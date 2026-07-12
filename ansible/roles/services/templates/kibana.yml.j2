@@ -1,0 +1,38 @@
+# Managed by Ansible
+server.host: "0.0.0.0"
+server.port: 5601
+server.name: "{{ inventory_hostname }}"
+server.publicBaseUrl: "https://{{ lab_ip }}:5601"
+
+server.ssl.enabled: true
+server.ssl.certificate: /etc/kibana/certs/kibana.crt
+server.ssl.key: /etc/kibana/certs/kibana.key
+
+elasticsearch.hosts: ["https://{{ elastic_nodes[0].ip }}:9200"]
+elasticsearch.serviceAccountToken: "${elasticsearch.serviceAccountToken}"
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elasticsearch-ca.pem"]
+elasticsearch.ssl.verificationMode: "certificate"
+
+xpack.encryptedSavedObjects.encryptionKey: "${xpack.encryptedSavedObjects.encryptionKey}"
+xpack.reporting.encryptionKey: "${xpack.reporting.encryptionKey}"
+xpack.security.encryptionKey: "${xpack.security.encryptionKey}"
+
+xpack.fleet.packages:
+  - name: fleet_server
+    version: latest
+  - name: system
+    version: latest
+  - name: elastic_agent
+    version: latest
+xpack.fleet.agentPolicies:
+  - name: Fleet-Server-Policy
+    id: fleet-server-policy
+    namespace: default
+    monitoring_enabled: [logs, metrics]
+    package_policies:
+      - name: fleet_server-1
+        package: {name: fleet_server}
+      - name: system-1
+        package: {name: system}
+      - name: elastic_agent-1
+        package: {name: elastic_agent}

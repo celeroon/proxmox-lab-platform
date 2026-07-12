@@ -1,0 +1,48 @@
+---
+# Task: Configure OVS mirror port (SPAN) for traffic monitoring
+# Variables:
+#   bridge_name: Bridge name (e.g., "br0")
+#   mirror_name: Mirror name (e.g., "mirror0")
+#   mirror_interface: Output interface (e.g., "eth8")
+#   monitored_interfaces: List of interfaces to mirror (e.g., ["eth1", "eth2", ...])
+
+- name: Verify Open vSwitch is installed and running
+  systemd:
+    name: openvswitch-switch
+    state: started
+  register: ovs_service
+
+- name: Verify OVS bridge exists
+  command: ovs-vsctl br-exists {{ bridge_name }}
+  register: bridge_check
+  changed_when: false
+  failed_when: bridge_check.rc != 0
+
+- name: Verify required ports exist on bridge
+  command: ovs-vsctl port-to-br {{ item }}
+  register: port_check
+  failed_when: port_check.rc != 0 or port_check.stdout != bridge_name
+  loop: "{{ monitored_interfaces + [mirror_interface] }}"
+  changed_when: false
+
+- name: Create systemd service file for mirror port
+  template:
+    src: "{{ playbook_dir }}/../roles/global/ovs/templates/ovs-mirror.service.j2"
+    dest: "/etc/systemd/system/ovs-mirror{{ mirror_name }}.service"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Enable mirror port service
+  systemd:
+    name: "ovs-mirror{{ mirror_name }}.service"
+    enabled: yes
+
+- name: Start mirror port service (creates mirror immediately)
+  systemd:
+    name: "ovs-mirror{{ mirror_name }}.service"
+    state: started

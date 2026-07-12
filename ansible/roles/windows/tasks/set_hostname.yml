@@ -1,0 +1,14 @@
+---
+# Task: Rename the Windows computer and reboot to apply the change.
+#
+# Required vars:
+#   hostname — desired computer name (e.g. "WIN-SRV-1")
+
+- name: Set hostname to {{ hostname }}
+  ansible.windows.win_hostname:
+    name: "{{ hostname }}"
+  register: hostname_result
+
+- name: Reboot to apply hostname change
+  ansible.windows.win_reboot:
+  when: hostname_result.reboot_required

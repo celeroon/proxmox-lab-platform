@@ -1,0 +1,14 @@
+- name: Set hostname
+  ansible.builtin.hostname:
+    name: "{{ vm_name }}"
+    # use: debian avoids the module's default systemd strategy, which shells out to
+    # `hostnamectl set-hostname` — that also tries to update /etc/machine-info for the
+    # pretty hostname, which systemd-hostnamed refuses inside unprivileged LXC
+    # containers ("Not allowed to update /etc/machine-info"), failing the whole task.
+    use: debian
+
+- name: Update /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    line: "127.0.1.1  {{ vm_name }}"

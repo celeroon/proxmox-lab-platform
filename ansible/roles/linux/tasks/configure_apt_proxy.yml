@@ -1,0 +1,19 @@
+---
+# Point apt at a caching proxy (apt-cacher-ng).
+# Must run before any apt install task so the cache is used from the first update.
+#
+# Required vars:
+#   apt_proxy_ip   - IP of the apt-cacher-ng host (typically mgmt_1_ip)
+# Optional vars:
+#   apt_proxy_port - proxy port (default: 3142)
+
+- name: Configure apt proxy
+  copy:
+    dest: /etc/apt/apt.conf.d/02proxy
+    content: |
+      Acquire::http::Proxy "http://{{ apt_proxy_ip }}:{{ apt_proxy_port | default(3142) }}";
+      Acquire::https::Proxy "DIRECT";
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes

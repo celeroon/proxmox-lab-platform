@@ -1,0 +1,9 @@
+---
+- name: Create build-sources directory
+  ansible.builtin.file:
+    path: "{{ lookup('env', 'BUILD_SOURCES_DIR') | default('/var/lib/lab-platform/build-sources', true) }}"
+    state: directory
+    mode: "0755"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+  tags: build_sources

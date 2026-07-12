@@ -1,0 +1,23 @@
+---
+# Task: Configure a DHCP pool on Cisco IOS-XE
+# Variables:
+#   pool_name:          DHCP pool name (e.g. LAN_POOL)
+#   network:            Network address (e.g. 172.16.100.0)
+#   mask:               Subnet mask (e.g. 255.255.255.0)
+#   default_router:     Default gateway (e.g. 172.16.100.254)
+#   dns_server:         DNS server (e.g. 8.8.8.8)
+#   excluded_addresses: List of excluded IPs (e.g. ["172.16.100.254"])
+
+- name: Exclude addresses from DHCP pool {{ pool_name }}
+  cisco.ios.ios_config:
+    lines:
+      - "ip dhcp excluded-address {{ item }}"
+  loop: "{{ excluded_addresses }}"
+
+- name: Configure DHCP pool {{ pool_name }}
+  cisco.ios.ios_config:
+    lines:
+      - network {{ network }} {{ mask }}
+      - default-router {{ default_router }}
+      - dns-server {{ dns_server }}
+    parents: ip dhcp pool {{ pool_name }}

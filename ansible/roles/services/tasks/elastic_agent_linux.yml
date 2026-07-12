@@ -1,0 +1,130 @@
+---
+# Install and enroll elastic-agent on a Linux host.
+# Fetches the CA cert live from the Fleet Server TLS connection.
+# Idempotent: skips all steps if agent binary already present at /opt/Elastic/Agent/.
+# A single shared enrollment key is generated once for the whole agent group.
+#
+# Required vars:
+#   elk_version      - Elastic stack version e.g. "9.4.2"
+#   elk_password     - elastic superuser password (used to generate enrollment key)
+#   fleet_ip         - IP of the Fleet Server; falls back to elastic_nodes[0].ip
+#   fleet_policy_id  - Fleet agent policy ID to enroll into (e.g. filestream-test-policy)
+
+# ── Step 0: Check if already installed (early exit path) ─────────
+
+- name: Check if elastic-agent is already installed
+  stat:
+    path: /opt/Elastic/Agent/elastic-agent
+  register: agent_binary
+
+# ── Step 1: Fetch CA certificate from Fleet Server TLS ────────────
+
+- name: Fetch Elastic CA certificate from ES node
+  shell: |
+    echo | openssl s_client -connect "{{ elastic_nodes[0].ip }}:9200" -showcerts 2>/dev/null \
+      | awk '/-----BEGIN CERTIFICATE-----/{n++} n==2{print} /-----END CERTIFICATE-----/ && n==2{exit}' \
+      > /etc/ssl/elastic-ca.pem
+  args:
+    creates: /etc/ssl/elastic-ca.pem
+  become: yes
+
+- name: Verify CA certificate was fetched
+  stat:
+    path: /etc/ssl/elastic-ca.pem
+  register: ca_cert_stat
+
+- name: Fail if CA certificate is empty
+  fail:
+    msg: "Failed to fetch CA certificate from {{ elastic_nodes[0].ip }}:9200"
+  when: ca_cert_stat.stat.size == 0
+
+# ── Step 2: Generate ONE shared enrollment API key for whole group ─
+# run_once executes on the first play host (ubuntu-desktop-1 / first replica).
+# That host can reach Kibana via the SDN network (neth-1 routes VLAN20→VLAN10).
+# Delegating to localhost would fail — the management VM has no route to kibana_ip.
+# register stores the result on ansible_play_hosts[0]; the set_fact below broadcasts it.
+
+- name: Generate shared enrollment API key for policy
+  uri:
+    url: "https://{{ kibana_ip | default(fleet_ip) | default(elastic_nodes[0].ip) }}:5601/api/fleet/enrollment_api_keys"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ fleet_policy_id }}-{{ now(utc=True, fmt='%Y%m%d%H%M%S') }}"
+      policy_id: "{{ fleet_policy_id }}"
+    validate_certs: no
+    status_code: 200
+  register: _enrollment_key_raw
+  run_once: true
+  become: false
+  no_log: true
+
+- name: Broadcast enrollment token to all agents
+  set_fact:
+    _enrollment_api_key: "{{ hostvars[ansible_play_hosts[0]]['_enrollment_key_raw'].json.item.api_key }}"
+  no_log: true
+
+# ── Step 3: Download and extract elastic-agent ────────────────────
+
+- name: Download elastic-agent from local mirror
+  get_url:
+    url: "http://{{ mirror_ip | default(fleet_ip) | default(elastic_nodes[0].ip) }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    mode: '0644'
+    timeout: 120
+  become: yes
+  when: not agent_binary.stat.exists
+  # Dozens of agent CTs hit the mirror at once; a saturated mirror stalls some
+  # downloads past the default 10s timeout. Retry so stragglers self-heal.
+  register: agent_download
+  until: agent_download is succeeded
+  retries: 5
+  delay: 10
+
+- name: Extract elastic-agent tarball
+  unarchive:
+    src: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: /var/tmp/
+    remote_src: yes
+    creates: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64/elastic-agent"
+  become: yes
+  when: not agent_binary.stat.exists
+
+# ── Step 4: Install and enroll ────────────────────────────────────
+
+- name: Install and enroll elastic-agent
+  command: >
+    ./elastic-agent install
+    --url=https://{{ fleet_ip | default(elastic_nodes[0].ip) }}:8220
+    --enrollment-token={{ _enrollment_api_key }}
+    --certificate-authorities=/etc/ssl/elastic-ca.pem
+    --force
+  args:
+    chdir: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64"
+  become: yes
+  no_log: true
+  when: not agent_binary.stat.exists
+  register: _agent_install
+  retries: 3
+  delay: 30
+  until: _agent_install.rc == 0
+
+# ── Step 5: Cleanup ───────────────────────────────────────────────
+
+- name: Remove elastic-agent extracted directory
+  file:
+    path: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64"
+    state: absent
+  when: not agent_binary.stat.exists
+
+- name: Remove elastic-agent tarball
+  file:
+    path: "/var/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    state: absent
+  when: not agent_binary.stat.exists

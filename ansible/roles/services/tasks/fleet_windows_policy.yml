@@ -1,0 +1,207 @@
+---
+# Create Windows agent policy with System, Windows, Elastic Defend, and Network Traffic integrations.
+# Idempotent: skips all steps if windows-policy already exists.
+#
+# Required vars:
+#   elk_password - elastic superuser password
+
+- name: Check if windows-policy already exists
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies/windows-policy"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 404]
+  register: windows_policy_check
+  no_log: true
+
+- name: Get installed package versions
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/epm/packages/{{ item }}"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: 200
+  register: windows_pkg_versions
+  loop: [system, windows, endpoint, network_traffic]
+  no_log: true
+  when: windows_policy_check.status == 404
+
+- name: Extract package versions
+  set_fact:
+    win_pkg_system: "{{ windows_pkg_versions.results[0].json.item.version }}"
+    win_pkg_windows: "{{ windows_pkg_versions.results[1].json.item.version }}"
+    win_pkg_endpoint: "{{ windows_pkg_versions.results[2].json.item.version }}"
+    win_pkg_nettraffic: "{{ windows_pkg_versions.results[3].json.item.version }}"
+  when: windows_policy_check.status == 404
+
+- name: Create Windows agent policy
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      id: windows-policy
+      name: Windows-Policy
+      namespace: default
+      monitoring_enabled: [logs, metrics]
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404
+
+- name: Add System integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: system-windows
+      namespace: default
+      policy_id: windows-policy
+      package:
+        name: system
+        version: "{{ win_pkg_system }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404
+
+- name: Add Windows integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: windows-1
+      namespace: default
+      policy_id: windows-policy
+      package:
+        name: windows
+        version: "{{ win_pkg_windows }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404
+
+- name: Add Elastic Defend integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    timeout: 120
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: endpoint-windows
+      namespace: default
+      description: ""
+      enabled: true
+      policy_id: windows-policy
+      policy_ids: [windows-policy]
+      package:
+        name: endpoint
+        title: Elastic Defend
+        version: "{{ win_pkg_endpoint }}"
+        requires_root: true
+      inputs:
+        - type: endpoint
+          enabled: true
+          config:
+            integration_config:
+              value:
+                type: endpoint
+                endpointConfig:
+                  preset: DataCollection
+            policy:
+              value:
+                windows:
+                  events:
+                    credential_access: true
+                    dll_and_driver_load: true
+                    dns: true
+                    file: true
+                    network: true
+                    process: true
+                    registry: true
+                    security: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+                mac:
+                  events:
+                    process: true
+                    file: true
+                    network: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+                linux:
+                  events:
+                    process: true
+                    file: true
+                    network: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+          streams: []
+      vars: {}
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404
+
+- name: Add Network Traffic integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: network_traffic-windows
+      namespace: default
+      policy_id: windows-policy
+      package:
+        name: network_traffic
+        version: "{{ win_pkg_nettraffic }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404

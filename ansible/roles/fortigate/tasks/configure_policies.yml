@@ -1,0 +1,25 @@
+---
+# Task: Configure firewall policies on FortiGate
+# Variables:
+#   firewall_policies: List of firewall policy configurations
+#     - policyid: 1001
+#       name: "USERS->SERVERS"
+#       srcintf: [{ name: "vlan20" }]
+#       dstintf: [{ name: "vlan10" }]
+#       srcaddr: [{ name: "USERS-172.16.20.0/24" }]
+#       dstaddr: [{ name: "SERVERS-172.16.10.0/24" }]
+#       action: "accept"
+#       schedule: "always"
+#       service: [{ name: "ALL" }]
+#       logtraffic: "all"
+
+- name: Configure firewall policies
+  fortinet.fortios.fortios_firewall_policy:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    firewall_policy: "{{ item }}"
+  loop: "{{ firewall_policies | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

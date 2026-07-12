@@ -1,0 +1,78 @@
+---
+# Deploy the S7comm conveyor-belt PLC simulator as a systemd service.
+#
+# Variables:
+#   s7comm_port:  TCP port to listen on (default: 102)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/s7comm directory
+  file:
+    path: /opt/s7comm
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/s7comm/venv
+  args:
+    creates: /opt/s7comm/venv/bin/python3
+  become: true
+
+- name: Install python-snap7 and rich into venv
+  pip:
+    name:
+      - python-snap7==3.0.0
+      - rich
+    virtualenv: /opt/s7comm/venv
+  become: true
+
+- name: Copy s7comm simulation files
+  copy:
+    src: s7comm/
+    dest: /opt/s7comm/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies s7_logic.py, s7_server.py, s7_client.py, s7_tui_common.py,
+  # s7_server_tui.py, s7_client_tui.py -- run the *_tui.py scripts manually over
+  # SSH for a live htop-style status view (/opt/s7comm/venv/bin/python3 /opt/s7comm/s7_server_tui.py)
+
+- name: Install s7comm-server systemd service
+  copy:
+    dest: /etc/systemd/system/s7comm-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=S7comm PLC Simulator (conveyor belt)
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/s7comm/venv/bin/python3 /opt/s7comm/s7_server.py \
+        --host 0.0.0.0 \
+        --port {{ s7comm_port | default(102) }} \
+        --log-file /var/log/s7comm-server.log
+      Restart=always
+      WorkingDirectory=/opt/s7comm
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start s7comm-server
+  systemd:
+    name: s7comm-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

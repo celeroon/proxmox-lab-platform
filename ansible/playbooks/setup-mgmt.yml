@@ -1,0 +1,6 @@
+---
+- name: Management VM bootstrap
+  hosts: mgmt
+  become: true
+  roles:
+    - platform

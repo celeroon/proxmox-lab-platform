@@ -1,0 +1,61 @@
+---
+# Task: Configure IKEv2 site-to-site IPsec on VyOS (StrongSwan-based, VyOS 1.5+)
+# Variables:
+#   ipsec_local_ip:     WAN/mgmt IP of this router (IKE local address and PSK id)
+#   ipsec_remote_ip:    WAN/mgmt IP of the peer router (IKE remote address and PSK id)
+#   ipsec_local_subnet: LAN CIDR at this site, e.g. 172.16.0.0/16
+#   ipsec_remote_subnet: LAN CIDR at the peer site, e.g. 172.17.0.0/16
+#   ipsec_psk:          IKEv2 pre-shared key (string)
+#   ipsec_peer_name:    Alphanumeric peer name used in VyOS config (default: REMOTE-SITE)
+#   ipsec_ike_group:    IKE group name (default: IKE-LAB)
+#   ipsec_esp_group:    ESP group name (default: ESP-LAB)
+#   ipsec_psk_name:     Global PSK entry name (default: LAB-PSK)
+#   ipsec_interface:    WAN interface (default: eth0)
+#
+# Note: locally-generated traffic from the VyOS router itself bypasses xfrm encryption
+# via StrongSwan's bypass route in table 220. Only forwarded traffic (from LAN hosts)
+# is encrypted. Test connectivity using hosts behind the routers, not the router itself.
+
+- name: Build IPsec configuration lines
+  set_fact:
+    ipsec_lines: >-
+      {{
+        [
+          'set vpn ipsec ike-group ' ~ _ike ~ ' key-exchange ikev2',
+          'set vpn ipsec ike-group ' ~ _ike ~ ' lifetime 28800',
+          'set vpn ipsec ike-group ' ~ _ike ~ ' proposal 1 dh-group 19',
+          'set vpn ipsec ike-group ' ~ _ike ~ ' proposal 1 encryption aes256',
+          'set vpn ipsec ike-group ' ~ _ike ~ ' proposal 1 hash sha512',
+          'set vpn ipsec esp-group ' ~ _esp ~ ' lifetime 3600',
+          'set vpn ipsec esp-group ' ~ _esp ~ ' mode tunnel',
+          'set vpn ipsec esp-group ' ~ _esp ~ ' pfs dh-group19',
+          'set vpn ipsec esp-group ' ~ _esp ~ ' proposal 1 encryption aes256gcm128',
+          'set vpn ipsec interface ' ~ _iface,
+          'set vpn ipsec authentication psk ' ~ _psk_name ~ ' id "' ~ ipsec_local_ip ~ '"',
+          'set vpn ipsec authentication psk ' ~ _psk_name ~ ' id "' ~ ipsec_remote_ip ~ '"',
+          'set vpn ipsec authentication psk ' ~ _psk_name ~ ' secret "' ~ ipsec_psk ~ '"',
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' authentication mode pre-shared-secret',
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' authentication local-id "' ~ ipsec_local_ip ~ '"',
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' authentication remote-id "' ~ ipsec_remote_ip ~ '"',
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' remote-address ' ~ ipsec_remote_ip,
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' ike-group ' ~ _ike,
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' local-address ' ~ ipsec_local_ip,
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' tunnel 1 esp-group ' ~ _esp,
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' tunnel 1 local prefix ' ~ ipsec_local_subnet,
+          'set vpn ipsec site-to-site peer ' ~ _peer ~ ' tunnel 1 remote prefix ' ~ ipsec_remote_subnet
+        ]
+      }}
+  vars:
+    _peer: "{{ ipsec_peer_name | default('REMOTE-SITE') }}"
+    _ike: "{{ ipsec_ike_group | default('IKE-LAB') }}"
+    _esp: "{{ ipsec_esp_group | default('ESP-LAB') }}"
+    _psk_name: "{{ ipsec_psk_name | default('LAB-PSK') }}"
+    _iface: "{{ ipsec_interface | default('eth0') }}"
+
+- name: Apply IPsec configuration
+  vyos.vyos.vyos_config:
+    lines: "{{ ipsec_lines }}"
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

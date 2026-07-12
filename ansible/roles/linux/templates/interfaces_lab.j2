@@ -1,0 +1,28 @@
+{% set mgmt_if = ansible_default_ipv4.interface %}
+{% set lab_if = lab_interface | default(ansible_interfaces | reject('match', '^(docker|veth|br-)') | difference([mgmt_if, 'lo']) | sort | first) %}
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto {{ mgmt_if }}
+iface {{ mgmt_if }} inet static
+  pre-up ip addr flush dev {{ mgmt_if }}
+  address {{ ansible_host }}
+  netmask 255.255.0.0
+  pre-up sleep 2
+
+auto {{ lab_if }}
+{% if lab_ip is defined %}
+iface {{ lab_if }} inet static
+  address {{ lab_ip }}
+  netmask {{ lab_netmask | default('255.255.255.0') }}
+{% if lab_gateway is defined %}
+  gateway {{ lab_gateway }}
+{% endif %}
+{% if lab_dns is defined %}
+  dns-nameservers {{ lab_dns }}
+{% endif %}
+{% else %}
+iface {{ lab_if }} inet dhcp
+{% endif %}

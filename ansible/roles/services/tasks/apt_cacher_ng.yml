@@ -1,0 +1,18 @@
+---
+# Install and start apt-cacher-ng as a caching proxy for apt packages.
+# Other VMs/CTs in the same deployment point to http://<this-host-ip>:3142.
+# Default config listens on 0.0.0.0:3142 and accepts all clients — no extra tuning needed.
+
+- name: Install apt-cacher-ng
+  apt:
+    name: apt-cacher-ng
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Enable and start apt-cacher-ng
+  systemd:
+    name: apt-cacher-ng
+    enabled: yes
+    state: started
+  become: yes

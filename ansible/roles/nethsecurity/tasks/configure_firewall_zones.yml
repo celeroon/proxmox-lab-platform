@@ -1,0 +1,78 @@
+---
+# Task: Configure firewall zones on NethSecurity
+# Variables:
+#   zones: list of firewall zones to create
+#     - name:     Zone name (e.g. "wan", "lan")
+#       network:  UCI interface name(s) to assign (e.g. "wan" or "vlan10 eth2")
+#       input:    Default input policy: ACCEPT, REJECT, DROP
+#       output:   Default output policy: ACCEPT, REJECT, DROP
+#       forward:  Default forward policy: ACCEPT, REJECT, DROP
+#       masq:     Enable masquerading: true/false (WAN only)
+
+- name: Create firewall zone sections
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}=zone"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set zone names
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.name={{ item.name }}"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set zone networks
+  ansible.builtin.command:
+    argv:
+      - uci
+      - set
+      - "firewall.ns_{{ item.name }}.network={{ item.network }}"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set zone input policies
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.input={{ item.input }}"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set zone output policies
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.output={{ item.output }}"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set zone forward policies
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.forward={{ item.forward }}"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Enable masquerading
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.masq=1"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when: item.masq | default(false)
+
+- name: Commit firewall config
+  ansible.builtin.command:
+    cmd: uci commit firewall
+
+- name: Restart firewall
+  ansible.builtin.command:
+    cmd: /etc/init.d/firewall restart

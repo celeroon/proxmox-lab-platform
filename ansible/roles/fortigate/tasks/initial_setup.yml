@@ -1,0 +1,36 @@
+---
+# Task: Initial setup for FortiGate (wait for readiness, set hostname, timezone)
+# Variables:
+#   fgt1_hostname: Hostname for the FortiGate device
+
+- name: Wait for FortiGate to be ready
+  wait_for:
+    host: "{{ ansible_host }}"
+    port: 443
+    delay: 15
+    timeout: 60
+  register: result
+  retries: 5
+  delay: 30
+  until: result is success
+
+- name: Set hostname
+  fortios_system_global:
+    vdom: "{{ vdom | default('root') }}"
+    system_global:
+      hostname: "{{ fgt1_hostname }}"
+  register: result
+  until: result is success
+  retries: 10
+  delay: 15
+  when: fgt1_hostname is defined
+
+- name: Set timezone
+  fortios_system_global:
+    vdom: "{{ vdom | default('root') }}"
+    system_global:
+      timezone: "{{ timezone | default('26') }}"
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

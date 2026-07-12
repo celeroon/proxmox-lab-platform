@@ -1,0 +1,21 @@
+---
+# Task: Configure SD-WAN on FortiGate
+# Variables:
+#   sdwan_config: SD-WAN configuration object
+#     status: "enable"
+#     members:
+#       - seq_num: 1
+#         interface: "port2"
+#         gateway: "192.0.2.1"
+#     load_balance_mode: "source-ip-based"
+#     health_check: [...]
+
+- name: Configure SD-WAN
+  fortinet.fortios.fortios_system_sdwan:
+    vdom: "{{ vdom | default('root') }}"
+    system_sdwan: "{{ sdwan_config }}"
+  when: sdwan_config is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

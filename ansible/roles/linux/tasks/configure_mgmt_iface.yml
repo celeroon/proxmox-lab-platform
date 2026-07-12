@@ -1,0 +1,19 @@
+- name: Write static mgmt interface config
+  ansible.builtin.copy:
+    dest: /etc/network/interfaces
+    content: |
+      source /etc/network/interfaces.d/*
+
+      auto lo
+      iface lo inet loopback
+
+      auto eth0
+      iface eth0 inet static
+          address {{ management_ip }}
+          netmask 255.255.0.0
+          dns-nameservers 8.8.8.8
+
+- name: Apply static IP immediately
+  ansible.builtin.command:
+    cmd: ip addr replace {{ management_ip }}/16 dev eth0
+  changed_when: true

@@ -1,0 +1,33 @@
+---
+- name: Install FastAPI systemd unit
+  ansible.builtin.template:
+    src: lab-platform.service.j2
+    dest: /etc/systemd/system/lab-platform.service
+    mode: "0644"
+  notify: reload systemd
+  tags: service
+
+- name: Enable and start lab-platform service
+  ansible.builtin.service:
+    name: lab-platform
+    state: started
+    enabled: true
+  tags: service
+
+- name: Allow non-admin OS users to execute the lab CLI
+  # /usr/local/bin/lab symlinks into {{ project_dir }}/.venv/bin/lab. The lab
+  # account's home is 0700 by default, which blocks path traversal for every
+  # other user — they get "command not found" even though /usr/local/bin is
+  # on their PATH. +x (not +r) only allows traversing to a known filename;
+  # it does not allow listing the directory or reading any other file in it
+  # (e.g. .env stays protected by its own permissions).
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: o+x
+  loop:
+    - "{{ project_dir | dirname }}"
+    - "{{ project_dir }}"
+    - "{{ project_dir }}/.venv"
+    - "{{ project_dir }}/.venv/bin"
+  tags: service

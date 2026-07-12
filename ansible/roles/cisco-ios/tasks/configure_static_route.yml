@@ -1,0 +1,12 @@
+---
+# Task: Configure a static route on Cisco IOS-XE
+# Variables:
+#   destination:  Destination network (e.g. 0.0.0.0)
+#   mask:         Subnet mask (e.g. 0.0.0.0)
+#   interface:    Exit interface (e.g. GigabitEthernet2)
+#   next_hop:     Next-hop IP address (e.g. 198.51.100.1)
+
+- name: Configure static route {{ destination }} {{ mask }} via {{ interface }}
+  cisco.ios.ios_config:
+    lines:
+      - ip route {{ destination }} {{ mask }} {{ interface }} {{ next_hop }}

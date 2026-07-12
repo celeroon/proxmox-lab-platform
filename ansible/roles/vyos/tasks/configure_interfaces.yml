@@ -1,0 +1,43 @@
+---
+# Task: Configure interfaces on VyOS router
+# Variables:
+#   interfaces: List of interface configurations
+#     - name: "eth0"
+#       description: "Management"
+#       address: "dhcp"
+#     - name: "eth1"
+#       description: "To ot-switch (802.1Q trunk)"   # omit `address` on a pure trunk parent
+#       vifs:                                         # optional — VLAN sub-interfaces (router-on-a-stick)
+#         - id: 10
+#           description: "Modbus VLAN"
+#           address: "192.168.10.1/24"
+#
+# Note: Hostname configuration has been moved to vyos/set_hostname task
+
+- name: Build interface configuration lines
+  set_fact:
+    interface_lines: "{{ interface_lines | default([]) + [
+      'set interfaces ethernet ' ~ item.name ~ ' description \"' ~ item.description ~ '\"']
+      + (['set interfaces ethernet ' ~ item.name ~ ' address dhcp'] if item.address | default('') == 'dhcp'
+         else ['set interfaces ethernet ' ~ item.name ~ ' address ' ~ item.address] if item.address is defined
+         else []) }}"
+  loop: "{{ interfaces | default([]) }}"
+
+- name: Build VLAN sub-interface (vif) configuration lines
+  set_fact:
+    interface_lines: "{{ interface_lines | default([]) + [
+      'set interfaces ethernet ' ~ item.0.name ~ ' vif ' ~ (item.1.id | string) ~ ' description \"' ~ item.1.description ~ '\"',
+      'set interfaces ethernet ' ~ item.0.name ~ ' vif ' ~ (item.1.id | string) ~ ' address ' ~ item.1.address
+    ] }}"
+  loop: "{{ interfaces | subelements('vifs', skip_missing=True) }}"
+
+- name: Configure interfaces
+  vyos.vyos.vyos_config:
+    lines: "{{ interface_lines }}"
+  vars:
+    ansible_command_timeout: 120
+  when: interface_lines is defined
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

@@ -1,0 +1,38 @@
+---
+# Task: Create and enable a simple Python HTTP server systemd service
+# Variables:
+#   http_serve_dir:  Directory to serve (default: /root/http-server)
+#   http_port:       Port to listen on (default: 80)
+
+- name: Create HTTP server directory
+  ansible.builtin.file:
+    path: "{{ http_serve_dir | default('/root/http-server') }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install simple-http-server systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/simple-http-server.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Simple HTTP Server
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/bin/env python3 -m http.server {{ http_port | default(80) }} --directory {{ http_serve_dir | default('/root/http-server') }}
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start simple-http-server
+  ansible.builtin.systemd:
+    name: simple-http-server
+    state: started
+    enabled: true
+    daemon_reload: true

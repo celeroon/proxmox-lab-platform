@@ -1,0 +1,51 @@
+---
+# Task: Create 802.1q VLAN device entries on NethSecurity
+# Variables:
+#   vlans: list of VLAN devices to create
+#     - name:   UCI section name (e.g. "ns_vlan10")
+#       ifname: Parent interface (e.g. "eth2")
+#       vid:    VLAN ID (e.g. 10)
+
+- name: Create VLAN device sections
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}=device"
+  loop: "{{ vlans }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set VLAN device names
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.name={{ item.ifname }}.{{ item.vid }}"
+  loop: "{{ vlans }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set VLAN types
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.type=8021q"
+  loop: "{{ vlans }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set VLAN parent interfaces
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.ifname={{ item.ifname }}"
+  loop: "{{ vlans }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set VLAN IDs
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.vid={{ item.vid }}"
+  loop: "{{ vlans }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Commit network config
+  ansible.builtin.command:
+    cmd: uci commit network

@@ -1,0 +1,36 @@
+---
+# Install Prometheus and configure it to scrape elasticsearch_exporter instances
+# on all elastic_nodes (port 9114).
+#
+# Required vars:
+#   elastic_nodes - cluster node list (used to build scrape targets)
+
+# ── Step 1: Install ───────────────────────────────────────────────
+
+- name: Install Prometheus
+  apt:
+    name: prometheus
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 2: Deploy config ─────────────────────────────────────────
+
+- name: Deploy prometheus.yml
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/prometheus.yml.j2"
+    dest: /etc/prometheus/prometheus.yml
+    owner: prometheus
+    group: prometheus
+    mode: '0644'
+  become: yes
+
+# ── Step 3: Start service ─────────────────────────────────────────
+
+- name: Restart Prometheus to apply config
+  systemd:
+    name: prometheus
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+  become: yes

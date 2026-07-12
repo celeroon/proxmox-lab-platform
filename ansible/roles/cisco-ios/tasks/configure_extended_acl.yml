@@ -1,0 +1,10 @@
+---
+# Task: Configure an extended ACL on Cisco IOS-XE
+# Variables:
+#   acl_name:  ACL name (e.g. ACL-NAT-S2S)
+#   entries:   List of ACE lines with sequence numbers (e.g. ["10 deny ip ...", "30 permit ip ..."])
+
+- name: Configure extended ACL {{ acl_name }}
+  cisco.ios.ios_config:
+    lines: "{{ entries }}"
+    parents: ip access-list extended {{ acl_name }}

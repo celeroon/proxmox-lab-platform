@@ -1,0 +1,13 @@
+---
+# systemd-networkd manages per-user management NICs via MAC-matched .network files.
+# The primary interface is managed by ifupdown (/etc/network/interfaces) — the two
+# don't conflict because ifupdown only touches interfaces listed in that file and
+# networkd only touches interfaces with a matching .network file.
+
+- name: Enable and start systemd-networkd
+  ansible.builtin.systemd:
+    name: systemd-networkd
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: networkd

@@ -1,0 +1,240 @@
+---
+# Fix Malcolm's three structural startup problems after every fresh deploy.
+#
+# Problem 1 — host-network containers can't use Docker DNS:
+#   arkime-live, pcap-capture, zeek-live, and suricata-live all run with
+#   network_mode: host, so they resolve hostnames via the host's /etc/hosts
+#   and /etc/resolv.conf rather than Docker's embedded DNS.  Without entries
+#   for 'opensearch' and 'arkime', those containers' startup scripts loop
+#   forever and capture never starts.
+#   Fix: patches static IPs for opensearch and arkime directly into
+#   docker-compose.yml (see the note further down for why not an override file)
+#   so the /etc/hosts entries stay correct across container restarts.
+#
+# Problem 2 — TLS cert inode divergence:
+#   Malcolm generates fresh certs after Docker containers are already running.
+#   Each cert is written to a new inode, but running containers hold bind-mount
+#   file descriptors pointing to the old inodes.  Logstash refuses Filebeat's
+#   client cert (old CA) and Filebeat can't reach Logstash (wrong server cert).
+#   Fix: force-recreate logstash and filebeat so they re-bind to the new inodes.
+#
+# Problem 3 — OpenSearch security index not initialised:
+#   Malcolm's setup-post-start.sh calls securityadmin.sh -h opensearch at
+#   startup to load internal_users.yml into the security index.  If 'opensearch'
+#   is unresolvable at that moment (problem 1 not yet fixed) or OpenSearch is
+#   not fully ready, securityadmin.sh fails and the security index stays stale.
+#   On the next restart the password in the curlrc diverges from the security
+#   index, causing 401 errors across all services.
+#   Fix: run securityadmin.sh with -h localhost (always resolvable) once
+#   OpenSearch is confirmed healthy.
+#
+# Variables:
+#   malcolm_dir:            Malcolm install directory     (default: /opt/malcolm)
+#   malcolm_subnet:         Fixed Docker bridge subnet    (default: 172.28.0.0/16)
+#   malcolm_gateway:        Gateway for that subnet       (default: 172.28.0.1)
+#   malcolm_opensearch_ip:  Static IP for opensearch      (default: 172.28.0.100)
+#   malcolm_arkime_ip:      Static IP for arkime          (default: 172.28.0.101)
+#
+# The static IPs are deliberately far from the low end of the subnet: on a fresh
+# stack, Docker's bridge driver hands out dynamic addresses sequentially starting
+# at .2, and the ~27 Malcolm containers can claim up to roughly .2-.28. A static
+# address inside that range races the dynamic allocator — whichever container
+# starts first wins it, and if a dynamic container wins, opensearch/arkime fail
+# to start with "Address already in use" (observed with .4/.5 on 2026-07-02:
+# zeek and valkey-cache grabbed them before opensearch/arkime could). .100/.101
+# are far enough from the sequential range to never collide.
+
+- name: Set Malcolm working variables
+  set_fact:
+    _malcolm_dir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+    _malcolm_subnet: "{{ malcolm_subnet | default('172.28.0.0/16') }}"
+    _malcolm_gateway: "{{ malcolm_gateway | default('172.28.0.1') }}"
+    _malcolm_opensearch_ip: "{{ malcolm_opensearch_ip | default('172.28.0.100') }}"
+    _malcolm_arkime_ip: "{{ malcolm_arkime_ip | default('172.28.0.101') }}"
+
+# Patches the static IPs directly into docker-compose.yml (same technique
+# configure_malcolm_version uses for image tags) rather than a separate
+# docker-compose.override.yml. Docker Compose only auto-merges override.yml when
+# no explicit -f is given — but Malcolm's own control.py (behind ./scripts/start,
+# which this task must use, see below) always calls compose with an explicit
+# `-f docker-compose.yml`, so a separate override file is silently ignored by it
+# while still being picked up by any *other* plain `docker compose` invocation.
+# That mismatch caused a real incident: control.py brought the stack up on
+# Docker's default subnet (override ignored), then a later plain `docker compose`
+# call in this same file saw the override and tried to recreate the network,
+# which failed because most containers were still attached to it. Baking the
+# config into docker-compose.yml itself means there is only one source of truth,
+# used identically regardless of how compose is invoked.
+- name: Patch docker-compose.yml with fixed subnet and static IPs
+  shell: |
+    python3 - <<'PYEOF'
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.preserve_quotes = True
+
+    path = "docker-compose.yml"
+    with open(path) as f:
+        data = yaml.load(f)
+
+    changed = False
+
+    networks = data.setdefault("networks", {})
+    default_net = networks.setdefault("default", {})
+    desired_ipam = {"config": [{"subnet": "{{ _malcolm_subnet }}", "gateway": "{{ _malcolm_gateway }}"}]}
+    if default_net.get("ipam") != desired_ipam:
+        default_net["ipam"] = desired_ipam
+        changed = True
+
+    static_ips = {"opensearch": "{{ _malcolm_opensearch_ip }}", "arkime": "{{ _malcolm_arkime_ip }}"}
+    for svc, ip in static_ips.items():
+        svc_cfg = data["services"][svc]
+        desired = {"default": {"ipv4_address": ip}}
+        if svc_cfg.get("networks") != desired:
+            svc_cfg["networks"] = desired
+            changed = True
+
+    if changed:
+        with open(path, "w") as f:
+            yaml.dump(data, f)
+
+    print("CHANGED" if changed else "UNCHANGED")
+    PYEOF
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _compose_patch
+  changed_when: "'CHANGED' in _compose_patch.stdout"
+  become: false
+
+# Cleans up a stale override file from before this task baked the config into
+# docker-compose.yml directly (harmless to run when the file doesn't exist).
+- name: Remove superseded docker-compose.override.yml if present
+  file:
+    path: "{{ _malcolm_dir }}/docker-compose.override.yml"
+    state: absent
+  become: false
+
+# A subnet change requires all containers to be restarted so Docker can
+# recreate the bridge. Skipped if the config was already correct.
+#
+# Uses ./scripts/stop and ./scripts/start (Malcolm's own control.py) rather than
+# raw `docker compose down`/`up -d`: control.py's start() also touches required
+# placeholder files (.opensearch.secondary.curlrc, htadmin/metadata,
+# nginx/nginx_ldap.conf, zeek intel/custom __load__.zeek) and pre-creates a long
+# list of bind-mount directories before invoking compose — skipping it and calling
+# compose directly causes "bind source path does not exist" errors on first start.
+# control.py refuses to run as root (same check as auth_setup), so become: false.
+- name: Stop all Malcolm containers (network config changed)
+  command: ./scripts/stop
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  when: _compose_patch is changed
+  changed_when: true
+  become: false
+
+- name: Start Malcolm with fixed network config
+  command: ./scripts/start
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  when: _compose_patch is changed
+  changed_when: true
+  become: false
+
+# Poll via admin cert — works even when the internal user password is wrong.
+- name: Wait for OpenSearch to become healthy
+  shell: >
+    docker compose --profile malcolm exec -T opensearch
+    curl -sk
+    --cert /usr/share/opensearch/config/certs/admin.crt
+    --key  /usr/share/opensearch/config/certs/admin.key
+    https://localhost:9200/_cat/health?h=status 2>&1
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _os_health
+  until: "_os_health.stdout | trim in ['green', 'yellow']"
+  retries: 60
+  delay: 10
+  changed_when: false
+  become: true
+
+# Load internal_users.yml into the security index.  Using -h localhost avoids
+# the DNS lookup that fails when securityadmin.sh runs at container startup.
+# This ensures the password in the security index always matches the curlrc.
+- name: Sync OpenSearch security index from internal_users.yml
+  shell: >
+    docker compose --profile malcolm exec -T opensearch
+    /usr/share/opensearch/plugins/opensearch-security/tools/securityadmin.sh
+    -cd /usr/share/opensearch/config/opensearch-security
+    -icl -nhnv
+    -cacert /usr/share/opensearch/config/certs/ca.crt
+    -cert   /usr/share/opensearch/config/certs/admin.crt
+    -key    /usr/share/opensearch/config/certs/admin.key
+    -h localhost 2>&1
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _secadmin
+  changed_when: true
+  failed_when: "_secadmin.rc != 0 and 'Done with success' not in _secadmin.stdout"
+  become: true
+
+# Static IPs baked into docker-compose.yml let these entries survive container restarts.
+- name: Add /etc/hosts entries for Malcolm container hostnames
+  lineinfile:
+    path: /etc/hosts
+    regexp: "^[0-9.]+ {{ item.name }}$"
+    line: "{{ item.ip }} {{ item.name }}"
+    state: present
+  loop:
+    - { name: opensearch, ip: "{{ _malcolm_opensearch_ip }}" }
+    - { name: arkime,     ip: "{{ _malcolm_arkime_ip }}" }
+  become: true
+
+# force-recreate makes Docker re-open the cert files at their current inodes,
+# picking up the certs Malcolm generated after initial container startup.
+# --no-deps scopes this strictly to the two named containers — it must never
+# touch the shared network or any other service (see the incident note above
+# the docker-compose.yml patch task for what happens when it does).
+- name: Force-recreate logstash and filebeat to pick up new cert inodes
+  command: docker compose --profile malcolm up -d --force-recreate --no-deps logstash filebeat
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  changed_when: true
+  become: true
+
+# logstash-start.sh waits for opensearch_status.sh -t malcolm_template before
+# starting Logstash.  With the password now correct this completes quickly but
+# can still take a few minutes while Logstash's JVM initialises.
+- name: Wait for Logstash beats input to start on port 5044
+  shell: docker compose --profile malcolm logs --tail 100 logstash 2>&1
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _ls_logs
+  until: "'Starting server on port: 5044' in _ls_logs.stdout"
+  retries: 90
+  delay: 10
+  changed_when: false
+  become: true
+
+# What Problem 2 actually requires is that filebeat's client cert completes a TLS
+# handshake against logstash's *current* cert/CA (no stale inode mismatch) — so
+# test that directly instead of grepping filebeat's own log for a connection
+# message. Investigated live on 2026-07-02: filebeat's beats-v7 image only logs
+# "Connection to ... established" lazily, on the first actual publish attempt —
+# with no new events queued yet, that line may never appear even though the
+# TLS/network path is completely healthy, producing a false-negative wait
+# (confirmed manually: `/proc/net/tcp` showed no connection yet, but an
+# `openssl s_client` handshake using filebeat's own certs succeeded immediately
+# with "Verify return code: 0 (ok)").
+- name: Verify filebeat's client cert completes a TLS handshake with Logstash
+  shell: >
+    docker compose --profile malcolm exec -T filebeat
+    openssl s_client -connect logstash:5044
+    -cert /certs/client.crt -key /certs/client.key -CAfile /certs/ca.crt
+    < /dev/null 2>&1
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _fb_tls
+  until: "'Verify return code: 0 (ok)' in _fb_tls.stdout"
+  retries: 30
+  delay: 5
+  changed_when: false
+  become: true

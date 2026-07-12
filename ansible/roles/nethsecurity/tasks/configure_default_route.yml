@@ -1,0 +1,17 @@
+---
+# Task: Set the default gateway on NethSecurity
+# Variables:
+#   gateway:    Gateway IP address (e.g. "192.0.2.1")
+#   interface:  UCI interface name the gateway is reachable via (e.g. "wan")
+
+- name: Set default gateway
+  ansible.builtin.command:
+    cmd: "uci set network.{{ interface }}.gateway={{ gateway }}"
+
+- name: Commit network config
+  ansible.builtin.command:
+    cmd: uci commit network
+
+- name: Restart network
+  ansible.builtin.command:
+    cmd: /etc/init.d/network restart

@@ -1,0 +1,19 @@
+---
+# Task: Set hostname on NethSecurity firewall
+# Variables:
+#   hostname: Hostname for the firewall (required)
+
+- name: Set hostname
+  ansible.builtin.command:
+    cmd: "uci set system.@system[0].hostname={{ hostname }}"
+  when: hostname is defined and hostname | length > 0
+
+- name: Commit hostname change
+  ansible.builtin.command:
+    cmd: uci commit system
+  when: hostname is defined and hostname | length > 0
+
+- name: Apply hostname immediately
+  ansible.builtin.command:
+    cmd: /etc/init.d/system reload
+  when: hostname is defined and hostname | length > 0

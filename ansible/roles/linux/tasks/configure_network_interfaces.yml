@@ -1,0 +1,57 @@
+---
+# Configure network interfaces for Linux VMs.
+# Ubuntu  → netplan (/etc/netplan/01-lab.yaml, NetworkManager renderer)
+# Debian  → /etc/network/interfaces
+#
+# eth0: static management IP (ansible_host/16), no default gateway
+# The "lab" interface: static when lab_ip is set; DHCP otherwise.
+#
+# Vars for the lab interface:
+#   lab_interface - explicit interface name (e.g. "eth1"). REQUIRED for any VM with
+#                   more than one non-management interface (e.g. malcolm-1, which also
+#                   has a promiscuous mirror interface) — auto-detect is unsafe there.
+#   lab_ip        - IP address for the lab interface
+#   lab_prefix    - CIDR prefix length, default 24   (netplan only)
+#   lab_netmask   - dotted-decimal netmask, default 255.255.255.0  (interfaces only)
+#   lab_gateway   - default gateway via the lab interface (optional)
+#   lab_dns       - DNS server (optional)
+
+- when: ansible_distribution == "Ubuntu"
+  become: true
+  block:
+    - name: Write netplan config
+      template:
+        src: "{{ lab_ansible_dir }}/roles/linux/templates/netplan_lab.j2"
+        dest: /etc/netplan/01-lab.yaml
+        mode: '0600'
+
+    - name: Apply netplan
+      command: netplan apply
+
+- when: ansible_distribution != "Ubuntu"
+  become: true
+  block:
+    - name: Write /etc/network/interfaces
+      template:
+        src: "{{ lab_ansible_dir }}/roles/linux/templates/interfaces_lab.j2"
+        dest: /etc/network/interfaces
+        mode: '0644'
+
+    - name: Restart networking
+      systemd:
+        name: networking
+        state: restarted
+
+    # On Debian without the `resolvconf` package, the `dns-nameservers` directive
+    # in /etc/network/interfaces is silently ignored, and restarting networking
+    # clears the DHCP-provided /etc/resolv.conf — leaving DNS broken for every
+    # subsequent internet-facing task (docker pull, apt, pip). Write resolv.conf
+    # directly so the declared lab_dns actually takes effect. `follow: false`
+    # replaces a systemd-resolved stub symlink with a static file if present.
+    - name: Set /etc/resolv.conf from lab_dns (Debian has no resolvconf)
+      copy:
+        dest: /etc/resolv.conf
+        content: "nameserver {{ lab_dns }}\n"
+        mode: '0644'
+        follow: false
+      when: lab_dns is defined

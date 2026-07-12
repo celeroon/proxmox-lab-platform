@@ -1,0 +1,36 @@
+---
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+  tags: nftables
+
+- name: Create /etc/nftables.d directory
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    mode: "0755"
+  tags: nftables
+
+- name: Deploy lab ACL ruleset
+  ansible.builtin.template:
+    src: lab-acl.nft.j2
+    dest: /etc/nftables.d/lab-acl.nft
+    mode: "0644"
+  notify: apply nftables acl
+  tags: nftables
+
+- name: Include lab-acl.nft in nftables.conf
+  ansible.builtin.lineinfile:
+    path: /etc/nftables.conf
+    line: 'include "/etc/nftables.d/*.nft"'
+    create: true
+    mode: "0644"
+  tags: nftables
+
+- name: Enable nftables service
+  ansible.builtin.service:
+    name: nftables
+    enabled: true
+    state: started
+  tags: nftables

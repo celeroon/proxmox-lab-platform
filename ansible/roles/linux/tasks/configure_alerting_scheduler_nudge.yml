@@ -1,0 +1,169 @@
+---
+# Force OpenSearch's Alerting job scheduler to actually resume executing
+# monitors after a reboot -- confirmed live 2026-07-05 that all 4 protocol
+# monitors (Modbus, S7comm, BACnet, EtherNet/IP) remain `enabled: true` in
+# their config the whole time after a cold boot, but the scheduler can take an
+# unpredictable, multi-hour delay before it resumes actually executing them
+# (confirmed: opensearch container restarted at 07:11:29Z, monitors produced
+# zero lock-acquisition activity until ~09:02Z -- an 111-minute dead window
+# during which a real attack produced no alert at all, even though the
+# monitor's own query/aggregation logic was proven correct when replicated
+# manually against the same data). This matches (and generalizes) the
+# previously-observed "OpenSearch Alerting escalation path NOT durable"
+# regression from 2026-07-04.
+#
+# Root cause is upstream OpenSearch Alerting/Job-Scheduler plugin behavior,
+# not a bug in our monitor configs -- so instead of trying to fix the
+# scheduler itself, this forces the known, documented community workaround
+# (disable the monitor, then re-enable it -- the same action a human would
+# take by unchecking/rechecking "enabled" in the Dashboards UI) on a
+# recurring timer, so whatever the scheduler's actual resume delay turns out
+# to be on any given boot, it never exceeds this timer's interval in
+# practice. configure_*_alerting.yml already does this toggle once, but only
+# at initial monitor creation time -- it has no effect on a later reboot
+# where the monitor doc is untouched and the scheduler alone is what's stuck.
+#
+# CORRECTED same day: this was originally a recurring timer (every 5 minutes,
+# forever), on the theory that toggling is a harmless no-op when the
+# scheduler is already healthy. That turned out to be wrong and actively
+# harmful: confirmed live that a real kali attack's alert was missed even
+# though a manual, non-scheduled `_execute` call against the monitor proved
+# the query/aggregation/trigger logic was 100% correct (found all 10 sessions,
+# correct attacker_ip, zero errors). The recurring toggle resets the
+# monitor's `enabled_time` (and therefore its period anchor) on every run,
+# which both wastes the scheduler's settled state and adds needless
+# uncertainty around exactly which 1-minute window boundary gets checked --
+# not the actual root cause of the miss (see below), but pure churn with no
+# benefit once the scheduler is already running.
+#
+# So this now runs ONCE at boot only (OnBootSec, no OnUnitActiveSec) --
+# enough to force the scheduler to resume after the specific bug this exists
+# for (a cold boot leaving monitors "enabled" but not actually scheduled),
+# without repeatedly disrupting an already-healthy scheduler afterward.
+#
+# Separately (NOT fixed by this task -- see configure_malcolm_alerting.yml
+# and its sibling per-protocol alerting tasks): the real reason the specific
+# attack above was missed is that OpenSearch bucket-level monitors evaluate
+# a strict, non-overlapping rolling window `[period_end-1m, period_end]` at
+# execution time. Zeek/Logstash ingestion lag (confirmed: newly-generated
+# session documents can take 10-20+ seconds to become searchable) means an
+# event in the last ~15s before a window boundary may not be indexed yet
+# when that window is evaluated -- and because the next window starts
+# exactly where this one ended, that gap is never re-checked. This is
+# invisible for continuous traffic (there's always a fresher packet in the
+# next window) but silently drops brief, one-shot attack bursts. Fixed by
+# widening each monitor's own query window to look back 2 minutes instead of
+# 1 (overlapping with the previous execution) while keeping the 1-minute
+# schedule interval -- OpenSearch Alerting's bucket-level trigger already
+# keys each alert by its own bucket (zeek.uid), so seeing the same session
+# again in the next overlapping window just updates the existing alert
+# rather than duplicating it.
+#
+# Variables:
+#   malcolm_dir: Malcolm install directory (default: /opt/malcolm)
+
+- name: Write malcolm-alerting-nudge.sh script
+  copy:
+    dest: /usr/local/sbin/malcolm-alerting-nudge.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      cd {{ malcolm_dir | default('/opt/malcolm') }}
+
+      OS_CERT=/usr/share/opensearch/config/certs/admin.crt
+      OS_KEY=/usr/share/opensearch/config/certs/admin.key
+
+      log() { logger -t malcolm-alerting-nudge "$1"; }
+
+      osq() {
+        docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" "$@"
+      }
+
+      # Wait for OpenSearch to actually answer before doing anything -- this
+      # script can run within seconds of the docker containers restarting,
+      # well before the cluster has formed.
+      ready=0
+      for i in $(seq 1 60); do
+        status=$(osq "https://localhost:9200/_cluster/health" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+        if [ "$status" = "green" ] || [ "$status" = "yellow" ]; then
+          ready=1
+          break
+        fi
+        sleep 5
+      done
+      if [ "$ready" -ne 1 ]; then
+        log "WARNING: opensearch never became reachable/healthy, skipping this run"
+        exit 0
+      fi
+
+      IDS=$(osq -H 'Content-Type: application/json' "https://localhost:9200/_plugins/_alerting/monitors/_search" \
+        -d '{"size":50,"query":{"match_all":{}}}' \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); [print(h['_id']) for h in d['hits']['hits'] if h['_source'].get('enabled')]")
+
+      count=0
+      for id in $IDS; do
+        doc=$(osq "https://localhost:9200/_plugins/_alerting/monitors/${id}")
+        seq_no=$(echo "$doc" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])")
+        prim_term=$(echo "$doc" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])")
+        body=$(echo "$doc" | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['monitor']))")
+
+        disabled_body=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); d['enabled']=False; print(json.dumps(d))")
+        resp=$(osq -H 'Content-Type: application/json' -X PUT \
+          "https://localhost:9200/_plugins/_alerting/monitors/${id}?if_seq_no=${seq_no}&if_primary_term=${prim_term}" \
+          -d "$disabled_body")
+        seq_no2=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])" 2>/dev/null)
+        prim_term2=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])" 2>/dev/null)
+        if [ -z "$seq_no2" ] || [ -z "$prim_term2" ]; then
+          log "WARNING: failed to disable monitor ${id}, skipping re-enable for it"
+          continue
+        fi
+
+        enabled_body=$(echo "$body" | python3 -c "import json,sys,time; d=json.load(sys.stdin); d['enabled']=True; d['enabled_time']=int(time.time()*1000); print(json.dumps(d))")
+        osq -H 'Content-Type: application/json' -X PUT \
+          "https://localhost:9200/_plugins/_alerting/monitors/${id}?if_seq_no=${seq_no2}&if_primary_term=${prim_term2}" \
+          -d "$enabled_body" > /dev/null
+        count=$((count + 1))
+      done
+
+      log "nudged ${count} monitor(s) (disable/re-enable) to force scheduler re-registration"
+
+- name: Install malcolm-alerting-nudge systemd service
+  copy:
+    dest: /etc/systemd/system/malcolm-alerting-nudge.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Nudge OpenSearch Alerting monitors to force scheduler registration
+      After=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/malcolm-alerting-nudge.sh
+
+- name: Install malcolm-alerting-nudge systemd timer
+  copy:
+    dest: /etc/systemd/system/malcolm-alerting-nudge.timer
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Periodic nudge to keep OpenSearch Alerting monitors scheduled
+
+      [Timer]
+      OnBootSec=60s
+      Unit=malcolm-alerting-nudge.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable and start malcolm-alerting-nudge timer
+  systemd:
+    name: malcolm-alerting-nudge.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes

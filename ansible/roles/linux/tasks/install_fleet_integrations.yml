@@ -1,0 +1,59 @@
+---
+# Task: Install Fleet integrations via Kibana API
+# Runs curl from inside the target VM (kibana hostname resolves to localhost)
+# Template files must exist: roles/global/linux/templates/{integration}_fleet_policy.json.j2
+#
+# Variables:
+#   elastic_password:    Elasticsearch password (default: labpassword)
+#   kibana_url:          Kibana base URL (default: https://localhost:5601)
+#   fleet_integrations:  List of integration names to install (e.g. ["cisco_ios", "netflow"])
+
+- name: Wait for Kibana API to be ready
+  ansible.builtin.shell: >
+    curl -k -s -o /dev/null -w "%{http_code}"
+    -u "elastic:{{ elastic_password | default('labpassword') }}"
+    "{{ kibana_url | default('https://localhost:5601') }}/api/status"
+  register: _kibana_ready
+  until: _kibana_ready.stdout == "200"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Template Fleet integration policy JSON files
+  ansible.builtin.template:
+    src: "{{ lab_ansible_dir }}/roles/global/linux/templates/{{ item }}_fleet_policy.json.j2"
+    dest: "/tmp/{{ item }}_fleet_policy.json"
+    mode: "0644"
+  loop: "{{ fleet_integrations }}"
+
+- name: Install Fleet integration package policies
+  ansible.builtin.shell: >
+    curl -k -s
+    -o /tmp/{{ item }}_fleet_response.json
+    -w "%{http_code}"
+    -u "elastic:{{ elastic_password | default('labpassword') }}"
+    -XPOST
+    -H "kbn-xsrf: kibana"
+    -H "Content-type: application/json"
+    "{{ kibana_url | default('https://localhost:5601') }}/api/fleet/package_policies"
+    --data @/tmp/{{ item }}_fleet_policy.json
+  register: _fleet_results
+  loop: "{{ fleet_integrations }}"
+  failed_when: _fleet_results.stdout not in ["200", "409"]
+  changed_when: _fleet_results.stdout == "200"
+
+- name: Log results
+  ansible.builtin.debug:
+    msg: >-
+      [{{ item.item }}]
+      {% if item.stdout == '409' %}already exists (skipped)
+      {% else %}installed successfully{% endif %}
+  loop: "{{ _fleet_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Clean up temp files
+  ansible.builtin.file:
+    path: "/tmp/{{ item }}_fleet_policy.json"
+    state: absent
+  loop: "{{ fleet_integrations }}"

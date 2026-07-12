@@ -1,0 +1,174 @@
+---
+# Join a non-bootstrap Elasticsearch node to an existing cluster.
+# Requires elasticsearch_bootstrap to have run on elastic_nodes[0] first.
+# Pulls TLS certs from the bootstrap node via a temporary HTTP server (port 19999).
+#
+# Required vars:
+#   lab_ip        - IP this node binds on
+#   elk_version   - Elastic stack version e.g. "9.4.2"
+#   elk_password  - elastic superuser password
+#   elk_cert_pass - .p12 cert password (must match bootstrap)
+#   elastic_nodes - cluster node list; elastic_nodes[0] is the bootstrap node
+#   node_roles    - list of ES roles; omit/~ for all roles (ES decides), [] for
+#                   coordinating-only (zero roles)
+#
+# Optional vars:
+#   elastic_heap  - JVM heap size e.g. "16g" (optional — if unset, ES uses JVM ergonomics: 50% RAM, max 31 GB)
+
+# ── Step 1: Add Elastic APT repository and install ────────────────
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, gpg, wget]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/es-gpg.asc
+    mode: '0644'
+
+- name: Add Elasticsearch GPG keyring
+  shell: gpg --dearmor < /tmp/es-gpg.asc > /usr/share/keyrings/elasticsearch-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+  become: yes
+
+- name: Add Elasticsearch APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elk_version.split('.')[0] }}.x/apt stable main"
+    state: present
+    filename: elastic
+  become: yes
+
+- name: Install Elasticsearch
+  apt:
+    name: "elasticsearch={{ elk_version }}"
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 2: Pull TLS certs from bootstrap node ────────────────────
+
+- name: Create certs directory
+  file:
+    path: /etc/elasticsearch/certs
+    state: directory
+    owner: root
+    group: elasticsearch
+    mode: '0750'
+  become: yes
+
+- name: Wait for cert distribution server on bootstrap node
+  wait_for:
+    host: "{{ elastic_nodes[0].ip }}"
+    port: 19999
+    timeout: 60
+
+- name: Pull shared certs from bootstrap node
+  get_url:
+    url: "http://{{ elastic_nodes[0].ip }}:19999/{{ item }}"
+    dest: "/etc/elasticsearch/certs/{{ item }}"
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+    force: yes
+  loop:
+    - elastic-stack-ca.p12
+    - elastic-certificates.p12
+    - elasticsearch-ca.pem
+  become: yes
+
+- name: Pull node HTTP cert from bootstrap node
+  get_url:
+    url: "http://{{ elastic_nodes[0].ip }}:19999/{{ inventory_hostname }}.p12"
+    dest: /etc/elasticsearch/certs/http.p12
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+    force: yes
+  become: yes
+
+# ── Step 3: Configure ─────────────────────────────────────────────
+
+- name: Deploy elasticsearch.yml
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/elasticsearch.yml.j2"
+    dest: /etc/elasticsearch/elasticsearch.yml
+    owner: root
+    group: elasticsearch
+    mode: '0660'
+  become: yes
+
+- name: Set JVM heap size
+  copy:
+    content: |
+      -Xms{{ elastic_heap }}
+      -Xmx{{ elastic_heap }}
+    dest: /etc/elasticsearch/jvm.options.d/heap.options
+    owner: root
+    group: elasticsearch
+    mode: '0660'
+  become: yes
+  when: elastic_heap is defined
+
+# ── Step 4: Set keystore passwords ────────────────────────────────
+
+- name: Initialize keystore if not present
+  command: /usr/share/elasticsearch/bin/elasticsearch-keystore create
+  args:
+    creates: /etc/elasticsearch/elasticsearch.keystore
+  become: yes
+
+- name: Set HTTP SSL keystore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+  become: yes
+  no_log: true
+
+- name: Set transport SSL keystore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+  become: yes
+  no_log: true
+
+- name: Set transport SSL truststore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password
+  become: yes
+  no_log: true
+
+# ── Step 5: Start ─────────────────────────────────────────────────
+
+- name: Enable and start Elasticsearch
+  systemd:
+    name: elasticsearch
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+# ── Step 6: Wait for node to join cluster ─────────────────────────
+# Check from the bootstrap node (elk-1) where the elastic password is
+# already established. elk-2/elk-3 can't authenticate locally until the
+# .security index replicates, which only happens after they join.
+#
+# Must check .security's OWN health, not overall cluster health — the cluster
+# can report yellow/green from unrelated indices/shards while .security itself
+# is still being allocated/initialized (e.g. the first data-capable node to
+# join a previously data-less cluster causes .security's long-unassigned shard
+# to initialize for the first time). A node joining during that window sees a
+# "healthy" cluster but still gets 401s authenticating locally until .security
+# specifically finishes. Scoping to /_cluster/health/.security closes that gap.
+
+- name: Wait for .security index to be available
+  uri:
+    url: "https://{{ elastic_nodes[0].ip }}:9200/_cluster/health/.security?wait_for_status=yellow&timeout=30s"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    status_code: 200
+  register: es_health
+  until: es_health.status == 200
+  retries: 20
+  delay: 15

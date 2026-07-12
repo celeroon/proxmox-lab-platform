@@ -1,0 +1,21 @@
+---
+# Task: Configure static routes on FortiGate
+# Variables:
+#   static_routes: List of static route configurations
+#     - seq_num: 1
+#       dst: "0.0.0.0/0"
+#       sdwan_zone:
+#         - name: "virtual-wan-link"
+#       distance: 1
+#       status: "enable"
+
+- name: Configure static routes
+  fortinet.fortios.fortios_router_static:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    router_static: "{{ item }}"
+  loop: "{{ static_routes | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

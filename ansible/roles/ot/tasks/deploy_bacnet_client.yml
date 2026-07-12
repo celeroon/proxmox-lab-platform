@@ -1,0 +1,92 @@
+---
+# Deploy the BACnet supervisory BAS (building automation system) client as a
+# systemd service.
+#
+# Variables:
+#   lab_ip:              this VM's own IP — BAC0/bacpypes3 must bind to a concrete
+#                        local IP, never 0.0.0.0 (confirmed by direct testing)
+#   server_ip:           IP of the bacnet-server to poll (required)
+#   bacnet_port:         UDP port to connect to (default: 47808)
+#   poll_seconds:        how often to poll (default: 3.0)
+#   external_probe_ip:   Optional — VyOS loopback (e.g. 9.9.9.9) to periodically
+#                        probe with a real BACnet read, for the "ICS/IoT External
+#                        Traffic" dashboard panel. Requires a matching
+#                        vyos/configure_external_traffic_redirect hairpin rule.
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/bacnet directory
+  file:
+    path: /opt/bacnet
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/bacnet/venv
+  args:
+    creates: /opt/bacnet/venv/bin/python3
+  become: true
+
+- name: Install BAC0 and rich into venv
+  pip:
+    name:
+      - BAC0==2025.9.15
+      - rich
+    virtualenv: /opt/bacnet/venv
+  become: true
+
+- name: Copy bacnet simulation files
+  copy:
+    src: bacnet/
+    dest: /opt/bacnet/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies bacnet_logic.py, bacnet_server.py, bacnet_client.py, bacnet_tui_common.py,
+  # bacnet_server_tui.py, bacnet_client_tui.py -- run the *_tui.py scripts manually over
+  # SSH for a live htop-style status view (/opt/bacnet/venv/bin/python3 /opt/bacnet/bacnet_client_tui.py)
+
+- name: Install bacnet-client systemd service
+  copy:
+    dest: /etc/systemd/system/bacnet-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=BACnet Client (supervisory BAS simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/bacnet/venv/bin/python3 /opt/bacnet/bacnet_client.py \
+        --host {{ server_ip }} \
+        --port {{ bacnet_port | default(47808) }} \
+        --bind-host {{ lab_ip }} \
+        --poll-seconds {{ poll_seconds | default(3.0) }} \
+        --log-file /var/log/bacnet-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/bacnet
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start bacnet-client
+  systemd:
+    name: bacnet-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

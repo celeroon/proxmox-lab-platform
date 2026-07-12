@@ -1,0 +1,295 @@
+OT-Lab ICS Attack Instructions
+================================
+Kali-1  |  192.168.100.10
+Malcolm |  https://192.168.100.254/
+
+All scripts live in /opt/ot-attacks/
+Activate the Python venv first:
+    source /opt/ot-attacks/venv/bin/activate
+
+════════════════════════════════════════════════════════
+ 1. MODBUS UNAUTHORIZED COMMAND INJECTION
+════════════════════════════════════════════════════════
+Target : modbus-server  192.168.10.10 : 502
+Prereq : modbus-server deployed
+
+Single attack run:
+    python3 /opt/ot-attacks/modbus_attack.py --target 192.168.10.10
+
+Continuous (repeat every 30 s):
+    python3 /opt/ot-attacks/modbus_attack.py --target 192.168.10.10 --continuous
+
+What you see in Malcolm after a few seconds:
+  - Dashboard: Modbus > Modbus - Observed Clients and Servers
+  - Dashboard: Modbus > Modbus - Function Codes (FC22 Mask Write, FC23 R/W Multiple)
+  - conn.log: connections from 192.168.100.10 to 192.168.10.10
+
+NOTE: ACID/ATT&CK for ICS panels do NOT fire on Modbus — ACID only covers
+S7Comm, EtherNet/IP-CIP, and BACnet. Use attack #2 for ATT&CK panels.
+
+════════════════════════════════════════════════════════
+ 2. S7COMM ACID / ATT&CK FOR ICS ATTACK
+════════════════════════════════════════════════════════
+Target : s7comm-server  192.168.20.10 : 102  (ISO-TSAP)
+Prereq : s7comm-server VM deployed
+
+Install snap7 (already done by Ansible, verify):
+    pip show python-snap7
+
+Run the attack:
+    python3 /opt/ot-attacks/s7comm_attack.py --target 192.168.20.10
+
+What triggers in Malcolm (confirmed 2026-07-04 — S7comm's ACID coverage is by
+FC/subfunc byte pairs, not service names, and this script's calls only match some):
+  ATT&CK for ICS Tactic: Privilege_Escalation (Handshake — fires on any connection)
+  ACID on ATT&CK for ICS panel populated (tactic only, no numbered technique yet —
+    Handshake isn't an officially-numbered MITRE technique)
+  NOT confirmed: T0836 (needs FC 0x01 subfunc 0x08 "Modify Variable", a plain DB
+    write doesn't match), T0858 (needs FC 0x00 "Push: Mode-Transition", STOP/HOT
+    RESTART use different function codes)
+  Non-ACID panels: S7comm Read-SZL (works), S7comm Devices / Upload-Download / Plus
+    Version (all require patching Malcolm's compiled Zeek analyzer — not achievable
+    from attack traffic alone)
+
+What you see in Malcolm:
+  - Dashboard: ICS/IoT Security Overview > ATT&CK for ICS Tactic
+  - Dashboard: ICS/IoT Security Overview > ICS Tactics and Techniques
+  - Dashboard: ICS/IoT Security Overview > ACID on ATT&CK for ICS
+  - notice.log: ATTACKICS::* entries
+
+════════════════════════════════════════════════════════
+ 3. BACNET ACID / ATT&CK FOR ICS ATTACK
+════════════════════════════════════════════════════════
+Target : bacnet-server  192.168.50.10 : 47808  (UDP)
+Prereq : bacnet-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/bacnet_attack.py --target 192.168.50.10 --bind-ip 192.168.100.10
+
+BACnet has the richest ACID coverage of any protocol here — 13 techniques, matched
+by literal BACnet service name (much easier to hit deliberately than S7comm/CIP's
+raw byte pairs). This script issues all 13 in one pass:
+  T0801 Monitor Process State           — Subscribe-COV
+  T0814 Denial of Service               — Device-Communication-Control
+  T0835 Manipulate I/O Image            — Create-Object / Delete-Object
+  T0836 Modify Parameter                — Add-List-Element
+  T0843 Program Download                — Write-Property (program-change=Load)
+  T0845 Program Upload                  — Atomic-Read-File
+  T0846 Remote System Discovery         — Who-Is / I-Am
+  T0855 Unauthorized Command Message    — Confirmed-Private-Transfer
+  T0858 Change Operating Mode           — Reinitialize-Device
+  T0861 Point & Tag Identification      — Read-Property
+  T0878 Alarm Suppression               — Acknowledge-Alarm
+  T0888 Remote System Info Discovery    — Who-Has
+  T0889 Modify Program                  — Atomic-Write-File
+
+Confirmed live 2026-07-04 against a real deployment: every request reaches the
+target, and 6 of 13 fire with a real, correctly-mapped ATT&CK technique ID —
+T0801, T0814, T0835, T0836, T0845, T0858. The other 7 either show up in Zeek's
+own bacnet.log without a matching ACID tag, or aren't logged by Zeek at all —
+not yet root-caused. Most requests come back a Reject/Error against this
+simulator's minimal object model (only 3 real points, no File/Program objects)
+— that's expected and doesn't block detection on its own, since ACID watches
+the request's service choice on the wire, not whether the reply succeeded.
+
+What you see in Malcolm:
+  - Dashboard: ICS/IoT Security Overview > ATT&CK for ICS Tactic
+  - Dashboard: ICS/IoT Security Overview > ICS Tactics and Techniques
+  - Dashboard: ICS/IoT Security Overview > ACID on ATT&CK for ICS
+  - notice.log: ATTACKICS::* entries
+
+════════════════════════════════════════════════════════
+ 4. ETHERNET/IP-CIP ACID / ATT&CK FOR ICS ATTACK
+════════════════════════════════════════════════════════
+Target : enip-server  192.168.40.10 : 44818  (TCP)
+Prereq : enip-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/enip_attack.py --target 192.168.40.10
+
+CIP's ACID coverage is matched by raw Class/Service byte pairs, not service
+names (unlike BACnet) — 5 rows, all issued in one pass:
+  Handshake            Class 0x8e Service 0x5c
+  T0836 Modify Parameter    Class 0x6a Service 0x51
+  T0843 Program Download    Class 0xac Service 0x08
+  T0858 Change Operating Mode  Class 0x8e Service 0x06 and 0x07 (both sent)
+  Forcing              Class 0x68 Service 0x4d, and Class 0x69 Service 0x4e
+
+None of these classes exist in enip-server's minimal object model (just
+Sensor1/Solenoid1), so every one of these comes back a malformed/garbled
+reply — that's expected and doesn't matter for detection, since ACID watches
+the request's Class/Service byte pair on the wire, not whether the device
+understood it. Also runs a plain recon + force-solenoid + spoof-sensor
+sequence first (real protocol-level demo value, but doesn't map to any ACID
+row — ordinary tag access isn't one of CIP's vendor/engineering-access
+services).
+
+Confirmed live 2026-07-04 against a real Malcolm deployment: ALL 7 requests
+fire in ACID. 4 get a real numbered technique ID (T0836, T0843, T0858 x2);
+the other 3 (Handshake, Forcing x2) get a correctly-mapped tactic with no
+numbered technique (same as S7comm's Handshake — neither is an officially
+numbered MITRE technique). This is the best first-pass result of the three
+ACID-covered protocols. Getting here needed cpppo's connector calls to pass
+route_path=False, send_path=False explicitly — without it, cpppo wraps every
+request in an "Unconnected Send" envelope by default, which is what Zeek
+actually parses as the top-level CIP service (Class 6/Service 0x52) instead
+of our intended Class/Service pair, and nothing fires at all. See
+enip_attack.py's module docstring for the full story.
+
+Also fires a real ENIP "List Identity" (UDP) and a hand-built "Connected I/O"
+datagram burst (raw UDP:2222, using a real Forward Open connection ID) before
+the ACID triggers — these populate Malcolm's own built-in "CIP - Device
+Identity", "CIP - Identity Logs", and "CIP - IO Logs" dashboard panels, which
+nothing else here touches. Confirmed live 2026-07-04.
+
+What you see in Malcolm:
+  - Dashboard: ICS/IoT Security Overview > ATT&CK for ICS Tactic
+  - Dashboard: ICS/IoT Security Overview > ICS Tactics and Techniques
+  - Dashboard: ICS/IoT Security Overview > ACID on ATT&CK for ICS
+  - Dashboard: CIP - Device Identity, CIP - Identity Logs, CIP - IO Logs
+  - notice.log: ATTACKICS::* entries
+
+════════════════════════════════════════════════════════
+ 5. DNP3 ATTACK (no ACID coverage — see note below)
+════════════════════════════════════════════════════════
+Target : dnp3-server  192.168.30.10 : 20000  (TCP)
+Prereq : dnp3-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/dnp3_attack.py --target 192.168.30.10
+
+Three techniques, all issued in one pass, each on its own TCP connection:
+  T0846 Remote System Discovery      — unauthenticated READ (class 0 poll)
+  T0855 Unauthorized Command Message — unauthenticated DIRECT_OPERATE (trip breaker)
+  T0814 Denial of Service            — COLD_RESTART (outstation goes silent ~5s)
+
+NOTE: Malcolm's ACID package only has detection tables for S7comm/CIP/BACnet
+(see attack #1's note) — DNP3 gets no ATT&CK panel tags here. Zeek's own
+bundled dnp3.log/dnp3_control.log analyzers still parse every request/response
+above (function code, group/variation, CROB fields) — that's what any future
+DNP3-specific alerting (a hand-built OpenSearch monitor, same as Modbus) would
+be built on.
+
+What you see in Malcolm:
+  - dnp3.log / dnp3_control.log: function codes 1 (READ), 5 (DIRECT_OPERATE), 13 (COLD_RESTART)
+  - conn.log: connections from 192.168.100.10 to 192.168.30.10:20000
+
+════════════════════════════════════════════════════════
+ 6. OPC-UA ATTACK (no ACID coverage — see note below)
+════════════════════════════════════════════════════════
+Target : opcua-server  192.168.60.10 : 4840  (TCP)
+Prereq : opcua-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/opcua_attack.py --target 192.168.60.10
+
+Three techniques, all issued in one shared connection (asyncua has no known
+parser-desync risk the way S7comm/BACnet do, unlike this project's other
+per-technique-isolated scripts):
+  T0846 Remote System Discovery      — unauthenticated read of Speed/Status/FaultCode
+  T0855 Unauthorized Command Message — force Status=Running directly, bypassing the historian
+  T0836 Modify Parameter             — inject a false FaultCode (run state untouched, only diagnostics lie)
+
+NOTE: Malcolm's ACID package only has detection tables for S7comm/CIP/BACnet
+(see attack #1's note) — OPC-UA gets no ATT&CK panel tags here, same gap as
+Modbus/DNP3/FINS. OPC-UA has its own custom "OPC-UA Detection Overview"
+dashboard + OpenSearch Alerting monitor instead — verified live 2026-07-05.
+Because all 3 techniques share one connection, expect exactly 1 alert per run
+(not 3 like DNP3/FINS) — that's correct, not a bug: all 3 land in the same
+`zeek.uid` session.
+
+What you see in Malcolm:
+  - conn.log: connections from 192.168.100.10 to 192.168.60.10:4840
+  - Zeek's own OPC-UA analyzer log (opcua_binary / opcua_binary_read / opcua_binary_write)
+  - Dashboard: "OPC-UA Detection Overview"
+
+════════════════════════════════════════════════════════
+ 7. FINS ATTACK (no ACID coverage — see note below)
+════════════════════════════════════════════════════════
+Target : fins-server  192.168.70.10 : 9600  (TCP)
+Prereq : fins-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/fins_attack.py --target 192.168.70.10
+
+Three techniques, each on its own TCP connection (own FINS/TCP handshake):
+  T0846 Remote System Discovery      — unauthenticated MEMORY AREA READ of item_count (DM0) + motor (CIO 0.00)
+  T0855 Unauthorized Command Message — unauthenticated MEMORY AREA WRITE forcing motor=ON, bypassing the HMI
+  T0836 Modify Parameter             — unauthenticated MEMORY AREA WRITE falsifying item_count, run state untouched
+
+NOTE: Malcolm's ACID package only has detection tables for S7comm/CIP/BACnet
+(see attack #1's note) — FINS gets no ATT&CK panel tags here, same gap as
+Modbus/DNP3/OPC-UA. FINS has its own custom "FINS Detection Overview"
+dashboard + OpenSearch Alerting monitor instead — verified live 2026-07-05.
+FINS's hand-rolled wire protocol was also confirmed CORRECT via an isolated
+Zeek replay the same day (unlike DNP3, no fix was needed) — if Malcolm ever
+shows nothing for FINS, restart the `zeek-live` docker container on
+malcolm-1 first (a stale-capture-state issue found after switch-1 was
+rebuilt), not a wire-format problem.
+
+What you see in Malcolm:
+  - Zeek's bundled Omron FINS parser log (omron_fins / omron_fins_detail)
+  - conn.log: connections from 192.168.100.10 to 192.168.70.10:9600
+  - Dashboard: "FINS Detection Overview"
+
+════════════════════════════════════════════════════════
+ 8. PROFINET ATTACK (experimental, no ACID coverage — see note below)
+════════════════════════════════════════════════════════
+Target : profinet-server  192.168.80.10 : 34964  (UDP)
+Prereq : profinet-server VM deployed
+
+Run the attack:
+    python3 /opt/ot-attacks/profinet_attack.py --target 192.168.80.10
+
+Three techniques, each its own AR-Connect (own RPCCon):
+  T0846 Remote System Discovery      — unauthenticated acyclic "DeviceAccess" connect probe (p-net refuses the AR type, but the probe itself is logged)
+  T0855 Unauthorized Command Message — full unauthorized AR-Connect with real IOCR (cyclic-IO) negotiation — succeeds against p-net
+  T0836 Modify Parameter             — a second AR-Connect declaring a DIFFERENT I/O module in the same slot — p-net reactively re-plugs to match
+
+NOTE: PROFINET's own device-discovery protocol (DCP) is invisible in
+Malcolm — only the AR-Connect/RPC exchange (UDP port 34964) is Zeek-visible,
+which is why every technique above is a Connect attempt rather than a cheap
+DCP command, unlike every other protocol here. Malcolm's ACID package has no
+PROFINET module either (same gap as Modbus/DNP3/OPC-UA/FINS) — PROFINET has
+its own custom "PROFINET Detection Overview" dashboard + OpenSearch Alerting
+monitor instead, verified live 2026-07-05. Full live cyclic I/O DATA
+exchange is NOT implemented — p-net aborts that step with a real-time alarm
+since virtio virtual NICs don't report a real link speed; the AR/IOCR
+negotiation traffic above is what gets detected.
+
+What you see in Malcolm:
+  - Zeek's built-in PROFINET analyzer log (profinet / profinet_io_cm)
+  - conn.log: connections from 192.168.100.10 to 192.168.80.10:34964
+  - Dashboard: "PROFINET Detection Overview"
+
+════════════════════════════════════════════════════════
+ 9. METASPLOIT S7COMM RECON (optional, no server needed)
+════════════════════════════════════════════════════════
+Even without an s7comm-server this sends S7Comm handshake packets
+that Zeek parses and ACID may detect as "Device handshake" (Collection).
+
+    msfconsole -q
+    use auxiliary/scanner/scada/s7_info
+    set RHOSTS 192.168.20.10
+    set PORTS 102
+    run
+
+════════════════════════════════════════════════════════
+ 10. NMAP ICS RECON
+════════════════════════════════════════════════════════
+Discover ICS devices and open ports across OT VLANs:
+
+    sudo nmap -sV -p 102,502,4840,9600,20000,34964,44818,47808 192.168.10.0/24 192.168.20.0/24 192.168.30.0/24 192.168.40.0/24 192.168.50.0/24 192.168.60.0/24 192.168.70.0/24 192.168.80.0/24
+
+════════════════════════════════════════════════════════
+ Malcolm Dashboard Navigation
+════════════════════════════════════════════════════════
+Open https://192.168.100.254/ in browser (accept self-signed cert)
+  Username: admin   Password: vagrant  (or check /opt/malcolm/config/auth.env on malcolm-1)
+
+Relevant dashboards:
+  ICS/IoT Security Overview   → ATT&CK panels, External Traffic
+  Modbus                      → all Modbus function code panels
+  Connections                 → all traffic conn.log
+
+Time range: set top-right picker to "Last 15 minutes" to see fresh data.

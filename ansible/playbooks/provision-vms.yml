@@ -1,0 +1,7 @@
+---
+# Called by the deploy engine per scenario.
+# Inventory is generated dynamically at deploy time — not from inventory/mgmt.ini.
+- name: Provision lab VMs
+  hosts: all
+  gather_facts: false
+  tasks: []

@@ -1,0 +1,283 @@
+---
+# Install elastic-agent as Fleet Server, co-located on the ELK node.
+# Prerequisites: Elasticsearch running, Kibana running with xpack.fleet config.
+# Reuses /etc/kibana/certs/ (kibana.crt, kibana.key, elasticsearch-ca.pem).
+#
+# Required vars:
+#   lab_ip       - IP of this node (Fleet Server binds on :8220)
+#   elk_version  - Elastic stack version (elastic-agent tarball must match)
+#   elk_password - elastic superuser password
+
+# ── Step 1: Generate fleet-server service token ───────────────────
+
+- name: Generate fleet-server service token
+  uri:
+    url: "https://{{ elastic_nodes[0].ip }}:9200/_security/service/elastic/fleet-server/credential/token"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    status_code: 200
+  register: fleet_token_result
+  no_log: true
+
+# ── Step 2: Get CA fingerprint ────────────────────────────────────
+
+- name: Get CA certificate fingerprint
+  command: openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/elasticsearch-ca.pem
+  register: ca_fingerprint_raw
+  changed_when: false
+
+- name: Extract CA fingerprint (strip colons)
+  set_fact:
+    ca_fingerprint: "{{ ca_fingerprint_raw.stdout.split('=')[1] | replace(':', '') }}"
+
+# ── Step 2b: Ensure Fleet is initialized in Kibana ────────────────
+# Kibana's own "wait for ready" check (/api/status) only confirms its core HTTP
+# server is up — Fleet's plugin setup (default index templates, ILM policies for
+# .fleet-* indices) can still be running. Without this, elastic-agent's
+# self-bootstrap can create the fleet-server-policy before Fleet has finished
+# setting itself up, leaving the policy without a working fleet-server input —
+# symptom: "Waiting on fleet-server input to be added to policy" then a 2-minute
+# timeout. Only matters when Fleet Server isn't co-located with Kibana (the
+# co-located case happens to have enough intervening tasks to never hit this).
+
+- name: Ensure Fleet is initialized in Kibana
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/setup"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+    validate_certs: no
+    status_code: 200
+  register: _fleet_setup_result
+  until: _fleet_setup_result.status is defined and _fleet_setup_result.status == 200
+  retries: 10
+  delay: 15
+
+# ── Step 2c: Ensure fleet-server-policy exists with the Fleet Server integration ──
+# elastic-agent install --fleet-server-policy=fleet-server-policy expects this exact
+# policy to already exist with the fleet_server package attached — it does not create
+# it itself when given an explicit policy ID. Kibana's "Add Fleet Server" UI wizard
+# normally does this invisibly before showing you the install command to copy.
+#
+# The agent-policy-exists check below ONLY gates creating the agent policy object —
+# it must NOT also gate attaching the integration. A previous failed elastic-agent
+# self-bootstrap attempt can leave a broken stub policy behind (exists, but with no
+# fleet_server input wired up) — that stub lives in Elasticsearch/Kibana, not on
+# fleet-1's VM, so destroying and recreating fleet-1 alone never clears it. The
+# attach step always runs and tolerates 409 (already attached) as success, so a
+# broken pre-existing policy still gets fixed up instead of silently skipped.
+
+- name: Check if fleet-server-policy already exists
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies/fleet-server-policy"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+    validate_certs: no
+    status_code: [200, 404]
+  register: _fleet_server_policy_check
+  no_log: true
+
+- name: Create fleet-server-policy
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies?sys_monitoring=true"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      id: fleet-server-policy
+      name: "Fleet Server Policy"
+      namespace: default
+      monitoring_enabled: [logs, metrics]
+      is_default_fleet_server: true
+    validate_certs: no
+    status_code: 200
+  when: _fleet_server_policy_check.status == 404
+
+- name: Get current fleet_server package version
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/epm/packages/fleet_server"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+    validate_certs: no
+    status_code: 200
+  register: _fleet_server_package_info
+
+- name: Attach fleet_server integration to fleet-server-policy
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      policy_id: fleet-server-policy
+      name: fleet_server-1
+      namespace: default
+      package:
+        name: fleet_server
+        version: "{{ _fleet_server_package_info.json.item.version }}"
+      inputs:
+        fleet_server-fleet-server:
+          enabled: true
+          vars: {}
+          streams: {}
+    validate_certs: no
+    status_code: [200, 409]
+
+# ── Step 3: Download and install elastic-agent as Fleet Server ────
+
+- name: Download elastic-agent tarball
+  get_url:
+    url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    mode: '0644'
+
+- name: Extract elastic-agent
+  unarchive:
+    src: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: /tmp/
+    remote_src: yes
+    creates: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64/elastic-agent"
+
+# --force reinstalls cleanly if already present (new token each deploy)
+# no_log on this task only (the command line contains the service token); the
+# follow-up task below surfaces stdout/stderr on failure without re-exposing
+# the command itself, since failed_when:false here lets execution continue to it.
+- name: Install elastic-agent as Fleet Server
+  command: >
+    ./elastic-agent install
+    --url=https://{{ lab_ip }}:8220
+    --fleet-server-es=https://{{ elastic_nodes[0].ip }}:9200
+    --fleet-server-service-token={{ fleet_token_result.json.token.value }}
+    --fleet-server-policy=fleet-server-policy
+    --fleet-server-es-ca-trusted-fingerprint={{ ca_fingerprint }}
+    --certificate-authorities=/etc/kibana/certs/elasticsearch-ca.pem
+    --fleet-server-es-ca=/etc/kibana/certs/elasticsearch-ca.pem
+    --fleet-server-cert=/etc/kibana/certs/fleet-server.crt
+    --fleet-server-cert-key=/etc/kibana/certs/fleet-server.key
+    --install-servers
+    --force
+  args:
+    chdir: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64"
+  become: yes
+  no_log: true
+  register: _fleet_install_result
+  failed_when: false
+
+- name: Fail with elastic-agent's actual output if Fleet Server install failed
+  fail:
+    msg: "{{ _fleet_install_result.stdout_lines | default([]) + _fleet_install_result.stderr_lines | default([]) }}"
+  when: _fleet_install_result.rc != 0
+
+# ── Step 4: Wait for Fleet Server to accept connections ───────────
+
+- name: Wait for Fleet Server port 8220
+  wait_for:
+    host: "{{ lab_ip }}"
+    port: 8220
+    timeout: 60
+
+# ── Step 5: Update Fleet default ES output (inject CA + HTTPS URL) ─
+# Hosts: nodes with fleet_output: true; falls back to all elastic_nodes if none flagged.
+
+- name: Build Fleet ES output hosts list
+  set_fact:
+    fleet_output_hosts: >-
+      {{ ((elastic_nodes | selectattr('fleet_output', 'defined') | selectattr('fleet_output', 'equalto', true) | list)
+          if (elastic_nodes | selectattr('fleet_output', 'defined') | selectattr('fleet_output', 'equalto', true) | list | length > 0)
+          else elastic_nodes)
+         | map(attribute='ip') | map('regex_replace', '^(.*)$', 'https://\1:9200') | list }}
+
+- name: Build Fleet output config_yaml (CA cert as YAML list item)
+  shell: |
+    CERT=$(awk '{printf "    %s\n", $0}' /etc/elasticsearch/certs/elasticsearch-ca.pem)
+    printf 'ssl:\n  certificate_authorities:\n  - |\n%s' "$CERT"
+  register: fleet_config_yaml
+  changed_when: false
+
+- name: Update Fleet default ES output
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/outputs/fleet-default-output"
+    method: PUT
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      hosts: "{{ fleet_output_hosts }}"
+      config_yaml: "{{ fleet_config_yaml.stdout }}"
+      preset: "{{ fleet_output_preset | default('throughput') }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+
+# ── Step 6: Register Fleet Server host ───────────────────────────
+# PUT /api/fleet/settings fleet_server_hosts returns 400 in 9.x — use POST here instead
+
+- name: Check existing Fleet Server hosts
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/fleet_server_hosts"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+    validate_certs: no
+    status_code: 200
+  register: fleet_hosts_list
+  no_log: true
+
+- name: Register Fleet Server host
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/fleet_server_hosts"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: default
+      host_urls:
+        - "https://{{ lab_ip }}:8220"
+      is_default: true
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: fleet_hosts_list.json['items'] | length == 0
+
+# ── Step 7: Restart elastic-agent ────────────────────────────────
+
+- name: Restart elastic-agent
+  systemd:
+    name: elastic-agent
+    state: restarted
+  become: yes

@@ -1,0 +1,29 @@
+---
+# Task: Configure a subinterface (dot1Q) on Cisco IOS-XE
+# Variables:
+#   interface:   Parent interface (e.g. GigabitEthernet3)
+#   vlan_id:     VLAN ID for encapsulation (e.g. 10)
+#   description: Subinterface description
+#   ip_address:  IPv4 address (e.g. 172.16.100.254)
+#   mask:        Subnet mask (e.g. 255.255.255.0)
+#   native:      Use dot1Q native encapsulation — accept untagged frames as this VLAN
+#                (required when connected to OVS access port via libvirt UDP tunnel,
+#                 which strips 802.1Q tags at the virtio layer). Default false.
+#   nat_inside:  Set subinterface as NAT inside (optional, default false)
+#   nat_outside: Set subinterface as NAT outside (optional, default false)
+
+- name: Enable parent interface {{ interface }}
+  cisco.ios.ios_config:
+    lines:
+      - no shutdown
+    parents: interface {{ interface }}
+
+- name: Configure subinterface {{ interface }}.{{ vlan_id }}
+  cisco.ios.ios_config:
+    lines:
+      - "encapsulation dot1Q {{ vlan_id }}{{ ' native' if native | default(false) else '' }}"
+      - description {{ description }}
+      - ip address {{ ip_address }} {{ mask }}
+      - "{{ 'ip nat inside' if nat_inside | default(false) else 'no ip nat inside' }}"
+      - "{{ 'ip nat outside' if nat_outside | default(false) else 'no ip nat outside' }}"
+    parents: interface {{ interface }}.{{ vlan_id }}

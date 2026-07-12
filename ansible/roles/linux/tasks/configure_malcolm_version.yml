@@ -1,0 +1,48 @@
+---
+# Pin Malcolm to a specific release by rewriting all image tags in
+# docker-compose.yml and pulling the new images before Malcolm starts.
+#
+# Malcolm is pre-installed on the generic-x64/debian12 template at whatever
+# version was current when the template was built.  This task makes the
+# deployed version deterministic and independent of the template age.
+#
+# On first deploy the version usually differs from the template, so images are
+# pulled and Malcolm is restarted here.  On re-deploy with the same version
+# the replace produces no change and the task is a no-op.
+#
+# Variables:
+#   malcolm_version:  Malcolm release tag, e.g. "24.10.0"  (required)
+#   malcolm_dir:      Malcolm install directory              (default: /opt/malcolm)
+
+- name: Read current Malcolm version from docker-compose.yml
+  shell: >
+    grep -m1 'ghcr.io/idaholab/malcolm/' {{ malcolm_dir | default('/opt/malcolm') }}/docker-compose.yml
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+  register: _current_version
+  changed_when: false
+  become: true
+
+- name: Rewrite Malcolm image tags to {{ malcolm_version }}
+  replace:
+    path: "{{ malcolm_dir | default('/opt/malcolm') }}/docker-compose.yml"
+    regexp: '(ghcr\.io/idaholab/malcolm/[^:]+:)[0-9]+\.[0-9]+\.[0-9]+'
+    replace: '\g<1>{{ malcolm_version }}'
+  register: _tags_updated
+  when: (_current_version.stdout | trim) != malcolm_version
+  become: true
+
+- name: Pull Malcolm {{ malcolm_version }} images
+  command: docker compose --profile malcolm pull
+  args:
+    chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+  when: _tags_updated is changed
+  changed_when: true
+  become: true
+
+- name: Restart Malcolm at {{ malcolm_version }}
+  command: docker compose --profile malcolm up -d --force-recreate
+  args:
+    chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+  when: _tags_updated is changed
+  changed_when: true
+  become: true

@@ -1,0 +1,36 @@
+---
+# Task: Create firewall addresses and address groups on FortiGate
+# Variables:
+#   network_addresses: List of network address objects
+#     - name: "SERVERS-172.16.10.0/24"
+#       subnet: "172.16.10.0 255.255.255.0"
+#   network_address_groups: List of address groups
+#     - name: "LAN-networks"
+#       members:
+#         - name: "SERVERS-172.16.10.0/24"
+
+- name: Create firewall addresses
+  fortios_firewall_address:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    firewall_address:
+      name: "{{ item.name }}"
+      subnet: "{{ item.subnet }}"
+  loop: "{{ network_addresses | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure firewall address groups
+  fortios_firewall_addrgrp:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    firewall_addrgrp:
+      name: "{{ item.name }}"
+      member: "{{ item.members }}"
+  loop: "{{ network_address_groups | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

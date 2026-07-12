@@ -1,0 +1,44 @@
+---
+- name: Detect main network interface
+  ansible.builtin.shell: |
+    ip route show default | awk '{print $5}' | head -1
+  register: main_iface
+  changed_when: false
+  tags: offload
+
+- name: Create offload disable script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/disable-offload.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      IFACE="{{ main_iface.stdout }}"
+      if [ -n "$IFACE" ]; then
+        ethtool -K "$IFACE" rx off tx off tso off gso off gro off lro off sg off 2>/dev/null || true
+      fi
+  tags: offload
+
+- name: Create offload disable systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/disable-offload.service
+    content: |
+      [Unit]
+      Description=Disable network offload for KVM nested virtualization
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/disable-offload.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  tags: offload
+
+- name: Enable and start offload disable service
+  ansible.builtin.systemd:
+    name: disable-offload
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: offload

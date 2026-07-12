@@ -1,0 +1,38 @@
+---
+# Task: Configure zone-to-zone forwarding on NethSecurity
+# Variables:
+#   forwardings: list of zone forwarding pairs
+#     - src:  Source zone (e.g. "lan")
+#       dest: Destination zone (e.g. "wan")
+
+- name: Add zone forwarding entries
+  ansible.builtin.command:
+    cmd: uci add firewall forwarding
+  loop: "{{ forwardings }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.src }}->{{ item.dest }}"
+
+- name: Set forwarding source zones
+  ansible.builtin.shell:
+    cmd: "uci set firewall.@forwarding[-1].src={{ item.src }}"
+  loop: "{{ forwardings }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.src }}->{{ item.dest }}"
+
+- name: Set forwarding destination zones
+  ansible.builtin.shell:
+    cmd: "uci set firewall.@forwarding[-1].dest={{ item.dest }}"
+  loop: "{{ forwardings }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.src }}->{{ item.dest }}"
+
+- name: Commit firewall config
+  ansible.builtin.command:
+    cmd: uci commit firewall
+
+- name: Restart firewall
+  ansible.builtin.command:
+    cmd: /etc/init.d/firewall restart

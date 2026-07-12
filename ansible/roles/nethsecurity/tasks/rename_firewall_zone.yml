@@ -1,0 +1,46 @@
+---
+# Task: Rename an existing firewall zone on NethSecurity
+# Variables:
+#   old_zone:   Existing UCI zone section name to remove (e.g. "ns_lan")
+#   new_zone:   New UCI zone section name to create (e.g. "ns_mgmt")
+#   zone_name:  Zone display name (e.g. "mgmt")
+#   network:    UCI interface name to assign (e.g. "mgmt")
+#   input:      Default input policy: ACCEPT, REJECT, DROP
+#   output:     Default output policy: ACCEPT, REJECT, DROP
+#   forward:    Default forward policy: ACCEPT, REJECT, DROP
+
+- name: Create new zone {{ new_zone }}
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}=zone"
+
+- name: Set zone name
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}.name={{ zone_name }}"
+
+- name: Set zone network
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}.network={{ network }}"
+
+- name: Set zone input policy
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}.input={{ input }}"
+
+- name: Set zone output policy
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}.output={{ output }}"
+
+- name: Set zone forward policy
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ new_zone }}.forward={{ forward }}"
+
+- name: Delete old zone {{ old_zone }}
+  ansible.builtin.command:
+    cmd: "uci delete firewall.{{ old_zone }}"
+
+- name: Commit firewall config
+  ansible.builtin.command:
+    cmd: uci commit firewall
+
+- name: Restart firewall
+  ansible.builtin.command:
+    cmd: /etc/init.d/firewall restart

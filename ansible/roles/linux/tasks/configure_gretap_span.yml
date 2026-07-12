@@ -1,0 +1,102 @@
+---
+# Configure a gretap L2 tunnel to receive SPAN/mirror frames from ot-switch.
+# Runs on the Malcolm VM.  The tunnel receives copies of all OT traffic for
+# pcap-capture, Arkime-live, Suricata-live, and Zeek-live analysis.
+#
+# After this task: Malcolm's pcap-capture.env has PCAP_IFACE set to the gretap
+# interface name, and a systemd unit keeps the interface up across reboots.
+# If Malcolm's docker-compose stack is already running the capture containers
+# are force-recreated so they pick up the new interface.
+#
+# Variables:
+#   gretap_iface:         gretap interface name — same value used on the switch side.
+#                         MUST NOT contain hyphens (default: grespan)
+#   gretap_local_ip:      Management IP of this VM (Malcolm side).
+#                         Use `{{ management_ip }}` — injected by the platform for every VM.
+#   gretap_remote_ip:     Management IP of ot-switch-1 (tunnel remote endpoint).
+#   pcap_capture_env:     Path to Malcolm's pcap-capture.env
+#                         (default: /opt/malcolm/config/pcap-capture.env)
+#   malcolm_compose_dir:  Directory containing Malcolm's docker-compose.yml
+#                         (default: /opt/malcolm)
+
+- name: Create gretap tunnel interface (ignore if already exists)
+  command: >
+    ip link add {{ gretap_iface | default('grespan') }} type gretap
+    local {{ gretap_local_ip }} remote {{ gretap_remote_ip }}
+  changed_when: false
+  failed_when: false
+
+# Linux auto-calculates a new gretap's MTU from the outbound route's MTU minus
+# encapsulation overhead — on this platform that route is a Proxmox VXLAN-backed
+# vNIC already reduced to 1450, so gretap lands on ~1412. Real OT traffic reaches
+# ~1432 bytes, which the kernel silently drops at the gretap device
+# ("dropped over-mtu packet") — confirmed live on 2026-07-02 as the reason
+# Modbus/ICS traffic never reached Zeek even though the OVS mirror was working.
+# Force 1500 explicitly; any resulting oversized encapsulated packet is
+# fragmented transparently by IP rather than dropped outright.
+- name: Set gretap interface MTU (auto-calculated MTU silently drops real traffic)
+  command: ip link set {{ gretap_iface | default('grespan') }} mtu 1500
+  changed_when: false
+
+- name: Bring gretap interface up in promiscuous mode
+  command: ip link set {{ gretap_iface | default('grespan') }} up promisc on
+  changed_when: false
+
+- name: Install malcolm-span-tunnel systemd service
+  copy:
+    dest: /etc/systemd/system/malcolm-span-tunnel.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=gretap SPAN tunnel receiver for Malcolm packet capture
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash -c '\
+        ip link add {{ gretap_iface | default("grespan") }} type gretap \
+          local {{ gretap_local_ip }} remote {{ gretap_remote_ip }} 2>/dev/null || true; \
+        ip link set {{ gretap_iface | default("grespan") }} mtu 1500; \
+        ip link set {{ gretap_iface | default("grespan") }} up promisc on'
+      ExecStop=/bin/bash -c '\
+        ip link del {{ gretap_iface | default("grespan") }} 2>/dev/null || true'
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start malcolm-span-tunnel service
+  systemd:
+    name: malcolm-span-tunnel.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Set PCAP_IFACE in Malcolm pcap-capture.env
+  lineinfile:
+    path: "{{ pcap_capture_env | default('/opt/malcolm/config/pcap-capture.env') }}"
+    regexp: '^PCAP_IFACE='
+    line: "PCAP_IFACE={{ gretap_iface | default('grespan') }}"
+    state: present
+
+- name: Check if Malcolm capture containers are running
+  command: >
+    docker compose --profile malcolm ps --services --filter status=running
+  args:
+    chdir: "{{ malcolm_compose_dir | default('/opt/malcolm') }}"
+  register: malcolm_running_services
+  changed_when: false
+  failed_when: false
+
+- name: Force-recreate Malcolm live-capture containers to pick up new PCAP_IFACE
+  command: >
+    docker compose --profile malcolm up -d --force-recreate
+    pcap-capture zeek-live suricata-live arkime-live
+  args:
+    chdir: "{{ malcolm_compose_dir | default('/opt/malcolm') }}"
+  when:
+    - malcolm_running_services.rc == 0
+    - "'pcap-capture' in malcolm_running_services.stdout or 'zeek-live' in malcolm_running_services.stdout"
+  changed_when: true

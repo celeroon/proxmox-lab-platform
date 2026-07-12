@@ -1,0 +1,10 @@
+---
+# Task: Enroll Windows host into Elastic Fleet via pre-rendered PowerShell script
+# Requires: C:\win-setup\deploy-elastic-agent.ps1 (rendered during setup_directory_files)
+#           C:\win-setup\elasticsearch-ca.pem (copied during setup_certificate)
+
+- name: Run Elastic Agent deployment script
+  ansible.windows.win_shell: |
+    C:\win-setup\deploy-elastic-agent.ps1
+  async: 600
+  poll: 15

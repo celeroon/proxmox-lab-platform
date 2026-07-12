@@ -1,0 +1,15 @@
+---
+- name: Generate /etc/network/interfaces from template
+  template:
+    src: "{{ lab_ansible_dir }}/roles/ovs/templates/interfaces.j2"
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: '0644'
+    backup: yes
+
+- name: Restart networking service (apply OVS bridge and port configuration)
+  systemd:
+    name: networking
+    state: restarted
+  ignore_errors: yes

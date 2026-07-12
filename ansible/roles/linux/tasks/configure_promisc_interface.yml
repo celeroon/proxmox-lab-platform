@@ -1,0 +1,38 @@
+---
+# Configure a network interface in promiscuous mode and persist it across reboots.
+#
+# Variables:
+#   interface: interface name to set promiscuous (e.g. eth2)
+
+- name: Set interface to promiscuous mode
+  command: ip link set {{ interface }} promisc on up
+  changed_when: false
+  become: true
+
+- name: Write systemd unit to persist promiscuous mode at boot
+  copy:
+    dest: /etc/systemd/system/promisc-{{ interface }}.service
+    content: |
+      [Unit]
+      Description=Enable promiscuous mode on {{ interface }}
+      After=network.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=ip link set {{ interface }} promisc on up
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Enable and start promisc service
+  systemd:
+    name: "promisc-{{ interface }}.service"
+    enabled: yes
+    daemon_reload: yes
+    state: started
+  become: true

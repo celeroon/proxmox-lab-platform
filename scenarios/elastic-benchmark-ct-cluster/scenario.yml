@@ -1,0 +1,504 @@
+version: 1
+name: Elastic Benchmark — Capacity Scaling Cluster + CT Agents
+description: >
+  Role-separated ES cluster constrained to 1 data node so it saturates at ~100-150
+  agents, then scales out live (add data-2/coord-1/data-warm-1/data-cold-1 and recover
+  with Rally). Scale-out nodes must be created (--skip-ansible) before master-1;
+  never deploy without --target.
+
+vm_prefix: ""
+
+# All 10 eventual ES nodes are listed up front — cert pre-generation needs every
+# node's IP resolvable at bootstrap time, even ones provisioned much later.
+x-elastic-config: &elastic-config
+  elastic_nodes:
+    - {name: master-1, ip: "{{ master_1_ip | default(ansible_host) }}", roles: [master]}
+    - {name: data-1, ip: "{{ data_1_ip }}", roles: [data_hot, data_content]}
+    - {name: ingest-1, ip: "{{ ingest_1_ip }}", roles: [ingest], fleet_output: true}
+    - {name: data-2, ip: "{{ data_2_ip }}", roles: [data_hot, data_content]}
+    - {name: coord-1, ip: "{{ coord_1_ip }}", roles: []}
+    - {name: data-warm-1, ip: "{{ data_warm_1_ip }}", roles: [data_warm]}
+    - {name: data-cold-1, ip: "{{ data_cold_1_ip }}", roles: [data_cold]}
+  elk_version: "9.4.2"
+  elk_password: "labpassword"
+  elk_cert_pass: "labcertpass"
+  kibana_ip: "{{ kibana_1_ip | default(ansible_host) }}"
+  fleet_ip: "{{ fleet_1_ip | default(ansible_host) }}"
+  mirror_ip: "{{ mgmt_1_ip }}"
+  es_exporter_password: "labexporterpass"
+  ilm_rollover_max_size: "2gb"
+  # Create the .security index on data-1 — master-1 is master-only and can't hold data.
+  es_monitoring_user_host_ip: "{{ data_1_ip }}"
+
+vms:
+  - name: mgmt-1
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: linux/install_xfce
+        - task: services/prometheus
+        - task: services/grafana
+        - task: linux/create_accesses_file
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "prometheus.local"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "grafana.local"
+        - task: linux/add_hosts_entry
+          vars:
+            # Kibana's port, not raw ES — point at kibana-1 (separate VM here).
+            hosts_entry_ip: "{{ kibana_1_ip }}"
+            hosts_entry_name: "elastic.local"
+        # /etc/hosts aliases so mgmt-1 can use node names instead of raw IPs.
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ master_1_ip }}"
+            hosts_entry_name: "master-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ data_1_ip }}"
+            hosts_entry_name: "data-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ ingest_1_ip }}"
+            hosts_entry_name: "ingest-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ kibana_1_ip }}"
+            hosts_entry_name: "kibana-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ fleet_1_ip }}"
+            hosts_entry_name: "fleet-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ data_2_ip }}"
+            hosts_entry_name: "data-2"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ coord_1_ip }}"
+            hosts_entry_name: "coord-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ data_warm_1_ip }}"
+            hosts_entry_name: "data-warm-1"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ data_cold_1_ip }}"
+            hosts_entry_name: "data-cold-1"
+        - task: services/apt_cacher_ng
+        - task: services/elastic_agent_mirror
+        - task: services/esrally
+
+  # Core cluster (Step B — provision after the Step A scale-out VMs exist).
+
+  - name: master-1
+    depends_on: [mgmt-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_bootstrap
+        - task: services/elasticsearch
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [master, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/elasticsearch_ilm
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: data-1
+    depends_on: [master-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 8
+    memory: 32768
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [data_hot, data_content, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: ingest-1
+    depends_on: [master-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [ingest, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: kibana-1
+    depends_on: [master-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/kibana_fetch_certs
+        - task: services/kibana
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: fleet-1
+    depends_on: [kibana-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 2
+    memory: 2048
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/fleet_fetch_certs
+        - task: services/fleet_server
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/fleet_filestream_policy
+
+  # Scale-out nodes (Step A — create with --skip-ansible; provision later via --target).
+
+  - name: data-2
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 8
+    memory: 32768
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [data_hot, data_content, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: coord-1
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [remote_cluster_client]   # coordinating + CCS client — requires the node_roles template fix
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: data-warm-1
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 4
+    memory: 16384
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [data_warm, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  - name: data-cold-1
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 2
+    memory: 8192
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: [data_cold, remote_cluster_client]
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+
+  # Agent batches — add incrementally with --target. 4 x 50 = 200 agents max.
+
+  - name: agent-batch-1
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-2
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-3
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-4
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500

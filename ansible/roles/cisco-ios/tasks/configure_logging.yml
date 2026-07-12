@@ -1,0 +1,35 @@
+---
+# Task: Configure syslog logging on Cisco IOS-XE
+# Variables:
+#   timezone:           Timezone name (e.g. CET)
+#   timezone_offset:    UTC offset in hours (e.g. 1)
+#   summer_time:        Summer time name (e.g. CEST)
+#   syslog_host:        Remote syslog server IP (e.g. 172.16.10.10)
+#   syslog_port:        UDP port for syslog (e.g. 9010)
+#   syslog_level:       Logging trap level (e.g. debugging)
+#   source_interface:   Source interface for syslog (e.g. GigabitEthernet3)
+#   facility:           Syslog facility (e.g. local7)
+
+- name: Configure logging
+  cisco.ios.ios_config:
+    lines:
+      - clock timezone {{ timezone }} {{ timezone_offset }}
+      - clock summer-time {{ summer_time }} recurring last Sun Mar 2:00 last Sun Oct 3:00
+      - logging on
+      - service timestamps log datetime msec
+      - logging host {{ syslog_host }} transport udp port {{ syslog_port }}
+      - logging trap {{ syslog_level }}
+      - logging source-interface {{ source_interface }}
+      - logging facility {{ facility }}
+      - login on-failure log
+      - login on-success log
+
+- name: Configure archive log config
+  cisco.ios.ios_config:
+    lines:
+      - logging enable
+      - notify syslog
+      - hidekeys
+    parents:
+      - archive
+      - log config

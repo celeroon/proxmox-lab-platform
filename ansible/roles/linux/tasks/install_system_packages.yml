@@ -1,0 +1,17 @@
+---
+# Install common system packages on Debian/Ubuntu VMs
+#
+# Optional vars:
+#   system_packages - list of packages to install (default: curl, git, jq)
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  become: yes
+
+- name: Install system packages
+  apt:
+    name: "{{ system_packages | default(['curl', 'git', 'jq']) }}"
+    state: present
+  become: yes

@@ -1,0 +1,23 @@
+---
+# Task: Configure NetFlow on FortiGate
+# Variables:
+#   netflow_collector_ip:       Collector IP address
+#   netflow_collector_port:     Collector UDP port (default: 9011)
+#   netflow_source_ip:          Source IP for NetFlow packets
+#   netflow_active_timeout:     Active flow timeout in minutes (default: 60)
+#   netflow_inactive_timeout:   Inactive flow timeout in seconds (default: 15)
+#   netflow_template_tx_timeout: Template transmission timeout (default: 60)
+#   netflow_template_tx_counter: Template transmission counter (default: 20)
+
+- name: Configure NetFlow collector
+  fortios_system_netflow:
+    vdom: "{{ vdom | default('root') }}"
+    system_netflow:
+      collector_ip: "{{ netflow_collector_ip }}"
+      collector_port: "{{ netflow_collector_port | default(9011) }}"
+      source_ip: "{{ netflow_source_ip }}"
+      active_flow_timeout: "{{ netflow_active_timeout | default(60) }}"
+      inactive_flow_timeout: "{{ netflow_inactive_timeout | default(15) }}"
+      template_tx_timeout: "{{ netflow_template_tx_timeout | default(60) }}"
+      template_tx_counter: "{{ netflow_template_tx_counter | default(20) }}"
+      interface_select_method: "auto"

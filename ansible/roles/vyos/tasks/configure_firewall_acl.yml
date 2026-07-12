@@ -1,0 +1,59 @@
+---
+# Task: Configure IPv4 firewall ACLs on VyOS 1.4+
+# Per-interface firewall apply was removed in VyOS 1.4+. This task uses the global
+# "forward filter" chain (set firewall ipv4 forward filter) which intercepts all
+# traffic being routed through the box — the correct mechanism for inter-VLAN ACL.
+#
+# Variables:
+#   network_groups: list of {name, networks[]} — named subnet groups for rule matching
+#   forward_filter: global forwarded-traffic filter
+#     default_action: accept|drop
+#     rules:
+#       - rule: <N>
+#         action: accept|drop
+#         match_established: true     # optional — match ESTABLISHED state
+#         match_related: true         # optional — match RELATED state
+#         source_address: 10.0.0.0/8 # optional — source CIDR
+#         source_group: GROUP-NAME    # optional — match source network-group
+#         destination_address: ...    # optional — destination CIDR
+#         destination_group: ...      # optional — match destination network-group
+
+- name: Build firewall network group lines
+  set_fact:
+    acl_lines: "{{ acl_lines | default([]) + [
+      'set firewall group network-group ' ~ item.0.name ~ ' network ' ~ item.1
+    ] }}"
+  loop: "{{ network_groups | default([]) | subelements('networks') }}"
+
+- name: Build forward filter default-action line
+  set_fact:
+    acl_lines: "{{ acl_lines | default([]) + [
+      'set firewall ipv4 forward filter default-action ' ~ forward_filter.default_action
+    ] }}"
+  when: forward_filter is defined
+
+- name: Build forward filter rule lines
+  set_fact:
+    acl_lines: "{{ acl_lines | default([]) + [
+      'set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' action ' ~ item.action
+    ]
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' state established'] if item.match_established | default(false) else [])
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' state related'] if item.match_related | default(false) else [])
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' source address ' ~ item.source_address] if item.source_address is defined else [])
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' source group network-group ' ~ item.source_group] if item.source_group is defined else [])
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' destination address ' ~ item.destination_address] if item.destination_address is defined else [])
+    + (['set firewall ipv4 forward filter rule ' ~ (item.rule | string) ~ ' destination group network-group ' ~ item.destination_group] if item.destination_group is defined else [])
+    }}"
+  loop: "{{ forward_filter.rules | default([]) }}"
+  when: forward_filter is defined
+
+- name: Apply firewall configuration
+  vyos.vyos.vyos_config:
+    lines: "{{ acl_lines }}"
+  vars:
+    ansible_command_timeout: 60
+  when: acl_lines is defined
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

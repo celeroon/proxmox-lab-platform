@@ -1,0 +1,78 @@
+---
+# Task: Configure DHCP servers on NethSecurity via dnsmasq UCI
+# Note: Uses direct dnsmasq UCI instead of ns.dhcp API, which does not
+#       support manually created VLAN interfaces. The GUI DHCP page
+#       requires separate ipaddr/netmask fields on the network interface
+#       (not CIDR notation) or ns.dhcp get-interface will crash.
+# Variables:
+#   dhcp_servers: list of DHCP servers to configure
+#     - interface: UCI interface name (e.g. "vlan20")
+#       start:     First IP offset or full IP of range start (e.g. "100")
+#       limit:     Number of addresses in range (e.g. "101" for .100-.200)
+#       leasetime: Lease duration (e.g. "12h")
+#       gateway:   Default gateway IP (e.g. "172.16.20.254")
+#       dns:       DNS server IP (e.g. "8.8.8.8")
+
+- name: Create DHCP sections
+  ansible.builtin.command:
+    cmd: "uci set dhcp.{{ item.interface }}=dhcp"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP interfaces
+  ansible.builtin.command:
+    cmd: "uci set dhcp.{{ item.interface }}.interface={{ item.interface }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP start
+  ansible.builtin.command:
+    cmd: "uci set dhcp.{{ item.interface }}.start={{ item.start }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP limit
+  ansible.builtin.command:
+    cmd: "uci set dhcp.{{ item.interface }}.limit={{ item.limit }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP lease time
+  ansible.builtin.command:
+    cmd: "uci set dhcp.{{ item.interface }}.leasetime={{ item.leasetime }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP gateway option
+  ansible.builtin.command:
+    cmd: "uci add_list dhcp.{{ item.interface }}.dhcp_option=3,{{ item.gateway }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Set DHCP DNS option
+  ansible.builtin.command:
+    cmd: "uci add_list dhcp.{{ item.interface }}.dhcp_option=6,{{ item.dns }}"
+  loop: "{{ dhcp_servers }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.interface }}"
+
+- name: Commit DHCP config
+  ansible.builtin.command:
+    cmd: uci commit dhcp
+
+- name: Restart dnsmasq
+  ansible.builtin.command:
+    cmd: /etc/init.d/dnsmasq restart

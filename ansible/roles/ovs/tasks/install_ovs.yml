@@ -1,0 +1,12 @@
+---
+- name: Install Open vSwitch
+  apt:
+    name: openvswitch-switch
+    state: present
+    update_cache: yes
+
+- name: Enable and start Open vSwitch service
+  systemd:
+    name: openvswitch-switch
+    enabled: yes
+    state: started

@@ -1,0 +1,10 @@
+---
+# Task: Configure NAT overload (PAT) on Cisco IOS-XE
+# Variables:
+#   acl_name:       ACL name to match inside traffic (e.g. NAT_ACL)
+#   outside_interface: Exit interface for NAT (e.g. GigabitEthernet2)
+
+- name: Configure NAT overload via {{ outside_interface }}
+  cisco.ios.ios_config:
+    lines:
+      - ip nat inside source list {{ acl_name }} interface {{ outside_interface }} overload

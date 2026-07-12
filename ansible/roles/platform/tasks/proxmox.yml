@@ -1,0 +1,222 @@
+---
+# All Proxmox API tasks run from localhost using the uri module.
+# Credentials are read from environment (exported by setup.sh before calling ansible-playbook).
+
+- name: Set Proxmox API facts
+  ansible.builtin.set_fact:
+    px_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+    px_port: "{{ lookup('env', 'PROXMOX_PORT') | default('8006', true) }}"
+    px_auth: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    px_ssl: "{{ (lookup('env', 'PROXMOX_VERIFY_SSL') | default('false', true)) | bool }}"
+    tmpl_dir: "{{ lookup('env', 'TEMPLATES_DIR') | default('/var/lib/lab-platform/templates', true) }}"
+  tags: proxmox
+
+# ── Get cluster nodes ──────────────────────────────────────────────────────────
+
+- name: Get Proxmox cluster status
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/status"
+    method: GET
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: 200
+  register: px_cluster_resp
+  tags: proxmox
+
+- name: Set node IP list
+  ansible.builtin.set_fact:
+    px_node_ips: >-
+      {{ px_cluster_resp.json.data
+         | selectattr('type', 'equalto', 'node')
+         | selectattr('ip', 'defined')
+         | map(attribute='ip')
+         | list }}
+  tags: proxmox
+
+- name: Fall back to PROXMOX_HOST when node IPs not available
+  ansible.builtin.set_fact:
+    px_node_ips: ["{{ px_host }}"]
+  when: px_node_ips | length == 0
+  tags: proxmox
+
+# ── NFS exports ───────────────────────────────────────────────────────────────
+
+- name: Configure NFS exports for Proxmox nodes
+  ansible.builtin.template:
+    src: nfs-exports.j2
+    dest: /etc/exports
+    mode: "0644"
+  vars:
+    node_ips: "{{ px_node_ips }}"
+    templates_dir: "{{ tmpl_dir }}"
+  notify: reload nfs exports
+  tags: proxmox
+
+- name: Flush handlers to apply NFS exports before registering storage pool
+  ansible.builtin.meta: flush_handlers
+  tags: proxmox
+
+# ── SDN zones ─────────────────────────────────────────────────────────────────
+
+- name: Set SDN peers
+  ansible.builtin.set_fact:
+    sdn_peers: "{{ px_node_ips | join(',') }}"
+  tags: proxmox
+
+- name: Check SDN zone labmgmt
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones/labmgmt"
+    method: GET
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: [200, 404, 500]
+  register: zone_labmgmt
+  tags: proxmox
+
+- name: Create SDN zone labmgmt
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones"
+    method: POST
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      zone: labmgmt
+      type: vxlan
+      peers: "{{ sdn_peers }}"
+    status_code: 200
+  when: zone_labmgmt.status != 200
+  tags: proxmox
+
+- name: Update SDN zone labmgmt peers
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones/labmgmt"
+    method: PUT
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      peers: "{{ sdn_peers }}"
+    status_code: 200
+  when: zone_labmgmt.status == 200
+  tags: proxmox
+
+- name: Check SDN zone labzone
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones/labzone"
+    method: GET
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: [200, 404, 500]
+  register: zone_labzone
+  tags: proxmox
+
+- name: Create SDN zone labzone
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones"
+    method: POST
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      zone: labzone
+      type: vxlan
+      peers: "{{ sdn_peers }}"
+    status_code: 200
+  when: zone_labzone.status != 200
+  tags: proxmox
+
+- name: Update SDN zone labzone peers
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn/zones/labzone"
+    method: PUT
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      peers: "{{ sdn_peers }}"
+    status_code: 200
+  when: zone_labzone.status == 200
+  tags: proxmox
+
+- name: Apply SDN config
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/cluster/sdn"
+    method: PUT
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: [200, 204]
+  tags: proxmox
+
+# ── NFS storage pool ──────────────────────────────────────────────────────────
+
+- name: Check NFS template storage pool
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/storage/nfs-templates"
+    method: GET
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: [200, 404, 500]
+  register: nfs_storage
+  tags: proxmox
+
+- name: Register NFS template storage pool in Proxmox
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/storage"
+    method: POST
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      storage: nfs-templates
+      type: nfs
+      server: "{{ ansible_default_ipv4.address }}"
+      export: "{{ tmpl_dir }}"
+      content: images,vztmpl
+    status_code: 200
+  when: nfs_storage.status != 200
+  tags: proxmox
+
+- name: Update NFS storage to include vztmpl content type
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/storage/nfs-templates"
+    method: PUT
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    body_format: form-urlencoded
+    body:
+      content: images,vztmpl
+    status_code: 200
+  when: nfs_storage.status == 200 and 'vztmpl' not in (nfs_storage.json.data.content | default(''))
+  tags: proxmox
+
+- name: Set primary node name for pveam
+  ansible.builtin.set_fact:
+    px_primary_node: >-
+      {{ px_cluster_resp.json.data
+         | selectattr('type', 'equalto', 'node')
+         | map(attribute='name')
+         | first }}
+  tags: proxmox
+
+- name: Update pveam template list
+  ansible.builtin.uri:
+    url: "https://{{ px_host }}:{{ px_port }}/api2/json/nodes/{{ px_primary_node }}/pveam/update"
+    method: POST
+    headers:
+      Authorization: "{{ px_auth }}"
+    validate_certs: "{{ px_ssl }}"
+    status_code: 200
+  ignore_errors: true
+  tags: proxmox

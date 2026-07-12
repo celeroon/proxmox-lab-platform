@@ -1,0 +1,93 @@
+---
+# Install and configure Metricbeat for Elasticsearch cluster monitoring.
+# Runs on every ES node. Reports local node metrics via the elasticsearch-xpack
+# module (127.0.0.1:9200). Outputs to all cluster nodes for resilience.
+# metricbeat setup runs only on the bootstrap node (elastic_nodes[0]).
+#
+# Required vars:
+#   lab_ip        - IP of this node (used to detect bootstrap node)
+#   elk_version   - Elastic stack version e.g. "9.4.2"
+#   elk_password  - elastic superuser password
+#   elk_cert_pass - .p12 cert password (CA PEM is already on disk from elasticsearch tasks)
+#   elastic_nodes - cluster node list
+#
+# Optional vars:
+#   kibana_ip     - Kibana host for setup.kibana; defaults to elastic_nodes[0].ip
+
+# ── Step 1: Add Elastic APT repository ───────────────────────────
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, gpg, wget]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/es-gpg.asc
+    mode: '0644'
+
+- name: Add Elasticsearch GPG keyring
+  shell: gpg --dearmor < /tmp/es-gpg.asc > /usr/share/keyrings/elasticsearch-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+  become: yes
+
+- name: Add Elasticsearch APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elk_version.split('.')[0] }}.x/apt stable main"
+    state: present
+    filename: elastic
+  become: yes
+
+# ── Step 2: Install ───────────────────────────────────────────────
+
+- name: Install Metricbeat
+  apt:
+    name: "metricbeat={{ elk_version }}"
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 3: Deploy main config ────────────────────────────────────
+
+- name: Deploy metricbeat.yml
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/metricbeat.yml.j2"
+    dest: /etc/metricbeat/metricbeat.yml
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+
+# ── Step 4: Deploy elasticsearch-xpack module config ─────────────
+
+- name: Deploy elasticsearch-xpack module config
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/elasticsearch-xpack.yml.j2"
+    dest: /etc/metricbeat/modules.d/elasticsearch-xpack.yml
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+
+# ── Step 5: Run setup on bootstrap node only ─────────────────────
+# Uploads dashboards + ILM policies to Kibana.
+# ignore_errors: yes — non-fatal when Kibana is not yet ready at deploy time.
+
+- name: Run metricbeat setup (bootstrap node only)
+  command: metricbeat setup --index-management
+  become: yes
+  when: lab_ip == elastic_nodes[0].ip
+
+# ── Step 6: Start service ─────────────────────────────────────────
+
+- name: Enable and start Metricbeat
+  systemd:
+    name: metricbeat
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes

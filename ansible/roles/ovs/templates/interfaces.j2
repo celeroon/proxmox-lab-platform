@@ -1,0 +1,46 @@
+# Loopback interface
+auto lo
+iface lo inet loopback
+
+# Management interface
+auto {{ management_interface.name }}
+{% if management_interface.address == 'dhcp' %}
+iface {{ management_interface.name }} inet dhcp
+{% else %}
+iface {{ management_interface.name }} inet static
+    address {{ management_interface.address }}
+    netmask {{ management_interface.netmask }}
+{% endif %}
+
+# OVS Bridge
+auto {{ bridge_name }}
+iface {{ bridge_name }} inet manual
+    ovs_type OVSBridge
+    ovs_ports {{ bridge_ports | map(attribute='name') | join(' ') }}{% if svi_interfaces is defined %}{{ ' ' + svi_interfaces | map(attribute='name') | join(' ') }}{% endif %}
+
+{# Generate bridge ports dynamically #}
+{% for port in bridge_ports %}
+auto {{ port.name }}
+iface {{ port.name }} inet manual
+    ovs_bridge {{ bridge_name }}
+    ovs_type OVSPort
+{% if port.type == 'trunk' and port.trunks is defined %}
+    ovs_options trunks={{ port.trunks | join(',') }}
+{% elif port.type == 'access' and port.tag is defined and port.tag is not none %}
+    ovs_options tag={{ port.tag }}
+{% endif %}
+
+{% endfor %}
+
+{# Generate SVI interfaces dynamically #}
+{% if svi_interfaces is defined %}
+{% for svi in svi_interfaces %}
+auto {{ svi.name }}
+iface {{ svi.name }} inet static
+    ovs_bridge {{ bridge_name }}
+    ovs_type OVSIntPort
+    ovs_options tag={{ svi.tag }}
+    address {{ svi.address }}
+    netmask {{ svi.netmask }}
+{% endfor %}
+{% endif %}

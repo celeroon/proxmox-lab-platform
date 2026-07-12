@@ -1,0 +1,94 @@
+---
+# Create the benchmark ILM policy and apply it to logs-* data streams.
+# Runs once, on the ES bootstrap node, after services/elasticsearch.
+#
+# Size-based rollover (not time-based) so hot -> warm -> cold migration happens
+# during a benchmark run instead of waiting days. Once data-warm-1/data-cold-1 join
+# the cluster later, ES automatically migrates eligible indices to them — this
+# policy never needs to change when those nodes are added.
+#
+# Required vars:
+#   elk_password - elastic superuser password
+#
+# Optional vars:
+#   ilm_rollover_max_size - size threshold per index before rollover (default: "2gb")
+#   ilm_number_of_shards  - primary shards per backing index (default: 1). A backing
+#                           index's write throughput is capped to whichever single
+#                           node(s) hold its primary shard(s) — set this to the
+#                           scenario's data_hot node count to let writes spread
+#                           across all of them instead of just one.
+
+# ── Step 1: Create the ILM policy ──────────────────────────────────
+
+- name: Create lab-benchmark-logs ILM policy
+  uri:
+    url: "https://127.0.0.1:9200/_ilm/policy/lab-benchmark-logs"
+    method: PUT
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    body_format: json
+    body:
+      policy:
+        phases:
+          hot:
+            actions:
+              rollover:
+                max_primary_shard_size: "{{ ilm_rollover_max_size | default('2gb') }}"
+              set_priority:
+                priority: 100
+          warm:
+            min_age: "0ms"
+            actions:
+              migrate: {}
+              allocate:
+                number_of_replicas: 0
+              forcemerge:
+                max_num_segments: 1
+              set_priority:
+                priority: 50
+          cold:
+            min_age: "0ms"
+            actions:
+              migrate: {}
+              allocate:
+                number_of_replicas: 0
+              set_priority:
+                priority: 0
+    status_code: 200
+  register: _ilm_policy_result
+  until: _ilm_policy_result.status is defined and _ilm_policy_result.status == 200
+  retries: 5
+  delay: 10
+
+# ── Step 2: Override the logs-* index template to apply the policy ─
+
+- name: Override logs-* index template with the benchmark ILM policy
+  uri:
+    url: "https://127.0.0.1:9200/_index_template/lab-logs-override"
+    method: PUT
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    body_format: json
+    body:
+      # 500, not 200: integration packages (e.g. fleet_server's own
+      # logs-fleet_server.output_health-* template) install their own narrower
+      # logs-* templates at priority 200. ES refuses to install a template if
+      # two templates with EQUAL priority could both match the same index
+      # pattern ("multiple index templates may not match during index
+      # creation") — fleet_server's install fails with exactly that error if
+      # this stays at 200. Must stay above 200 to avoid colliding with any
+      # future package that also claims priority 200 under logs-*.
+      priority: 500
+      index_patterns: ["logs-*"]
+      data_stream: {}
+      template:
+        settings:
+          index.lifecycle.name: "lab-benchmark-logs"
+          index.number_of_shards: "{{ ilm_number_of_shards | default(1) }}"
+    status_code: 200
+  register: _ilm_template_result
+  until: _ilm_template_result.status is defined and _ilm_template_result.status == 200
+  retries: 5
+  delay: 10

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lab-platform"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "proxmoxer",
+    "requests",
+    "typer",
+    "python-dotenv",
+    "psycopg2-binary",
+    "pydantic-settings",
+    "httpx",
+    "pyyaml",
+    "ansible-runner",
+    "ansible",
+    "paramiko",
+    "rich",
+]
+
+[project.scripts]
+lab = "lab.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "types-PyYAML"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lab*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

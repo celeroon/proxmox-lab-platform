@@ -1,0 +1,158 @@
+version: 1
+name: Elastic Benchmark — Single Node + CT Agents
+description: >
+  Single-node Elasticsearch + Kibana + Fleet on the management network. Agent workload
+  runs as LXC containers; deploy elk-1 first, then add agent batches with --target.
+
+vm_prefix: ""
+
+x-elastic-config: &elastic-config
+  elastic_nodes:
+    - {name: elk-1, ip: "{{ elk_1_ip | default(ansible_host) }}", roles: []}
+  elk_version: "9.4.2"
+  elk_password: "labpassword"
+  elk_cert_pass: "labcertpass"
+  kibana_ip: "{{ elk_1_ip | default(ansible_host) }}"
+  fleet_ip: "{{ elk_1_ip | default(ansible_host) }}"
+  mirror_ip: "{{ mgmt_1_ip }}"
+  es_exporter_password: "labexporterpass"
+
+vms:
+  - name: mgmt-1
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: linux/install_xfce
+        - task: services/prometheus
+        - task: services/grafana
+        - task: linux/create_accesses_file
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "prometheus.local"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "grafana.local"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ elk_1_ip }}"
+            hosts_entry_name: "elastic.local"
+        - task: services/apt_cacher_ng
+        - task: services/elastic_agent_mirror
+
+  - name: elk-1
+    depends_on: [mgmt-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 16
+    memory: 65536
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_bootstrap
+        - task: services/elasticsearch
+          vars:
+            lab_ip: "{{ ansible_host }}"
+            node_roles: ~
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+            elastic_heap: "31g"
+        - task: services/metricbeat
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/kibana
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/fleet_server
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/fleet_filestream_policy
+
+  - name: agent-batch-1
+    type: container
+    depends_on: [elk-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ elk_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-2
+    type: container
+    depends_on: [elk-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ elk_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+

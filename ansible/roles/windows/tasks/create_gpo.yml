@@ -1,0 +1,25 @@
+---
+# Task: Create the domain auditing GPO and link it to the root OU.
+# Idempotent — skips creation/linking if already present.
+#
+# Required vars:
+#   gpo_audit_name — GPO display name (e.g. "Custom Domain Auditing Policy")
+#   ad_domain      — domain FQDN (e.g. "lab.local")
+#   ad_netbios     — NetBIOS / root OU name (e.g. "LAB")
+
+- name: Create and link auditing GPO
+  ansible.windows.win_shell: |
+    Import-Module GroupPolicy
+    $domDN = (Get-ADDomain).DistinguishedName
+
+    if (-not (Get-GPO -Name "{{ gpo_audit_name }}" -Domain "{{ ad_domain }}" -ErrorAction SilentlyContinue)) {
+        New-GPO -Name "{{ gpo_audit_name }}" -Domain "{{ ad_domain }}"
+    }
+
+    $links = (Get-GPInheritance -Target "OU={{ ad_netbios }},$domDN").GpoLinks
+    if (-not ($links | Where-Object { $_.DisplayName -eq "{{ gpo_audit_name }}" })) {
+        New-GPLink `
+            -Name   "{{ gpo_audit_name }}" `
+            -Target "OU={{ ad_netbios }},$domDN" `
+            -Domain "{{ ad_domain }}"
+    }

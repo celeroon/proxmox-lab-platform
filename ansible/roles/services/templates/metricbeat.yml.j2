@@ -1,0 +1,20 @@
+metricbeat.config.modules:
+  path: ${path.config}/modules.d/*.yml
+  reload.enabled: false
+
+setup.kibana:
+  host: "https://{{ kibana_ip | default(elastic_nodes[0].ip) }}:5601"
+  ssl:
+    enabled: true
+    certificate_authorities: ["/etc/elasticsearch/certs/elasticsearch-ca.pem"]
+
+output.elasticsearch:
+  hosts:
+{% for node in elastic_nodes %}
+    - "https://{{ node.ip }}:9200"
+{% endfor %}
+  username: "elastic"
+  password: "{{ elk_password }}"
+  ssl:
+    enabled: true
+    certificate_authorities: ["/etc/elasticsearch/certs/elasticsearch-ca.pem"]

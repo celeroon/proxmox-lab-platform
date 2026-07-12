@@ -1,0 +1,208 @@
+---
+# Install and configure Kibana connected to an Elasticsearch cluster.
+# Kibana is expected to be co-located on the first ES node (single-node setup).
+# Reuses the ES node's http.p12 for Kibana server SSL (same IP SANs).
+#
+# Required vars:
+#   lab_ip        - IP Kibana binds on (and serves HTTPS on)
+#   elk_version   - Elastic stack version e.g. "9.4.2"
+#   elk_password  - elastic superuser password (used to generate service account token)
+#   elk_cert_pass - .p12 cert password (used to convert http.p12 to PEM)
+#   elastic_nodes      - cluster node list; elastic_nodes[0].ip is the ES host Kibana connects to
+
+# ── Step 1: Add Elastic APT repository ───────────────────────────
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, gpg, wget]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/es-gpg.asc
+    mode: '0644'
+
+- name: Add Elasticsearch GPG keyring
+  shell: gpg --dearmor < /tmp/es-gpg.asc > /usr/share/keyrings/elasticsearch-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+  become: yes
+
+- name: Add Elastic APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elk_version.split('.')[0] }}.x/apt stable main"
+    state: present
+    filename: elastic
+  become: yes
+
+# ── Step 2: Install ───────────────────────────────────────────────
+
+- name: Install Kibana
+  apt:
+    name: "kibana={{ elk_version }}"
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 3: Certificates ──────────────────────────────────────────
+
+- name: Create Kibana certs directory
+  file:
+    path: /etc/kibana/certs
+    state: directory
+    owner: root
+    group: kibana
+    mode: '0750'
+  become: yes
+
+- name: Copy CA certificate from Elasticsearch certs
+  copy:
+    src: /etc/elasticsearch/certs/elasticsearch-ca.pem
+    dest: /etc/kibana/certs/elasticsearch-ca.pem
+    remote_src: yes
+    owner: root
+    group: kibana
+    mode: '0640'
+  become: yes
+
+- name: Extract Kibana certificate from kibana.p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/es-http-certs/kibana/kibana.p12
+    -clcerts -nokeys
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/kibana.crt
+  become: yes
+  no_log: true
+
+- name: Extract Kibana private key from kibana.p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/es-http-certs/kibana/kibana.p12
+    -nocerts -nodes
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/kibana.key
+  become: yes
+  no_log: true
+
+- name: Extract Fleet Server certificate from fleet-server.p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/es-http-certs/fleet-server/fleet-server.p12
+    -clcerts -nokeys
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/fleet-server.crt
+  become: yes
+  no_log: true
+
+- name: Extract Fleet Server private key from fleet-server.p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/es-http-certs/fleet-server/fleet-server.p12
+    -nocerts -nodes
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/fleet-server.key
+  become: yes
+  no_log: true
+
+- name: Set permissions on Kibana cert files
+  file:
+    path: "/etc/kibana/certs/{{ item.path }}"
+    owner: root
+    group: "{{ item.group }}"
+    mode: '0640'
+  loop:
+    - { path: kibana.crt, group: kibana }
+    - { path: kibana.key, group: kibana }
+    - { path: fleet-server.crt, group: root }
+    - { path: fleet-server.key, group: root }
+  become: yes
+
+# ── Step 4: Configure ─────────────────────────────────────────────
+
+- name: Deploy kibana.yml
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/kibana.yml.j2"
+    dest: /etc/kibana/kibana.yml
+    owner: root
+    group: kibana
+    mode: '0660'
+  become: yes
+
+# ── Step 5: Keystore — service account token + xpack keys ────────
+
+- name: Initialize Kibana keystore if not present
+  command: /usr/share/kibana/bin/kibana-keystore create
+  args:
+    creates: /etc/kibana/kibana.keystore
+  become: yes
+
+- name: Delete existing Kibana service account token (idempotent)
+  uri:
+    url: "https://{{ elastic_nodes[0].ip }}:9200/_security/service/elastic/kibana/credential/token/kibana_token"
+    method: DELETE
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    status_code: [200, 404]
+  no_log: true
+
+- name: Generate Kibana service account token
+  uri:
+    url: "https://{{ elastic_nodes[0].ip }}:9200/_security/service/elastic/kibana/credential/token/kibana_token"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    status_code: 200
+  register: kibana_token_result
+  no_log: true
+
+- name: Store service account token in keystore
+  shell: echo -n "{{ kibana_token_result.json.token.value }}" | /usr/share/kibana/bin/kibana-keystore add --stdin --force elasticsearch.serviceAccountToken
+  become: yes
+  no_log: true
+
+- name: Check if xpack encryption keys are already in keystore
+  command: /usr/share/kibana/bin/kibana-keystore list
+  register: kibana_keystore_list
+  become: yes
+  changed_when: false
+
+- name: Generate and store xpack encryption keys
+  shell: |
+    key1=$(head /dev/urandom | tr -dc 'a-f0-9' | fold -w 32 | head -n 1)
+    key2=$(head /dev/urandom | tr -dc 'a-f0-9' | fold -w 32 | head -n 1)
+    key3=$(head /dev/urandom | tr -dc 'a-f0-9' | fold -w 32 | head -n 1)
+    echo "$key1" | /usr/share/kibana/bin/kibana-keystore add --stdin --force xpack.encryptedSavedObjects.encryptionKey
+    echo "$key2" | /usr/share/kibana/bin/kibana-keystore add --stdin --force xpack.reporting.encryptionKey
+    echo "$key3" | /usr/share/kibana/bin/kibana-keystore add --stdin --force xpack.security.encryptionKey
+  become: yes
+  no_log: true
+  when: "'xpack.encryptedSavedObjects.encryptionKey' not in kibana_keystore_list.stdout"
+
+# ── Step 6: Start ─────────────────────────────────────────────────
+
+- name: Enable and start Kibana
+  systemd:
+    name: kibana
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+# ── Step 7: Wait for Kibana to be ready ──────────────────────────
+
+- name: Wait for Kibana to be ready
+  uri:
+    url: "https://{{ lab_ip }}:5601/api/status"
+    method: GET
+    validate_certs: no
+    status_code: 200
+  register: kibana_status
+  until: kibana_status.status == 200
+  retries: 40
+  delay: 15

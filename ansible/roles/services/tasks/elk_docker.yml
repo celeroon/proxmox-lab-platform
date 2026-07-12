@@ -1,0 +1,89 @@
+---
+# Deploy Elastic Stack (Elasticsearch + Kibana + Logstash) via Docker Compose
+# Uses: https://github.com/celeroon/docker-compose-elastic-stack
+#
+# Required vars:
+#   elk_ip       - IP address of this VM on the lab network (e.g. "172.16.10.10")
+#
+# Optional vars:
+#   elk_version  - Elastic stack version (default: "8.17.0")
+#   elk_password - Elasticsearch superuser password (default: "labpassword")
+#   elk_dir      - Working directory on the VM (default: "/setup-vm")
+
+# ── Step 1: Prepare working directory ────────────────────────────
+
+- name: Create working directory
+  file:
+    path: "{{ elk_dir | default('/setup-vm') }}"
+    state: directory
+    owner: "{{ ansible_user | default('vagrant') }}"
+    group: "{{ ansible_user | default('vagrant') }}"
+    mode: '0755'
+  become: yes
+
+# ── Step 2: Clone docker-compose repo ────────────────────────────
+
+- name: Clone docker-compose-elastic-stack repo
+  git:
+    repo: https://github.com/celeroon/docker-compose-elastic-stack.git
+    dest: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack"
+    version: main
+    force: yes
+
+# ── Step 3: Write .env with lab-specific config ───────────────────
+
+- name: Deploy .env configuration
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/elk_docker.env.j2"
+    dest: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack/.env"
+    mode: '0644'
+  become: yes
+
+# ── Step 4: Prepare certs directory (needed before first start) ──
+
+- name: Set certs directory writable for initial cert generation
+  file:
+    path: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack/certs"
+    state: directory
+    mode: '0777'
+  become: yes
+
+# ── Step 5: Build and start the stack ────────────────────────────
+
+- name: Build Elastic stack images via Docker Compose
+  command: docker-compose build
+  args:
+    chdir: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack"
+  become: yes
+
+- name: Start Elastic stack via Docker Compose
+  command: docker-compose up -d
+  args:
+    chdir: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack"
+  become: yes
+
+# ── Step 6: Wait for Elasticsearch to be healthy ─────────────────
+
+- name: Wait for Elasticsearch to be ready
+  uri:
+    url: "https://{{ elk_ip }}:9200"
+    method: GET
+    user: "elastic"
+    password: "{{ elk_password | default('labpassword') }}"
+    validate_certs: no
+    status_code: 200
+  register: es_health
+  until: es_health.status == 200
+  retries: 30
+  delay: 10
+
+# ── Step 7: Fetch CA certificate to lab host ─────────────────────
+# The CA cert is needed by Elastic Agents (Windows/Linux clients)
+# to enroll with Fleet. It is saved to data/artifacts/elk/ on the
+# lab platform host so other provisioning tasks can distribute it.
+
+- name: Fetch Elasticsearch CA certificate for agent enrollment
+  fetch:
+    src: "{{ elk_dir | default('/setup-vm') }}/docker-compose-elastic-stack/certs/elasticsearch-ca.pem"
+    dest: "{{ lab_ansible_dir }}/../data/artifacts/elk/elasticsearch-ca.pem"
+    flat: yes

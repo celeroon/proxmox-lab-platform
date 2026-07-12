@@ -1,0 +1,78 @@
+---
+# Deploy the DNP3 substation breaker outstation simulator as a systemd service.
+#
+# Variables:
+#   dnp3_port:  TCP port to listen on (default: 20000)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/dnp3 directory
+  file:
+    path: /opt/dnp3
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/dnp3/venv
+  args:
+    creates: /opt/dnp3/venv/bin/python3
+  become: true
+
+- name: Install rich into venv
+  pip:
+    name:
+      - rich
+    virtualenv: /opt/dnp3/venv
+  become: true
+
+- name: Copy dnp3 simulation files
+  copy:
+    src: dnp3/
+    dest: /opt/dnp3/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies dnp3_logic.py, dnp3_protocol.py, dnp3_server.py, dnp3_client.py,
+  # dnp3_tui_common.py, dnp3_server_tui.py, dnp3_client_tui.py -- run the
+  # *_tui.py scripts manually over SSH for a live htop-style status view
+  # (/opt/dnp3/venv/bin/python3 /opt/dnp3/dnp3_server_tui.py)
+
+- name: Install dnp3-server systemd service
+  copy:
+    dest: /etc/systemd/system/dnp3-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=DNP3 Substation Breaker Outstation Simulator
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/dnp3/venv/bin/python3 /opt/dnp3/dnp3_server.py \
+        --host 0.0.0.0 \
+        --port {{ dnp3_port | default(20000) }} \
+        --log-file /var/log/dnp3-server.log
+      Restart=always
+      WorkingDirectory=/opt/dnp3
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start dnp3-server
+  systemd:
+    name: dnp3-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

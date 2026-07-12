@@ -1,0 +1,27 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: reload nfs exports
+  ansible.builtin.command: /usr/sbin/exportfs -ra
+
+- name: reload dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    state: reloaded
+
+- name: reload nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded
+
+- name: apply nftables acl
+  ansible.builtin.shell: |
+    nft add table inet filter
+    nft add chain inet filter forward '{ type filter hook forward priority 0; policy accept; }'
+    nft flush chain inet filter forward
+    nft add rule inet filter forward ct state established,related accept
+    nft add rule inet filter forward iifname "mgmt*" oifname "mgmt*" counter drop
+  args:
+    executable: /bin/bash

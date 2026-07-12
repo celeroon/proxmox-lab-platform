@@ -1,0 +1,79 @@
+---
+# Task: Configure IPsec Site-to-Site VPN on FortiGate
+# Variables:
+#   vpn_name: Name of the VPN tunnel
+#   wan_interface: WAN interface name
+#   remote_gateway_ip: Remote gateway IP address
+#   preshared_key: Pre-shared key for authentication
+
+- name: Configure IPsec VPN Phase 1 (IKE)
+  fortinet.fortios.fortios_vpn_ipsec_phase1_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    vpn_ipsec_phase1_interface:
+      name: "{{ vpn_name }}"
+      type: "static"
+      interface: "{{ wan_interface }}"
+      ike_version: 2
+      peertype: "any"
+      net_device: "disable"
+      proposal: "{{ proposal | default('des-sha1') }}"
+      dhgrp: "{{ dhgrp | default('2') }}"
+      remote_gw: "{{ remote_gateway_ip }}"
+      psksecret: "{{ preshared_key }}"
+      dpd: "{{ dpd | default('on-idle') }}"
+      dpd_retrycount: "{{ dpd_retrycount | default(3) }}"
+      dpd_retryinterval: "{{ dpd_retryinterval | default(5) }}"
+      keylife: "{{ keylife | default(28800) }}"
+      nattraversal: "{{ nattraversal | default('disable') }}"
+      mode_cfg: "{{ mode_cfg | default('disable') }}"
+      wizard_type: "{{ wizard_type | default('custom') }}"
+  when: vpn_name is defined and wan_interface is defined and remote_gateway_ip is defined and preshared_key is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure IPsec VPN Phase 2 (IPsec) - SERVERS network selector
+  fortinet.fortios.fortios_vpn_ipsec_phase2_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    vpn_ipsec_phase2_interface:
+      name: "{{ vpn_name }}-s1"
+      phase1name: "{{ vpn_name }}"
+      proposal: "{{ proposal | default('des-sha1') }}"
+      dhgrp: "{{ dhgrp | default('2') }}"
+      auto_negotiate: "{{ auto_negotiate | default('enable') }}"
+      src_addr_type: "{{ src_addr_type | default('name') }}"
+      dst_addr_type: "{{ dst_addr_type | default('name') }}"
+      src_name: "{{ src_name | default('SERVERS-172.16.10.0/24') }}"
+      dst_name: "{{ dst_name | default('BRANCH-1-172.30.10.0/24') }}"
+      keylife_type: "{{ keylife_type | default('seconds') }}"
+      keylifeseconds: "{{ keylifeseconds | default(3600) }}"
+  when: vpn_name is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure IPsec VPN Phase 2 (IPsec) - USERS network selector
+  fortinet.fortios.fortios_vpn_ipsec_phase2_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    vpn_ipsec_phase2_interface:
+      name: "{{ vpn_name }}-s2"
+      phase1name: "{{ vpn_name }}"
+      proposal: "{{ proposal | default('des-sha1') }}"
+      dhgrp: "{{ dhgrp | default('2') }}"
+      auto_negotiate: "{{ auto_negotiate | default('enable') }}"
+      src_addr_type: "{{ src_addr_type | default('name') }}"
+      dst_addr_type: "{{ dst_addr_type | default('name') }}"
+      src_name: "{{ src_name_users | default('USERS-172.16.20.0/24') }}"
+      dst_name: "{{ dst_name_users | default('BRANCH-1-172.30.10.0/24') }}"
+      keylife_type: "{{ keylife_type | default('seconds') }}"
+      keylifeseconds: "{{ keylifeseconds | default(3600) }}"
+  when: vpn_name is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

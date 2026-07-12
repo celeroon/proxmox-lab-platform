@@ -1,0 +1,88 @@
+---
+# Deploy the DNP3 SCADA master (control room) simulator as a systemd service.
+#
+# Variables:
+#   server_ip:           IP of the dnp3-server to connect to (required)
+#   dnp3_port:            TCP port to connect to (default: 20000)
+#   poll_seconds:        How often to poll (default: 3.0)
+#   external_probe_ip:   Optional — VyOS loopback (e.g. 9.9.9.9) to periodically
+#                        probe with a real DNP3 read, for the "ICS/IoT External
+#                        Traffic" dashboard panel. Requires a matching
+#                        vyos/configure_external_traffic_redirect hairpin rule.
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/dnp3 directory
+  file:
+    path: /opt/dnp3
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/dnp3/venv
+  args:
+    creates: /opt/dnp3/venv/bin/python3
+  become: true
+
+- name: Install rich into venv
+  pip:
+    name:
+      - rich
+    virtualenv: /opt/dnp3/venv
+  become: true
+
+- name: Copy dnp3 simulation files
+  copy:
+    src: dnp3/
+    dest: /opt/dnp3/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies dnp3_logic.py, dnp3_protocol.py, dnp3_server.py, dnp3_client.py,
+  # dnp3_tui_common.py, dnp3_server_tui.py, dnp3_client_tui.py -- run the
+  # *_tui.py scripts manually over SSH for a live htop-style status view
+  # (/opt/dnp3/venv/bin/python3 /opt/dnp3/dnp3_client_tui.py)
+
+- name: Install dnp3-client systemd service
+  copy:
+    dest: /etc/systemd/system/dnp3-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=DNP3 Client (SCADA master simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/dnp3/venv/bin/python3 /opt/dnp3/dnp3_client.py \
+        --host {{ server_ip }} \
+        --port {{ dnp3_port | default(20000) }} \
+        --poll-seconds {{ poll_seconds | default(3.0) }} \
+        --log-file /var/log/dnp3-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/dnp3
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start dnp3-client
+  systemd:
+    name: dnp3-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

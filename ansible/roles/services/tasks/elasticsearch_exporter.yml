@@ -1,0 +1,139 @@
+---
+# Install and configure elasticsearch_exporter (Prometheus metrics, port 9114).
+# Runs on every ES node. The ES monitoring user is created once, on whichever node
+# es_monitoring_user_host_ip points to (default: the bootstrap node).
+#
+# Required vars:
+#   lab_ip               - IP of this node (used to detect which node creates the user)
+#   elastic_nodes        - cluster node list
+#   elk_password         - elastic superuser password (for creating exporter user)
+#   es_exporter_password - password for the elasticsearch_exporter ES user
+#
+# Optional vars:
+#   es_exporter_version      - release version to install (default: "1.9.0")
+#   es_monitoring_user_host_ip - which node creates the monitoring user (default:
+#     elastic_nodes[0].ip, the bootstrap node). The monitoring user lives in the
+#     .security system index, which needs a data-capable node to allocate to — if
+#     the bootstrap node is master-only (role-separated clusters), override this to
+#     a data node's IP so the write doesn't hang waiting for shard allocation that
+#     can never happen on a master-only single-node cluster.
+
+# ── Step 1: Create ES monitoring user (once, on the configured node) ───────
+# Idempotent: PUT _security/user returns 200 on update, 201 on create.
+# Always targets elastic_nodes[0] (the bootstrap node), never 127.0.0.1/lab_ip —
+# a node that just joined hasn't replicated .security locally yet, so its own
+# endpoint 401s on any auth-dependent call right after joining (same trap
+# elasticsearch_join.yml's cluster-health wait already documents and avoids).
+# The bootstrap node routes the write to wherever the shard actually lives.
+
+- name: Create elasticsearch_exporter monitoring user
+  uri:
+    url: "https://{{ elastic_nodes[0].ip }}:9200/_security/user/elasticsearch_exporter"
+    method: PUT
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    body_format: json
+    body:
+      password: "{{ es_exporter_password }}"
+      roles:
+        - monitoring_user
+        - remote_monitoring_agent
+        - remote_monitoring_collector
+      full_name: "Prometheus ES Exporter"
+    status_code: [200, 201]
+  become: yes
+  when: lab_ip == (es_monitoring_user_host_ip | default(elastic_nodes[0].ip))
+  no_log: true
+  register: _exporter_user_result
+  until: _exporter_user_result.status is defined and _exporter_user_result.status in [200, 201]
+  retries: 5
+  delay: 10
+
+# ── Step 2: Create Linux system user ────────────────────────────
+
+- name: Create elastic_exporter system user
+  user:
+    name: elastic_exporter
+    system: yes
+    shell: /bin/false
+    create_home: no
+  become: yes
+
+# ── Step 3: Download and install binary ──────────────────────────
+
+- name: Download elasticsearch_exporter archive
+  get_url:
+    url: "https://github.com/prometheus-community/elasticsearch_exporter/releases/download/v{{ es_exporter_version | default('1.9.0') }}/elasticsearch_exporter-{{ es_exporter_version | default('1.9.0') }}.linux-amd64.tar.gz"
+    dest: "/tmp/elasticsearch_exporter.tar.gz"
+    mode: '0644'
+
+- name: Install elasticsearch_exporter binary
+  shell: >
+    tar -xzf /tmp/elasticsearch_exporter.tar.gz -C /usr/local/bin
+    --strip-components=1
+    elasticsearch_exporter-{{ es_exporter_version | default('1.9.0') }}.linux-amd64/elasticsearch_exporter
+  args:
+    creates: /usr/local/bin/elasticsearch_exporter
+  become: yes
+
+- name: Set binary ownership
+  file:
+    path: /usr/local/bin/elasticsearch_exporter
+    owner: elastic_exporter
+    group: elastic_exporter
+    mode: '0755'
+  become: yes
+
+# ── Step 4: Configure environment file ──────────────────────────
+
+- name: Deploy environment file
+  copy:
+    content: |
+      ES_URI="https://elasticsearch_exporter:{{ es_exporter_password }}@127.0.0.1:9200"
+    dest: /etc/default/elasticsearch_exporter
+    owner: elastic_exporter
+    group: elastic_exporter
+    mode: '0600'
+  become: yes
+  no_log: true
+
+# ── Step 5: Create systemd service ──────────────────────────────
+
+- name: Create elasticsearch_exporter systemd service
+  copy:
+    content: |
+      [Unit]
+      Description=Prometheus Elasticsearch Exporter
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=elastic_exporter
+      EnvironmentFile=/etc/default/elasticsearch_exporter
+      ExecStart=/usr/local/bin/elasticsearch_exporter \
+        --es.uri=${ES_URI} \
+        --es.all \
+        --es.indices \
+        --es.timeout=20s \
+        --es.ssl-skip-verify \
+        --web.listen-address="0.0.0.0:9114"
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/elasticsearch_exporter.service
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+
+# ── Step 6: Start service ────────────────────────────────────────
+
+- name: Enable and start elasticsearch_exporter
+  systemd:
+    name: elasticsearch_exporter
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes

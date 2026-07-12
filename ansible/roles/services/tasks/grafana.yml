@@ -1,0 +1,141 @@
+---
+# Install Grafana with Prometheus datasource provisioned automatically.
+# Downloads and provisions the Elasticsearch Overview dashboard (ID 14191).
+# Grafana listens on port 3000 (default).
+
+# ── Step 1: Add Grafana APT repository ───────────────────────────
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, software-properties-common, wget, gnupg]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Create apt keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Download Grafana GPG key
+  get_url:
+    url: https://apt.grafana.com/gpg.key
+    dest: /tmp/grafana-gpg.key
+    mode: '0644'
+
+- name: Add Grafana GPG keyring
+  shell: gpg --dearmor < /tmp/grafana-gpg.key > /etc/apt/keyrings/grafana.gpg
+  args:
+    creates: /etc/apt/keyrings/grafana.gpg
+  become: yes
+
+- name: Add Grafana APT repository
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main"
+    state: present
+    filename: grafana
+  become: yes
+
+# ── Step 2: Install ───────────────────────────────────────────────
+
+- name: Install Grafana
+  apt:
+    name: grafana
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 3: Configure provisioning ────────────────────────────────
+
+- name: Create provisioning directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: grafana
+    group: grafana
+    mode: '0755'
+  loop:
+    - /etc/grafana/provisioning/datasources
+    - /etc/grafana/provisioning/dashboards
+    - /var/lib/grafana/dashboards
+  become: yes
+
+- name: Configure Prometheus datasource
+  copy:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://localhost:9090
+          isDefault: true
+          access: proxy
+    dest: /etc/grafana/provisioning/datasources/prometheus.yml
+    owner: grafana
+    group: grafana
+    mode: '0640'
+  become: yes
+
+- name: Configure dashboard provider
+  copy:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: default
+          type: file
+          updateIntervalSeconds: 30
+          options:
+            path: /var/lib/grafana/dashboards
+    dest: /etc/grafana/provisioning/dashboards/dashboards.yml
+    owner: grafana
+    group: grafana
+    mode: '0640'
+  become: yes
+
+# ── Step 4: Download dashboard 14191 ─────────────────────────────
+
+- name: Download Elasticsearch overview dashboard (ID 14191)
+  get_url:
+    url: "https://grafana.com/api/dashboards/14191/revisions/latest/download"
+    dest: /var/lib/grafana/dashboards/elasticsearch-overview.json
+    owner: grafana
+    group: grafana
+    mode: '0640'
+  become: yes
+
+# ── Step 5: Deploy SNMP VyOS dashboard ──────────────────────────
+# Custom dashboard querying exactly the ifHCInOctets/ifHCOutOctets/ifOperStatus
+# metrics produced by our prometheus_snmp_exporter if_mib config.
+
+- name: Deploy VyOS SNMP dashboard
+  copy:
+    src: "{{ lab_ansible_dir }}/roles/services/files/snmp-vyos-dashboard.json"
+    dest: /var/lib/grafana/dashboards/snmp-vyos-dashboard.json
+    owner: grafana
+    group: grafana
+    mode: '0640'
+  become: yes
+
+# ── Step 6: Set admin password ───────────────────────────────────
+# Overrides the default admin/admin before first start so the browser
+# never shows the forced-change prompt.
+
+- name: Set Grafana admin password
+  ini_file:
+    path: /etc/grafana/grafana.ini
+    section: security
+    option: admin_password
+    value: vagrant
+  become: yes
+
+# ── Step 6: Start service ─────────────────────────────────────────
+
+- name: Enable and start Grafana
+  systemd:
+    name: grafana-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes

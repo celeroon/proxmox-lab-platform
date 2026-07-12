@@ -1,0 +1,14 @@
+---
+- import_tasks: sudo.yml
+- import_tasks: postgresql.yml
+- import_tasks: service.yml
+- import_tasks: nfs.yml
+- import_tasks: build-sources.yml
+- import_tasks: build-work.yml
+- import_tasks: offload.yml
+- import_tasks: networkd.yml
+- import_tasks: dnsmasq.yml
+- import_tasks: proxmox.yml
+- import_tasks: nftables.yml
+- import_tasks: novnc.yml
+- import_tasks: web.yml

@@ -1,0 +1,233 @@
+---
+# Generate TLS certificates for an Elasticsearch cluster.
+# Runs on the first ES node only (elastic_nodes[0]).
+# Single-node: certs stay local. Multi-node (Phase 2): fetch to mgmt artifacts.
+#
+# Required vars:
+#   elastic_nodes      - cluster node list: [{name, ip, roles}]
+#   elk_version        - Elastic stack version e.g. "9.4.2"
+#   elk_cert_pass      - password for all generated .p12 files
+# Optional vars:
+#   kibana_ip          - IP of the Kibana host; defaults to elastic_nodes[0].ip (co-located)
+#   fleet_ip           - IP of the Fleet Server host; defaults to kibana_ip (same host as Kibana)
+
+# ── Step 1: Install ES (needed for elasticsearch-certutil binary) ─
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, gpg, wget, unzip]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/es-gpg.asc
+    mode: '0644'
+
+- name: Add Elasticsearch GPG keyring
+  shell: gpg --dearmor < /tmp/es-gpg.asc > /usr/share/keyrings/elasticsearch-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+  become: yes
+
+- name: Add Elasticsearch APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elk_version.split('.')[0] }}.x/apt stable main"
+    state: present
+    filename: elastic
+  become: yes
+
+- name: Install Elasticsearch
+  apt:
+    name: "elasticsearch={{ elk_version }}"
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 2: Create certs directory ───────────────────────────────
+
+- name: Create certs directory
+  file:
+    path: /etc/elasticsearch/certs
+    state: directory
+    owner: root
+    group: elasticsearch
+    mode: '0750'
+  become: yes
+
+# ── Step 3: Generate CA certificate ──────────────────────────────
+
+- name: Generate CA certificate
+  command: >
+    /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+    --silent
+    --pass "{{ elk_cert_pass }}"
+    -out /etc/elasticsearch/certs/elastic-stack-ca.p12
+  args:
+    creates: /etc/elasticsearch/certs/elastic-stack-ca.p12
+  become: yes
+
+# ── Step 4: Generate transport certificate ───────────────────────
+
+- name: Generate transport certificate
+  command: >
+    /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+    --ca /etc/elasticsearch/certs/elastic-stack-ca.p12
+    --ca-pass "{{ elk_cert_pass }}"
+    --pass "{{ elk_cert_pass }}"
+    --silent
+    -out /etc/elasticsearch/certs/elastic-certificates.p12
+  args:
+    creates: /etc/elasticsearch/certs/elastic-certificates.p12
+  become: yes
+
+# ── Step 5: Generate HTTP certificate ────────────────────────────
+
+- name: Write instances.yml for HTTP cert generation
+  copy:
+    content: |
+      instances:
+      {% for node in elastic_nodes %}
+        - name: {{ node.name }}
+          ip:
+            - 127.0.0.1
+            - {{ node.ip }}
+      {% endfor %}
+        - name: kibana
+          ip:
+            - 127.0.0.1
+            - {{ kibana_ip | default(elastic_nodes[0].ip) }}
+        - name: fleet-server
+          ip:
+            - 127.0.0.1
+            - {{ fleet_ip | default(kibana_ip | default(elastic_nodes[0].ip)) }}
+    dest: /tmp/es-instances.yml
+    mode: '0644'
+
+- name: Generate HTTP certificates
+  command: >
+    /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+    --silent
+    --in /tmp/es-instances.yml
+    --ca /etc/elasticsearch/certs/elastic-stack-ca.p12
+    --ca-pass "{{ elk_cert_pass }}"
+    --pass "{{ elk_cert_pass }}"
+    -out /tmp/es-http-certs.zip
+  args:
+    creates: /tmp/es-http-certs.zip
+  become: yes
+
+- name: Create HTTP cert extraction directory
+  file:
+    path: /tmp/es-http-certs
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Unzip HTTP certificates
+  unarchive:
+    src: /tmp/es-http-certs.zip
+    dest: /tmp/es-http-certs/
+    remote_src: yes
+  become: yes
+
+- name: Copy HTTP cert for this node
+  copy:
+    src: "/tmp/es-http-certs/{{ elastic_nodes[0].name }}/{{ elastic_nodes[0].name }}.p12"
+    dest: /etc/elasticsearch/certs/http.p12
+    remote_src: yes
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+  become: yes
+
+# ── Step 6: Extract CA PEM (needed by Kibana and Elastic Agents) ──
+
+- name: Extract CA certificate as PEM
+  shell: >
+    openssl pkcs12
+    -in /etc/elasticsearch/certs/elastic-stack-ca.p12
+    -clcerts -nokeys
+    -passin "pass:{{ elk_cert_pass }}"
+    | awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/'
+    > /etc/elasticsearch/certs/elasticsearch-ca.pem
+  args:
+    creates: /etc/elasticsearch/certs/elasticsearch-ca.pem
+  become: yes
+
+# ── Step 6b: Copy per-node HTTP certs into certs dir + start distribution server ─
+
+- name: Copy per-node HTTP certs into certs directory
+  copy:
+    src: "/tmp/es-http-certs/{{ node.name }}/{{ node.name }}.p12"
+    dest: "/etc/elasticsearch/certs/{{ node.name }}.p12"
+    remote_src: yes
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+  loop: "{{ elastic_nodes }}"
+  loop_control:
+    loop_var: node
+  become: yes
+  when: elastic_nodes | length > 1
+
+- name: Copy Kibana and Fleet Server certs into certs directory
+  copy:
+    src: "/tmp/es-http-certs/{{ item }}/{{ item }}.p12"
+    dest: "/etc/elasticsearch/certs/{{ item }}.p12"
+    remote_src: yes
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+  loop:
+    - kibana
+    - fleet-server
+  become: yes
+  when: elastic_nodes | length > 1
+
+- name: Deploy cert distribution server systemd unit
+  copy:
+    dest: /etc/systemd/system/es-cert-server.service
+    content: |
+      [Unit]
+      Description=Elasticsearch cert distribution server (serves TLS certs to joining nodes)
+      After=network.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/etc/elasticsearch/certs
+      ExecStart=/usr/bin/python3 -m http.server 19999 --directory /etc/elasticsearch/certs/
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+  become: yes
+  when: elastic_nodes | length > 1
+
+- name: Enable and start cert distribution server
+  systemd:
+    name: es-cert-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+  when: elastic_nodes | length > 1
+
+# ── Step 7: Set permissions ───────────────────────────────────────
+
+- name: Set cert file permissions
+  file:
+    path: "/etc/elasticsearch/certs/{{ item }}"
+    owner: root
+    group: elasticsearch
+    mode: '0640'
+  loop:
+    - elastic-stack-ca.p12
+    - elastic-certificates.p12
+    - http.p12
+    - elasticsearch-ca.pem
+  become: yes

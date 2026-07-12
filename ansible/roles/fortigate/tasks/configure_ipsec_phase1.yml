@@ -1,0 +1,39 @@
+---
+# Task: Configure IPsec Phase 1 (IKE) on FortiGate
+# Variables:
+#   vpn_name:          VPN tunnel name
+#   wan_interface:     WAN interface (e.g. port2)
+#   remote_gateway_ip: Remote peer IP address
+#   preshared_key:     Pre-shared key
+#   proposal:          IKE proposal (default: des-sha1)
+#   dhgrp:             DH group (default: 2)
+#   keylife:           Phase 1 key lifetime in seconds (default: 28800)
+#   nattraversal:      NAT traversal (default: disable)
+
+- name: Configure IPsec Phase 1 {{ vpn_name }}
+  fortinet.fortios.fortios_vpn_ipsec_phase1_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    vpn_ipsec_phase1_interface:
+      name: "{{ vpn_name }}"
+      type: "static"
+      interface: "{{ wan_interface }}"
+      ike_version: 2
+      peertype: "any"
+      net_device: "enable"
+      add_route: "enable"
+      proposal: "{{ proposal | default('des-sha1') }}"
+      dhgrp: "{{ dhgrp | default('2') }}"
+      remote_gw: "{{ remote_gateway_ip }}"
+      psksecret: "{{ preshared_key }}"
+      dpd: "{{ dpd | default('on-idle') }}"
+      dpd_retrycount: "{{ dpd_retrycount | default(3) }}"
+      dpd_retryinterval: "{{ dpd_retryinterval | default(5) }}"
+      keylife: "{{ keylife | default(28800) }}"
+      nattraversal: "{{ nattraversal | default('disable') }}"
+      mode_cfg: "disable"
+      wizard_type: "custom"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

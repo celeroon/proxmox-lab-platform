@@ -1,0 +1,43 @@
+---
+- name: Ensure PostgreSQL is started
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: true
+  tags: postgresql
+
+- name: Create DB user
+  community.postgresql.postgresql_user:
+    name: lab
+    password: "{{ lookup('env', 'DB_PASSWORD') }}"
+    state: present
+  become_user: postgres
+  tags: postgresql
+
+- name: Create database
+  community.postgresql.postgresql_db:
+    name: lab
+    owner: lab
+    state: present
+  become_user: postgres
+  tags: postgresql
+
+- name: Copy schema to temp location
+  ansible.builtin.copy:
+    src: schema.sql
+    dest: /tmp/lab-schema.sql
+    mode: '0644'
+  tags: postgresql
+
+- name: Apply schema
+  community.postgresql.postgresql_script:
+    login_db: lab
+    path: /tmp/lab-schema.sql
+  become_user: postgres
+  tags: postgresql
+
+- name: Remove schema temp file
+  ansible.builtin.file:
+    path: /tmp/lab-schema.sql
+    state: absent
+  tags: postgresql

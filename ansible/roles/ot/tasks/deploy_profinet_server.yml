@@ -1,0 +1,120 @@
+---
+# Deploy the PROFINET IO-Device simulator (p-net's sample app, hefloryd/p-net
+# fork) as a systemd service.
+#
+# rtlabs-com/p-net's own "public" branch has its buildable scaffolding
+# (root CMakeLists.txt, samples/) stripped out for licensing reasons —
+# hefloryd/p-net is a full, buildable GPLv3 fork with the modern
+# samples/pn_dev layout intact. Building with -DCMAKE_C_FLAGS suppresses a
+# real (pre-existing, upstream) GCC-12 -Werror=array-bounds false trip in
+# pf_scheduler.c — confirmed harmless at the default LOG_LEVEL=FATAL; do NOT
+# add -DLOG_LEVEL=DEBUG, which reproducibly crashes pn_dev even with zero
+# client interaction (see profinet_logic.py's module docstring for the
+# forensics).
+#
+# Needs root for pn_dev's raw AF_PACKET socket (DCP + PROFINET RT frames) —
+# runs directly as root via systemd's default User=, same as every other
+# privileged capture/protocol service in this scenario.
+#
+# Variables:
+#   profinet_interface:     Network interface pn_dev binds to (default: eth1)
+#   profinet_station_name:  DCP station name                  (default: profinet-server)
+
+- name: Install build tools for p-net
+  apt:
+    name: [build-essential, cmake, git, python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+
+- name: Clone hefloryd/p-net (full buildable fork, incl. submodules)
+  git:
+    repo: https://github.com/hefloryd/p-net.git
+    dest: /opt/p-net
+    recursive: yes
+    update: no
+    version: master
+
+- name: Configure p-net build (CMake)
+  command: cmake -B build -S . -DCMAKE_C_FLAGS=-Wno-error=array-bounds
+  args:
+    chdir: /opt/p-net
+    creates: /opt/p-net/build/CMakeCache.txt
+
+- name: Build pn_dev sample IO-Device app
+  command: cmake --build build -j2 --target pn_dev
+  args:
+    chdir: /opt/p-net
+    creates: /opt/p-net/build/pn_dev
+
+- name: Create p-net storage directory
+  file:
+    path: /opt/p-net/run
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create /opt/profinet directory (TUI files)
+  file:
+    path: /opt/profinet
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create Python venv for the server TUI
+  command: python3 -m venv /opt/profinet/venv
+  args:
+    creates: /opt/profinet/venv/bin/python3
+
+- name: Install rich into the TUI venv
+  pip:
+    name: [rich]
+    virtualenv: /opt/profinet/venv
+
+- name: Copy profinet TUI files
+  copy:
+    src: profinet/profinet_tui_common.py
+    dest: /opt/profinet/profinet_tui_common.py
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Copy profinet server TUI
+  copy:
+    src: profinet/profinet_server_tui.py
+    dest: /opt/profinet/profinet_server_tui.py
+    owner: root
+    group: root
+    mode: '0644'
+  # run manually over SSH for a live htop-style status view:
+  # /opt/profinet/venv/bin/python3 /opt/profinet/profinet_server_tui.py
+
+- name: Install profinet-server systemd service
+  copy:
+    dest: /etc/systemd/system/profinet-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=PROFINET IO-Device simulator (p-net sample app)
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/p-net/build/pn_dev -v -i {{ profinet_interface | default('eth1') }} -s {{ profinet_station_name | default('profinet-server') }} -p /opt/p-net/run
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/p-net/run
+      StandardOutput=append:/var/log/profinet-server.log
+      StandardError=append:/var/log/profinet-server.log
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start profinet-server
+  systemd:
+    name: profinet-server
+    state: started
+    enabled: yes
+    daemon_reload: yes

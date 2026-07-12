@@ -1,0 +1,80 @@
+---
+# Deploy the PROFINET engineering-station simulator ("profinet-client") as a
+# systemd service. Periodically resolves profinet-server via real DCP
+# discovery (same L2 segment) and establishes a real, legitimate AR-Connect
+# with IOCR negotiation. This stops short of live cyclic data exchange (a
+# p-net/virtio real-time port-validation limitation, not chased further).
+#
+# Variables:
+#   profinet_target:       DCP station name to resolve (default: profinet-server)
+#   profinet_interface:    Network interface to use    (default: eth1)
+#   profinet_poll_seconds: Seconds between AR-Connect attempts (default: 30)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+
+- name: Create /opt/profinet directory
+  file:
+    path: /opt/profinet
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create Python venv
+  command: python3 -m venv /opt/profinet/venv
+  args:
+    creates: /opt/profinet/venv/bin/python3
+
+- name: Install profinet-py and rich into venv
+  pip:
+    name: [profinet-py, rich]
+    virtualenv: /opt/profinet/venv
+
+- name: Copy profinet client files
+  copy:
+    src: profinet/
+    dest: /opt/profinet/
+    owner: root
+    group: root
+    mode: '0644'
+  # copies profinet_logic.py, profinet_client.py, profinet_tui_common.py,
+  # profinet_client_tui.py, profinet_server_tui.py -- run the *_tui.py
+  # scripts manually over SSH for a live htop-style status view
+  # (/opt/profinet/venv/bin/python3 /opt/profinet/profinet_client_tui.py)
+
+- name: Install profinet-client systemd service
+  copy:
+    dest: /etc/systemd/system/profinet-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=PROFINET Engineering Station simulator (profinet-client)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/profinet/venv/bin/python3 /opt/profinet/profinet_client.py \
+        --target {{ profinet_target | default('profinet-server') }} \
+        --interface {{ profinet_interface | default('eth1') }} \
+        --poll-seconds {{ profinet_poll_seconds | default(30) }} \
+        --log-file /var/log/profinet-client.log
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/profinet
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start profinet-client
+  systemd:
+    name: profinet-client
+    state: started
+    enabled: yes
+    daemon_reload: yes

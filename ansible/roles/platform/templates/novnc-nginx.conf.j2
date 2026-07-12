@@ -1,0 +1,41 @@
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/ssl/novnc.crt;
+    ssl_certificate_key /etc/nginx/ssl/novnc.key;
+
+    # noVNC static files
+    location /novnc/ {
+        alias /usr/share/novnc/;
+        index vnc.html;
+    }
+
+    # Console redirect service — generates fresh VNC ticket at click time
+    location /console/ {
+        proxy_pass http://127.0.0.1:8080/console/;
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }
+
+    # WebSocket proxy to Proxmox — adds API token auth server-side
+    location /ws/ {
+        proxy_pass          https://{{ lookup('env', 'PROXMOX_HOST') }}:{{ lookup('env', 'PROXMOX_PORT') | default('8006', true) }}/;
+        proxy_http_version  1.1;
+        proxy_set_header    Upgrade    $http_upgrade;
+        proxy_set_header    Connection "upgrade";
+        proxy_set_header    Host       {{ lookup('env', 'PROXMOX_HOST') }}:{{ lookup('env', 'PROXMOX_PORT') | default('8006', true) }};
+        proxy_set_header    Authorization "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}";
+        proxy_ssl_verify    off;
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}

@@ -1,0 +1,59 @@
+---
+# Task: Configure physical and VLAN interfaces on FortiGate
+# Variables:
+#   interfaces: List of interface configurations
+#     - name: "port2"
+#       mode: "static"
+#       ip: "192.0.2.6 255.255.255.248"
+#       description: "WAN"
+#       role: "wan"
+#     - name: "vlan10"
+#       interface: "port3"
+#       vlanid: "10"
+#       ip: "172.16.10.254 255.255.255.0"
+#       description: "SERVERS"
+#       role: "lan"
+
+- name: Configure physical interfaces
+  fortios_system_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    system_interface:
+      name: "{{ item.name }}"
+      mode: "{{ item.mode | default('static') }}"
+      ip: "{{ item.ip }}"
+      description: "{{ item.description }}"
+      alias: "{{ item.alias | default(item.description) }}"
+      allowaccess: "{{ item.allowaccess | default(['ping']) }}"
+      role: "{{ item.role }}"
+      vdom: "{{ item.vdom | default('root') }}"
+      netflow_sampler: "{{ item.netflow_sampler | default(omit) }}"
+  loop: "{{ interfaces | default([]) }}"
+  when: item.interface is not defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure VLAN interfaces
+  fortios_system_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    system_interface:
+      name: "{{ item.name }}"
+      mode: "{{ item.mode | default('static') }}"
+      ip: "{{ item.ip }}"
+      description: "{{ item.description }}"
+      alias: "{{ item.alias | default(item.description) }}"
+      allowaccess: "{{ item.allowaccess | default(['ping']) }}"
+      role: "{{ item.role }}"
+      vdom: "{{ item.vdom | default('root') }}"
+      interface: "{{ item.interface }}"
+      vlanid: "{{ item.vlanid }}"
+      netflow_sampler: "{{ item.netflow_sampler | default(omit) }}"
+  loop: "{{ interfaces | default([]) }}"
+  when: item.interface is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

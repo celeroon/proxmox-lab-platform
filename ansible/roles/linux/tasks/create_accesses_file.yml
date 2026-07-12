@@ -1,0 +1,28 @@
+---
+# Write an accesses.txt shortcut file to the vagrant Desktop.
+# Lists service URLs available on this mgmt node.
+#
+# Optional vars:
+#   accesses_user      - owner of the Desktop (default: vagrant)
+#   accesses_extra     - list of extra lines to append (default: [])
+
+- name: Ensure Desktop directory exists
+  file:
+    path: "/home/{{ accesses_user | default('vagrant') }}/Desktop"
+    state: directory
+    owner: "{{ accesses_user | default('vagrant') }}"
+    group: "{{ accesses_user | default('vagrant') }}"
+    mode: '0755'
+  become: yes
+
+- name: Write accesses.txt
+  copy:
+    dest: "/home/{{ accesses_user | default('vagrant') }}/Desktop/accesses.txt"
+    owner: "{{ accesses_user | default('vagrant') }}"
+    group: "{{ accesses_user | default('vagrant') }}"
+    mode: '0644'
+    content: |
+      http://prometheus.local:9090
+      https://elastic.local:5601
+      http://grafana.local:3000
+  become: yes

@@ -1,0 +1,23 @@
+---
+# Task: Install Chocolatey package manager and software packages
+# Variables:
+#   chocolatey_software_list: list of {name, version?, ignore_checksums?} dicts
+
+- name: Install Chocolatey
+  ansible.windows.win_powershell:
+    script: |
+      if (Get-Command choco -ErrorAction SilentlyContinue) { exit 0 }
+      $progressPreference = 'SilentlyContinue'
+      [System.Net.ServicePointManager]::SecurityProtocol =
+          [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+      Invoke-WebRequest -Uri https://chocolatey.org/install.ps1 -UseBasicParsing |
+          Select-Object -ExpandProperty Content | Invoke-Expression
+
+- name: Install software via Chocolatey
+  chocolatey.chocolatey.win_chocolatey:
+    name: "{{ item.name }}"
+    state: present
+    version: "{{ item.version | default(omit) }}"
+    ignore_checksums: "{{ item.ignore_checksums | default(omit) }}"
+    timeout: 300
+  loop: "{{ chocolatey_software_list | default([]) }}"

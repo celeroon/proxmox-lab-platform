@@ -1,0 +1,89 @@
+---
+# Deploy the OPC-UA SCADA historian (client) simulator as a systemd service.
+#
+# Variables:
+#   server_ip:           IP of the opcua-server to connect to (required)
+#   opcua_port:          TCP port to connect to (default: 4840)
+#   toggle_seconds:      How often to issue a routine start/stop command (default: 20.0)
+#   external_probe_ip:   Optional — VyOS loopback (e.g. 9.9.9.9) to periodically
+#                        probe with a real OPC-UA read, for the "ICS/IoT External
+#                        Traffic" dashboard panel. Requires a matching
+#                        vyos/configure_external_traffic_redirect hairpin rule.
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/opcua directory
+  file:
+    path: /opt/opcua
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/opcua/venv
+  args:
+    creates: /opt/opcua/venv/bin/python3
+  become: true
+
+- name: Install asyncua and rich into venv
+  pip:
+    name:
+      - asyncua
+      - rich
+    virtualenv: /opt/opcua/venv
+  become: true
+
+- name: Copy opcua simulation files
+  copy:
+    src: opcua/
+    dest: /opt/opcua/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies opcua_logic.py, opcua_server.py, opcua_client.py, opcua_tui_common.py,
+  # opcua_server_tui.py, opcua_client_tui.py -- run the *_tui.py scripts manually
+  # over SSH for a live htop-style status view
+  # (/opt/opcua/venv/bin/python3 /opt/opcua/opcua_client_tui.py)
+
+- name: Install opcua-client systemd service
+  copy:
+    dest: /etc/systemd/system/opcua-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=OPC-UA Client (SCADA historian simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/opcua/venv/bin/python3 /opt/opcua/opcua_client.py \
+        --host {{ server_ip }} \
+        --port {{ opcua_port | default(4840) }} \
+        --toggle-seconds {{ toggle_seconds | default(20.0) }} \
+        --log-file /var/log/opcua-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/opcua
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start opcua-client
+  systemd:
+    name: opcua-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

@@ -1,0 +1,154 @@
+---
+# Deploy a synthetic syslog generator for ES ingestion benchmarking.
+# Writes random syslog lines to /var/log/filestream-test/bench.log at a
+# configurable rate. Rotates every 30s and deletes rotated files after 60s
+# so disk usage stays bounded.
+#
+# Required vars:
+#   bench_logs_per_second - lines per second to generate (e.g. 50)
+#
+# Works on both VMs (vagrant/sudo) and LXC containers (root).
+
+# ── Step 1: Deploy generator script ──────────────────────────────
+
+- name: Create /opt/bench directory
+  file:
+    path: /opt/bench
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Deploy log generator script
+  copy:
+    dest: /opt/bench/log_gen.py
+    mode: '0755'
+    content: |
+      #!/usr/bin/env python3
+      import time, random, os, glob, socket, datetime, threading
+
+      RATE         = float(os.environ.get("BENCH_LOGS_PER_SECOND", "50"))
+      LOG_DIR      = os.environ.get("BENCH_LOG_DIR", "/var/log/filestream-test")
+      ROTATE_SECS  = int(os.environ.get("BENCH_ROTATE_SECS", "30"))
+      DELETE_AFTER = int(os.environ.get("BENCH_DELETE_AFTER", "60"))
+
+      HOSTNAME  = socket.gethostname()
+      PROCS     = ["nginx","sshd","cron","systemd","postfix","sudo","app","worker"]
+      SEVS      = ["warning","notice","info","debug","err"]
+      TEMPLATES = [
+          "Connection from {ip} port {port} accepted",
+          "Failed password for {user} from {ip} port {port}",
+          "Session opened for user {user} by uid=0",
+          "Disk I/O wait {pct}% on {dev}",
+          "CPU usage spike: {val}%",
+          "GET /api/v1/{ep} 200 {ms}ms",
+          "GET /api/v1/{ep} 404 {ms}ms",
+          "Cache miss ratio {pct}%",
+          "Worker {pid} processed {n} jobs in {ms}ms",
+          "Health check OK for {svc}",
+          "Upstream timeout {svc}: {ms}ms",
+          "Connection pool at {pct}% capacity",
+      ]
+
+      def _rip():
+          return f"{random.randint(10,192)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+
+      def random_line():
+          ts   = datetime.datetime.utcnow().strftime("%b %d %H:%M:%S")
+          proc = random.choice(PROCS)
+          pid  = random.randint(100, 99999)
+          sev  = random.choice(SEVS)
+          msg  = random.choice(TEMPLATES).format(
+              ip=_rip(), port=random.randint(1024, 65535),
+              user=random.choice(["root","admin","vagrant","app","deploy"]),
+              pct=random.randint(1, 99), dev=random.choice(["/dev/sda","/dev/vda"]),
+              val=round(random.uniform(0.1, 99.9), 1),
+              ep=random.choice(["users","health","metrics","logs","events"]),
+              ms=random.randint(1, 5000), pid=random.randint(1000, 65535),
+              n=random.randint(1, 1000),
+              svc=random.choice(["elasticsearch","redis","postgresql","nginx"]),
+          )
+          return f"{ts} {HOSTNAME} {proc}[{pid}]: {sev}: {msg}\n"
+
+      def reaper():
+          while True:
+              time.sleep(max(10, DELETE_AFTER // 2))
+              cutoff = time.time() - DELETE_AFTER
+              for path in glob.glob(os.path.join(LOG_DIR, "bench-*.log")):
+                  if os.path.getmtime(path) < cutoff:
+                      try: os.remove(path)
+                      except OSError: pass
+
+      def main():
+          os.makedirs(LOG_DIR, exist_ok=True)
+          threading.Thread(target=reaper, daemon=True).start()
+
+          log_path = os.path.join(LOG_DIR, "bench.log")
+          fh = open(log_path, "a", buffering=8192)
+          last_rotate = time.monotonic()
+
+          # Batch size: 1 line at low rates; up to 50 at high rates.
+          # Sleep covers the exact wall time for the batch.
+          batch = max(1, min(50, int(RATE / 10))) if RATE >= 100 else 1
+          sleep = batch / RATE
+
+          while True:
+              now = time.monotonic()
+              if now - last_rotate >= ROTATE_SECS:
+                  fh.flush(); fh.close()
+                  rotated = os.path.join(LOG_DIR, f"bench-{int(time.time())}.log")
+                  os.rename(log_path, rotated)
+                  fh = open(log_path, "a", buffering=8192)
+                  last_rotate = now
+
+              fh.write("".join(random_line() for _ in range(batch)))
+              fh.flush()
+              time.sleep(sleep)
+
+      if __name__ == "__main__":
+          main()
+  become: yes
+
+# ── Step 2: Deploy env config ────────────────────────────────────
+
+- name: Deploy bench-log-gen env config
+  copy:
+    dest: /etc/default/bench-log-gen
+    mode: '0644'
+    content: |
+      BENCH_LOGS_PER_SECOND={{ bench_logs_per_second | default(50) }}
+      BENCH_LOG_DIR=/var/log/filestream-test
+      BENCH_ROTATE_SECS=30
+      BENCH_DELETE_AFTER=60
+  become: yes
+
+# ── Step 3: Deploy systemd service ───────────────────────────────
+
+- name: Deploy bench-log-gen systemd service
+  copy:
+    dest: /etc/systemd/system/bench-log-gen.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Benchmark log generator
+      After=network.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile=/etc/default/bench-log-gen
+      ExecStart=/usr/bin/python3 /opt/bench/log_gen.py
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  become: yes
+
+# ── Step 4: Enable and start ─────────────────────────────────────
+
+- name: Enable and start bench-log-gen
+  systemd:
+    name: bench-log-gen
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes

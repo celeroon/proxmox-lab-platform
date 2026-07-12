@@ -1,0 +1,88 @@
+---
+# Deploy the S7comm engineering-workstation client simulator as a systemd service.
+#
+# Variables:
+#   server_ip:           IP of the s7comm-server to connect to (required)
+#   s7comm_port:         TCP port to connect to (default: 102)
+#   poll_seconds:        How often to poll (default: 3.0)
+#   external_probe_ip:   Optional — VyOS loopback (e.g. 9.9.9.9) to periodically
+#                        probe with a real S7comm read, for the "ICS/IoT External
+#                        Traffic" dashboard panel. Requires a matching
+#                        vyos/configure_external_traffic_redirect hairpin rule.
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/s7comm directory
+  file:
+    path: /opt/s7comm
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/s7comm/venv
+  args:
+    creates: /opt/s7comm/venv/bin/python3
+  become: true
+
+- name: Install python-snap7 and rich into venv
+  pip:
+    name:
+      - python-snap7==3.0.0
+      - rich
+    virtualenv: /opt/s7comm/venv
+  become: true
+
+- name: Copy s7comm simulation files
+  copy:
+    src: s7comm/
+    dest: /opt/s7comm/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies s7_logic.py, s7_server.py, s7_client.py, s7_tui_common.py,
+  # s7_server_tui.py, s7_client_tui.py -- run the *_tui.py scripts manually over
+  # SSH for a live htop-style status view (/opt/s7comm/venv/bin/python3 /opt/s7comm/s7_client_tui.py)
+
+- name: Install s7comm-client systemd service
+  copy:
+    dest: /etc/systemd/system/s7comm-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=S7comm Client (engineering workstation simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/s7comm/venv/bin/python3 /opt/s7comm/s7_client.py \
+        --host {{ server_ip }} \
+        --port {{ s7comm_port | default(102) }} \
+        --poll-seconds {{ poll_seconds | default(3.0) }} \
+        --log-file /var/log/s7comm-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/s7comm
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start s7comm-client
+  systemd:
+    name: s7comm-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

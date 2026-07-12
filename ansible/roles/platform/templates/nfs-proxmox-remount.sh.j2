@@ -1,0 +1,32 @@
+#!/bin/bash
+# Trigger Proxmox pvemountd to remount nfs-templates after NFS server starts.
+# Proxmox re-evaluates storage config on disable→enable, clearing stale handles.
+set -euo pipefail
+
+ENV_FILE="{{ project_dir }}/.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "nfs-proxmox-remount: $ENV_FILE not found, skipping" >&2
+    exit 0
+fi
+
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+
+HOST="${PROXMOX_HOST}:${PROXMOX_PORT:-8006}"
+AUTH="PVEAPIToken=${PROXMOX_TOKEN_ID}=${PROXMOX_TOKEN_SECRET}"
+CURL_OPTS=(-sf --max-time 10)
+[[ "${PROXMOX_VERIFY_SSL:-false}" != "true" ]] && CURL_OPTS+=(-k)
+
+BASE_URL="https://${HOST}/api2/json/storage/nfs-templates"
+
+echo "nfs-proxmox-remount: disabling nfs-templates"
+curl "${CURL_OPTS[@]}" -X PUT "$BASE_URL" -H "Authorization: $AUTH" -d "disabled=1" \
+    || { echo "nfs-proxmox-remount: warning — could not disable storage (Proxmox unreachable?)" >&2; exit 0; }
+
+sleep 2
+
+echo "nfs-proxmox-remount: re-enabling nfs-templates"
+curl "${CURL_OPTS[@]}" -X PUT "$BASE_URL" -H "Authorization: $AUTH" -d "disabled=0" \
+    || { echo "nfs-proxmox-remount: warning — could not re-enable storage" >&2; exit 0; }
+
+echo "nfs-proxmox-remount: done"

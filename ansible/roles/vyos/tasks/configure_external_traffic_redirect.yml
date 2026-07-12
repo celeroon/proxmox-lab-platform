@@ -1,0 +1,101 @@
+---
+# Task: Redirect a "fake external" probe (destined for one of vyos-1's own
+# loopback addresses, e.g. 9.9.9.9 — see vyos/configure_loopback) back to a
+# real service on an internal OT VLAN, so Malcolm's "ICS/IoT External
+# Traffic" dashboard panel populates with genuine, correctly-classified
+# protocol traffic instead of an empty TCP SYN/RST.
+#
+# Why this needs three separate rules, not just a destination NAT:
+#   1. Destination NAT rewrites 9.9.9.9:<port> -> <target_ip>:<port>.
+#   2. Because the prober and the target are on the SAME subnet/VLAN, the
+#      redirected packet would otherwise reach the target with its ORIGINAL
+#      source address unchanged — the target replies directly to the
+#      prober, bypassing vyos-1 entirely, and the prober's TCP stack drops
+#      the reply since it doesn't match the connection it opened (it's
+#      expecting a reply FROM 9.9.9.9, not from the target's real IP). A
+#      source NAT (hairpin masquerade), scoped to just this redirected flow,
+#      forces the reply back through vyos-1 so it can be un-translated to
+#      look like it came from 9.9.9.9 again.
+#   3. The existing inter-VLAN forward-filter policy (see
+#      vyos/configure_firewall_acl) blocks OT-VLANS-to-OT-VLANS traffic by
+#      design — and once hairpinned through vyos-1, this redirected flow IS
+#      subject to that filter (same-subnet traffic normally never transits
+#      the router at all, so never sees the filter). A narrow allow rule for
+#      just this flow is required, and MUST be numbered lower than the
+#      existing broad inter-VLAN drop rule.
+#
+# Confirmed working live (2026-07-04): without the firewall allow rule, the
+# DNAT+SNAT alone dropped 2 packets on the existing "OT-VLANS -> 192.168.0.0/16"
+# drop rule; with it added, a real Modbus read against the fake external IP
+# succeeded and Zeek/Malcolm correctly logged conn.log service="modbus" with
+# destination still shown as the fake external IP (the mirror captures
+# traffic before vyos-1 applies NAT).
+#
+# CRITICAL bug found and fixed (2026-07-04), same day: the SNAT (hairpin
+# masquerade) and firewall-allow rules were originally scoped ONLY by
+# destination (real_target_ip/port) — with no source constraint at all. That
+# meant they matched ANY traffic reaching real_target_ip:port via
+# outbound_vif, not just the specific prober's redirected flow. Confirmed
+# live: a genuinely unrelated cross-VLAN attack (kali, on a different VLAN,
+# routed through vyos-1 like any inter-VLAN traffic) got its source silently
+# rewritten to vyos-1's own vif IP by the SNAT rule, and Zeek/Malcolm logged
+# the attack as coming from vyos-1 instead of the real attacker — completely
+# breaking attacker-IP attribution for the "Unauthorized Modbus Master"
+# detection. Fixed by requiring `prober_ip` (the specific host expected to
+# probe the fake-external address) as an explicit match criterion on both the
+# SNAT and firewall-allow rules, so only that host's redirected flow is
+# affected — any other traffic reaching the same destination:port (e.g. a
+# genuine cross-VLAN attack) passes through untouched, with its real source
+# preserved.
+#
+# Variables:
+#   fake_external_ip:    vyos-1 loopback address probes are sent to (e.g. 9.9.9.9)
+#   fake_external_port:  port the probe connects to (e.g. 502)
+#   real_target_ip:      real internal service to redirect to (e.g. 192.168.10.10)
+#   real_target_port:    real internal service port (usually same as fake_external_port)
+#   outbound_vif:        vif interface name facing real_target_ip (e.g. eth1.10)
+#   prober_ip:            the ONE host expected to send the fake-external probe
+#                         (e.g. modbus-client's real IP, 192.168.10.20) — required,
+#                         scopes the hairpin SNAT/firewall-allow to just this host
+#                         so unrelated traffic to the same destination:port (e.g. a
+#                         genuine cross-VLAN attack) is never touched
+#   protocol:             tcp|udp (default tcp)
+#   rule_number:          NAT/firewall rule number to use (default 10) — must be
+#                         unique among all configure_external_traffic_redirect
+#                         calls on the same vyos-1, and lower than the broad
+#                         inter-VLAN drop rule from configure_firewall_acl
+
+- name: Configure hairpin DNAT + SNAT + firewall allow for external-traffic redirect
+  vyos.vyos.vyos_config:
+    lines:
+      - >-
+        set nat destination rule {{ rule_number | default(10) }} description
+        'redirect fake-external probe ({{ fake_external_ip }}) to {{ real_target_ip }}'
+      - set nat destination rule {{ rule_number | default(10) }} destination address {{ fake_external_ip }}
+      - set nat destination rule {{ rule_number | default(10) }} destination port {{ fake_external_port }}
+      - set nat destination rule {{ rule_number | default(10) }} protocol {{ protocol | default('tcp') }}
+      - set nat destination rule {{ rule_number | default(10) }} translation address {{ real_target_ip }}
+      - set nat destination rule {{ rule_number | default(10) }} translation port {{ real_target_port }}
+      - >-
+        set nat source rule {{ rule_number | default(10) }} description
+        'hairpin masquerade for the {{ fake_external_ip }} redirect (prober {{ prober_ip }} only)'
+      - set nat source rule {{ rule_number | default(10) }} source address {{ prober_ip }}
+      - set nat source rule {{ rule_number | default(10) }} destination address {{ real_target_ip }}
+      - set nat source rule {{ rule_number | default(10) }} destination port {{ real_target_port }}
+      - set nat source rule {{ rule_number | default(10) }} protocol {{ protocol | default('tcp') }}
+      - set nat source rule {{ rule_number | default(10) }} outbound-interface name {{ outbound_vif }}
+      - set nat source rule {{ rule_number | default(10) }} translation address masquerade
+      - >-
+        set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} description
+        'allow hairpinned external-traffic redirect to {{ real_target_ip }} (prober {{ prober_ip }} only)'
+      - set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} action accept
+      - set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} source address {{ prober_ip }}
+      - set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} destination address {{ real_target_ip }}
+      - set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} destination port {{ real_target_port }}
+      - set firewall ipv4 forward filter rule {{ rule_number | default(10) + 5 }} protocol {{ protocol | default('tcp') }}
+  vars:
+    ansible_command_timeout: 60
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

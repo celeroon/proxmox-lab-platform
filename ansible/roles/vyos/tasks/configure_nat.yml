@@ -1,0 +1,33 @@
+---
+# Task: Configure NAT rules on VyOS router
+# Variables:
+#   nat_rules: List of NAT rule configurations
+#     - rule: 100
+#       description: "NAT HQ-Firewall"
+#       source: "192.0.2.0/29"
+#       outbound_interface: "eth1"
+#       translation: "masquerade"
+
+- name: Build NAT configuration lines
+  set_fact:
+    nat_lines: "{{ nat_lines | default([]) + [
+      'set nat source rule ' ~ (item.rule | string) ~ ' description \"' ~ item.description ~ '\"',
+      'set nat source rule ' ~ (item.rule | string) ~ ' source address \"' ~ item.source ~ '\"',
+      'set nat source rule ' ~ (item.rule | string) ~ ' outbound-interface name ' ~ item.outbound_interface
+    ] + (
+      ['set nat source rule ' ~ (item.rule | string) ~ ' destination address \"' ~ item.destination ~ '\"'] if item.destination is defined else []
+    ) + (
+      ['set nat source rule ' ~ (item.rule | string) ~ ' exclude'] if item.translation == 'exclude'
+      else ['set nat source rule ' ~ (item.rule | string) ~ ' translation address masquerade'] if item.translation == 'masquerade'
+      else ['set nat source rule ' ~ (item.rule | string) ~ ' translation address ' ~ item.translation]
+    ) }}"
+  loop: "{{ nat_rules | default([]) }}"
+
+- name: Configure NAT rules
+  vyos.vyos.vyos_config:
+    lines: "{{ nat_lines }}"
+  when: nat_lines is defined
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

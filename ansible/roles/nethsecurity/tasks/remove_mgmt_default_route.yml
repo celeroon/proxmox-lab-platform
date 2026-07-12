@@ -1,0 +1,16 @@
+---
+# Task: Remove default route from DHCP on the management interface
+# NethSecurity uses the management interface for platform access only —
+# the default route must come from the WAN interface, not from DHCP on mgmt.
+
+- name: Disable default route on mgmt interface
+  ansible.builtin.command:
+    cmd: uci set network.mgmt.defaultroute=0
+
+- name: Commit network config
+  ansible.builtin.command:
+    cmd: uci commit network
+
+- name: Restart network
+  ansible.builtin.command:
+    cmd: /etc/init.d/network restart

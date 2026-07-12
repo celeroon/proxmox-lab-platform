@@ -1,0 +1,114 @@
+---
+# Task: Enable IOX and configure guestshell on Cisco IOS-XE
+# Variables:
+#   outside_interface:   NAT outside interface (e.g. GigabitEthernet2)
+#   vportgroup_id:       VirtualPortGroup ID (e.g. 0)
+#   vportgroup_ip:       VirtualPortGroup IP address (e.g. 192.168.123.1)
+#   vportgroup_mask:     VirtualPortGroup subnet mask (e.g. 255.255.255.0)
+#   vportgroup_network:  VirtualPortGroup network address (e.g. 192.168.123.0)
+#   vportgroup_wildcard: VirtualPortGroup wildcard mask (e.g. 0.0.0.255)
+#   guest_ip:            Guestshell guest IP address (e.g. 192.168.123.5)
+#   guest_netmask:       Guestshell guest subnet mask (e.g. 255.255.255.0)
+#   guest_dns:           Guestshell DNS server (e.g. 8.8.8.8)
+#   lan_pool_ip:         Policy NAT pool IP — router's LAN gateway IP, used to masquerade
+#                        guestshell traffic toward remote subnets (e.g. 172.16.100.254)
+#   lan_pool_mask:       Policy NAT pool mask (e.g. 255.255.255.0)
+#   remote_subnets:      Remote subnets reachable via the S2S VPN — guestshell traffic
+#                        destined here is policy-NATed to lan_pool_ip instead of PAT.
+#                        Each entry: { network: "x.x.x.x", wildcard: "0.0.0.255" }
+
+- name: Build IOX ACL entry lists
+  set_fact:
+    _iox_internet_entries: "{{ _deny_entries + _permit_entry }}"
+    _iox_hq_entries: >-
+      {{
+        remote_subnets
+        | map(attribute='network')
+        | zip(remote_subnets | map(attribute='wildcard'))
+        | list
+        | map('join', ' ')
+        | map('regex_replace', '^(.+)$', 'permit ip ' ~ vportgroup_network ~ ' ' ~ vportgroup_wildcard ~ ' \1')
+        | list
+      }}
+  vars:
+    _deny_entries: >-
+      {{
+        remote_subnets
+        | map(attribute='network')
+        | zip(remote_subnets | map(attribute='wildcard'))
+        | list
+        | map('join', ' ')
+        | map('regex_replace', '^(.+)$', 'deny ip ' ~ vportgroup_network ~ ' ' ~ vportgroup_wildcard ~ ' \1')
+        | list
+      }}
+    _permit_entry:
+      - "permit ip {{ vportgroup_network }} {{ vportgroup_wildcard }} any"
+
+- name: Enable IOX
+  cisco.ios.ios_config:
+    lines:
+      - iox
+
+- name: Configure IOX_TO_INTERNET ACL
+  cisco.ios.ios_config:
+    lines: "{{ _iox_internet_entries }}"
+    parents: ip access-list extended IOX_TO_INTERNET
+
+- name: Configure IOX_TO_HQ ACL
+  cisco.ios.ios_config:
+    lines: "{{ _iox_hq_entries }}"
+    parents: ip access-list extended IOX_TO_HQ
+
+- name: Configure NAT overload for IOX internet access
+  cisco.ios.ios_config:
+    lines:
+      - ip nat inside source list IOX_TO_INTERNET interface {{ outside_interface }} overload
+
+- name: Configure IOX_AS_LAN NAT pool
+  cisco.ios.ios_config:
+    lines:
+      - ip nat pool IOX_AS_LAN {{ lan_pool_ip }} {{ lan_pool_ip }} netmask {{ lan_pool_mask }}
+
+- name: Configure route-map for IOX policy NAT to HQ
+  cisco.ios.ios_config:
+    lines:
+      - match ip address IOX_TO_HQ
+    parents: route-map RM-IOX-HQ permit 10
+
+- name: Configure policy NAT for IOX to HQ subnets
+  cisco.ios.ios_config:
+    lines:
+      - ip nat inside source route-map RM-IOX-HQ pool IOX_AS_LAN
+
+- name: Configure VirtualPortGroup{{ vportgroup_id }}
+  cisco.ios.ios_config:
+    lines:
+      - ip address {{ vportgroup_ip }} {{ vportgroup_mask }}
+      - ip nat inside
+    parents: interface VirtualPortGroup{{ vportgroup_id }}
+
+- name: Configure guestshell app-vnic
+  cisco.ios.ios_config:
+    lines:
+      - guest-ipaddress {{ guest_ip }} netmask {{ guest_netmask }}
+    parents:
+      - app-hosting appid guestshell
+      - app-vnic gateway0 virtualportgroup {{ vportgroup_id }} guest-interface 0
+
+- name: Configure guestshell default gateway and DNS
+  cisco.ios.ios_config:
+    lines:
+      - app-default-gateway {{ vportgroup_ip }} guest-interface 0
+      - name-server0 {{ guest_dns }}
+    parents: app-hosting appid guestshell
+
+- name: Enable guestshell
+  cisco.ios.ios_command:
+    commands:
+      - guestshell enable
+    wait_for:
+      - result[0] contains ""
+    retries: 3
+    interval: 10
+  vars:
+    ansible_command_timeout: 120

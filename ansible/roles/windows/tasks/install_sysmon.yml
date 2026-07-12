@@ -1,0 +1,23 @@
+---
+# Task: Install Sysmon with sysmon-modular config
+
+- name: Install Sysmon via Chocolatey
+  chocolatey.chocolatey.win_chocolatey:
+    name: sysmon
+    version: "15.14.0"
+    state: present
+    ignore_checksums: yes
+
+- name: Download Sysmon config (sysmon-modular)
+  ansible.windows.win_get_url:
+    url: https://raw.githubusercontent.com/olafhartong/sysmon-modular/master/sysmonconfig-with-filedelete.xml
+    dest: C:\win-setup\sysmonconfig.xml
+    force: yes
+
+- name: Clear event logs before Sysmon install
+  ansible.windows.win_shell: |
+    C:\win-setup\Clear-EventLogs.ps1
+
+- name: Install Sysmon with config
+  ansible.windows.win_shell: |
+    C:\ProgramData\chocolatey\lib\sysmon\tools\sysmon64.exe -i C:\win-setup\sysmonconfig.xml -accepteula

@@ -1,0 +1,13 @@
+---
+# Task: Install one or more Windows features/roles.
+#
+# Required vars:
+#   windows_features — list of Windows feature names to install
+#                      (e.g. ["RSAT-AD-PowerShell", "DNS"])
+
+- name: Install Windows features
+  ansible.windows.win_feature:
+    name: "{{ item }}"
+    include_management_tools: true
+    state: present
+  loop: "{{ windows_features }}"

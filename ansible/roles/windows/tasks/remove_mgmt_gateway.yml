@@ -1,0 +1,41 @@
+---
+# Task: Remove default gateway from Ethernet 2 by setting it to static (no gateway).
+# The current IP is preserved; only the default gateway entry is removed.
+#
+# WinRM runs over Ethernet 2, so changing its config briefly drops the connection.
+# The netsh command is fired asynchronously (poll: 0) to release WinRM before the
+# disruption occurs, then wait_for checks TCP port 5985 from the Ansible controller
+# (delegate_to: localhost) — avoids WinRM read-timeout issues with wait_for_connection.
+
+# - name: Remove default gateway route from Ethernet 2
+#   ansible.windows.win_shell: |
+#     Remove-NetRoute -InterfaceAlias "Ethernet 2" -DestinationPrefix "0.0.0.0/0" -Confirm:$false -ErrorAction SilentlyContinue
+
+- name: Remove default gateway from Ethernet 2 (async — will drop WinRM briefly)
+  ansible.windows.win_shell: |
+    $ipInfo = Get-NetIPAddress -InterfaceAlias "Ethernet 2" -AddressFamily IPv4
+    $ip = $ipInfo.IPAddress
+    $prefix = $ipInfo.PrefixLength
+    $mask = "255.255.0.0"
+    netsh interface ip set address "Ethernet 2" static $ip $mask
+  async: 45
+  poll: 0
+
+- name: Pause to let async netsh command run and disrupt WinRM
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: Wait for WinRM port to be reachable after network reconfiguration
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ ansible_port | default(5985) }}"
+    delay: 5
+    timeout: 60
+  delegate_to: localhost
+
+- name: Verify WinRM is actually responding after network reconfiguration
+  ansible.windows.win_ping:
+  register: _winrm_ping
+  until: _winrm_ping is succeeded
+  retries: 12
+  delay: 10

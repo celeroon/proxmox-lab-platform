@@ -1,0 +1,487 @@
+version: 1
+name: Elastic Cluster
+description: >
+  3-node Elasticsearch cluster with dedicated Kibana, Fleet Server, and Ubuntu agent VMs.
+  Deploy order: elk-1 → elk-2/elk-3/kibana-1 (parallel) → fleet-1 → ubuntu-agent.
+vm_prefix: ""
+
+x-elastic-config: &elastic-config
+  elastic_nodes:
+    - {name: elk-1, ip: &ip-elk-1 "172.16.10.10", roles: []}
+    - {name: elk-2, ip: &ip-elk-2 "172.16.10.11", roles: []}
+    - {name: elk-3, ip: &ip-elk-3 "172.16.10.12", roles: []}
+  elk_version: "9.4.2"
+  elk_password: "labpassword"
+  elk_cert_pass: "labcertpass"
+  kibana_ip: &ip-kibana-1 "172.16.10.20"
+  fleet_ip: &ip-fleet-1 "172.16.10.21"
+  es_exporter_password: "labexporterpass"
+
+x-agent-ip: &ip-ubuntu-agent "172.16.10.30"
+
+networks:
+  - name: vyos-neth
+    type: vnet
+  - name: neth-core
+    type: vnet
+  - name: ovs-elk-1
+    type: vnet
+  - name: ovs-elk-2
+    type: vnet
+  - name: ovs-elk-3
+    type: vnet
+  - name: ovs-kibana-1
+    type: vnet
+  - name: ovs-fleet-1
+    type: vnet
+  - name: ovs-ubuntu-agent
+    type: vnet
+
+vms:
+  - name: vyos-1
+    template: vyos/current
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-neth
+    ansible:
+      connection:
+        type: network_cli
+        network_os: vyos
+        user: vyos
+        password: vyos
+      gather_facts: false
+      become: false
+      tasks:
+        - task: vyos/set_hostname
+          vars:
+            hostname: vyos-1
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - name: eth1
+                description: "*** To NethSecurity (HQ) ***"
+                address: 192.0.2.1/29
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - rule: 100
+                description: "TEST-NET-1 Outbound NAT"
+                source: 192.0.2.0/24
+                outbound_interface: eth0
+                translation: masquerade
+        - task: vyos/configure_routing
+          vars:
+            routing:
+              default_route: "10.{USER_ID}.0.1"
+
+  - name: neth-1
+    depends_on: [vyos-1]
+    template: nethsecurity-8.7.2
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-neth
+      - name: eth2
+        type: vnet
+        network: neth-core
+    ansible:
+      connection:
+        type: ssh
+        user: root
+        password: Nethesis,1234
+      gather_facts: false
+      become: false
+      tasks:
+        - task: nethsecurity/set_hostname
+          vars:
+            hostname: neth-1
+        - task: nethsecurity/rename_firewall_zone
+          vars:
+            old_zone: ns_lan
+            new_zone: ns_mgmt
+            zone_name: mgmt
+            network: mgmt
+            input: ACCEPT
+            output: ACCEPT
+            forward: ACCEPT
+        - task: nethsecurity/remove_mgmt_default_route
+        - task: nethsecurity/configure_interfaces
+          vars:
+            interfaces:
+              - name: wan
+                device: eth1
+                proto: static
+                ipaddr: 192.0.2.6/29
+        - task: nethsecurity/configure_default_route
+          vars:
+            interface: wan
+            gateway: 192.0.2.1
+        - task: nethsecurity/configure_firewall_zones
+          vars:
+            zones:
+              - name: wan
+                network: wan
+                input: REJECT
+                output: ACCEPT
+                forward: REJECT
+                masq: true
+        - task: nethsecurity/configure_vlan_devices
+          vars:
+            vlans:
+              - name: ns_vlan10
+                ifname: eth2
+                vid: 10
+        - task: nethsecurity/configure_interfaces
+          vars:
+            interfaces:
+              - name: vlan10
+                device: eth2.10
+                proto: static
+                ipaddr: 172.16.10.254
+                netmask: 255.255.255.0
+              - name: eth2
+                device: eth2
+                proto: none
+        - task: nethsecurity/configure_firewall_zones
+          vars:
+            zones:
+              - name: lan
+                network: vlan10 eth2
+                input: ACCEPT
+                output: ACCEPT
+                forward: ACCEPT
+        - task: nethsecurity/configure_zone_forwarding
+          vars:
+            forwardings:
+              - src: lan
+                dest: wan
+        - task: nethsecurity/configure_nat
+          vars:
+            nat_rules:
+              - id: ns_nat_servers
+                name: SERVERS->Internet
+                src_ip: 172.16.10.0/24
+                device: eth1
+        - task: nethsecurity/configure_firewall_rules
+          vars:
+            firewall_rules:
+              - id: ns_rule_servers_internet
+                name: SERVERS->INTERNET
+                src_ip: 172.16.10.0/24
+                target: ACCEPT
+
+  - name: ovs-core-1
+    depends_on: [neth-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: neth-core
+      - name: eth2
+        type: vnet
+        network: ovs-elk-1
+      - name: eth3
+        type: vnet
+        network: ovs-elk-2
+      - name: eth4
+        type: vnet
+        network: ovs-elk-3
+      - name: eth5
+        type: vnet
+        network: ovs-kibana-1
+      - name: eth6
+        type: vnet
+        network: ovs-fleet-1
+      - name: eth7
+        type: vnet
+        network: ovs-ubuntu-agent
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: ovs/install_ovs
+        - task: ovs/configure_interfaces
+          vars:
+            bridge_name: br0
+            management_interface:
+              name: eth0
+              address: "{{ vm_mgmt_ip }}"
+              netmask: "{{ vm_mgmt_netmask }}"
+            bridge_ports:
+              - name: eth1
+                type: trunk
+                trunks: [10]
+              - name: eth2
+                type: access
+                tag: 10
+              - name: eth3
+                type: access
+                tag: 10
+              - name: eth4
+                type: access
+                tag: 10
+              - name: eth5
+                type: access
+                tag: 10
+              - name: eth6
+                type: access
+                tag: 10
+              - name: eth7
+                type: access
+                tag: 10
+
+  - name: elk-1
+    depends_on: [ovs-core-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 6
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-elk-1
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: elk-1
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-elk-1
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_bootstrap
+        - task: services/elasticsearch
+          vars:
+            lab_ip: *ip-elk-1
+            node_roles: ~
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+            elastic_heap: "8g"
+        - task: services/metricbeat
+          vars:
+            lab_ip: *ip-elk-1
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: *ip-elk-1
+
+  - name: elk-2
+    depends_on: [elk-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 6
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-elk-2
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: elk-2
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-elk-2
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: *ip-elk-2
+            node_roles: ~
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+            elastic_heap: "8g"
+        - task: services/metricbeat
+          vars:
+            lab_ip: *ip-elk-2
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: *ip-elk-2
+
+  - name: elk-3
+    depends_on: [elk-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 6
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-elk-3
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: elk-3
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-elk-3
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: *ip-elk-3
+            node_roles: ~
+            # elastic_heap: "8g"   # optional heap override (default: JVM ergonomics)
+            elastic_heap: "8g"
+        - task: services/metricbeat
+          vars:
+            lab_ip: *ip-elk-3
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: *ip-elk-3
+
+  - name: kibana-1
+    depends_on: [elk-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-kibana-1
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: kibana-1
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-kibana-1
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/kibana_fetch_certs
+        - task: services/kibana
+          vars:
+            lab_ip: *ip-kibana-1
+
+  - name: fleet-1
+    depends_on: [kibana-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-fleet-1
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: fleet-1
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-fleet-1
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/fleet_fetch_certs
+        - task: services/fleet_server
+          vars:
+            lab_ip: *ip-fleet-1
+        - task: services/elastic_agent_mirror
+        - task: services/fleet_windows_policy
+        - task: services/fleet_linux_policy
+        - task: services/fleet_filestream_policy
+
+  - name: ubuntu-desktop-1
+    depends_on: [fleet-1]
+    template: joaobrlt/ubuntu-desktop-24.04
+    clone_mode: full
+    cpus: 4
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-ubuntu-agent
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: ubuntu-agent
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-ubuntu-agent
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: *ip-fleet-1
+            fleet_policy_id: linux-policy

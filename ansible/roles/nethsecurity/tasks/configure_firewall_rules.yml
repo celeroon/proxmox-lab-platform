@@ -1,0 +1,80 @@
+---
+# Task: Configure firewall ACCEPT/DROP rules on NethSecurity
+# Variables:
+#   firewall_rules: list of rules to create
+#     - id:      UCI section name (e.g. "ns_rule_servers_internet")
+#       name:    Display name (e.g. "SERVERS->INTERNET")
+#       src_ip:  Source network (e.g. "172.16.10.0/24")
+#       target:  ACCEPT or DROP
+
+- name: Create firewall rule sections
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}=rule"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule names
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.name={{ item.name }}"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule source zones
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.src=*"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule source IPs
+  ansible.builtin.command:
+    cmd: "uci add_list firewall.{{ item.id }}.src_ip={{ item.src_ip }}"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule destination zones
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.dest=*"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule targets
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.target={{ item.target }}"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set rule protocols
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.proto=all"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Enable rules
+  ansible.builtin.command:
+    cmd: "uci set firewall.{{ item.id }}.enabled=1"
+  loop: "{{ firewall_rules }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Commit firewall config
+  ansible.builtin.command:
+    cmd: uci commit firewall
+
+- name: Restart firewall
+  ansible.builtin.command:
+    cmd: /etc/init.d/firewall restart

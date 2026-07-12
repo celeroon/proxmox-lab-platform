@@ -1,0 +1,79 @@
+---
+# Deploy the EtherNet/IP-CIP sensor+solenoid I/O rack simulator as a systemd
+# service.
+#
+# Variables:
+#   enip_port:    TCP port to listen on (default: 44818)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/enip directory
+  file:
+    path: /opt/enip
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/enip/venv
+  args:
+    creates: /opt/enip/venv/bin/python3
+  become: true
+
+- name: Install cpppo and rich into venv
+  pip:
+    name:
+      - cpppo==5.2.5
+      - rich
+    virtualenv: /opt/enip/venv
+  become: true
+
+- name: Copy enip simulation files
+  copy:
+    src: enip/
+    dest: /opt/enip/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies enip_logic.py, enip_server.py, enip_client.py, enip_tui_common.py,
+  # enip_server_tui.py, enip_client_tui.py -- run the *_tui.py scripts manually over
+  # SSH for a live htop-style status view (/opt/enip/venv/bin/python3 /opt/enip/enip_server_tui.py)
+
+- name: Install enip-server systemd service
+  copy:
+    dest: /etc/systemd/system/enip-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=EtherNet/IP-CIP Sensor+Solenoid I/O Rack Simulator
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/enip/venv/bin/python3 /opt/enip/enip_server.py \
+        --host 0.0.0.0 \
+        --port {{ enip_port | default(44818) }} \
+        --log-file /var/log/enip-server.log
+      Restart=always
+      WorkingDirectory=/opt/enip
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start enip-server
+  systemd:
+    name: enip-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

@@ -1,0 +1,383 @@
+---
+# Configure a gretap L2 tunnel for SPAN/mirror output and install per-port OpenFlow mirror
+# rules that send copies of frames to the remote endpoint (typically Malcolm).
+#
+# This replaces the OVS Mirror object approach (which does not work with Proxmox VXLAN SDN
+# zones — the VXLAN bridge drops unknown-unicast frames before they reach the mirror port).
+# The gretap tunnel carries raw Ethernet frames over the management network, bypassing
+# Proxmox SDN entirely.
+#
+# Must run AFTER configure_vlan_switch (bridge + access ports must already exist).
+#
+# Variables:
+#   bridge_name:      OVS bridge the gretap port is added to (default: br-ot)
+#   gretap_iface:     gretap interface name. MUST NOT contain hyphens — Malcolm's pcap-capture
+#                     startup does `export ${PCAP_IFACE}=...` which fails on non-identifiers
+#                     (default: grespan)
+#   gretap_local_ip:  Management IP of this VM (tunnel local endpoint).
+#                     Use `{{ management_ip }}` — injected by the platform for every VM.
+#   gretap_remote_ip: Management IP of the Malcolm VM (tunnel remote endpoint).
+#   mirror_ports:     List of OVS access port names to mirror via OpenFlow rules.
+#                     Include all ports whose traffic should reach Malcolm.
+#                     Example: [eth4, eth5, eth6, eth7, eth8, eth9, eth10, eth11, eth12, eth13, eth14, eth15]
+
+- name: Create gretap tunnel interface (ignore if already exists)
+  command: >
+    ip link add {{ gretap_iface | default('grespan') }} type gretap
+    local {{ gretap_local_ip }} remote {{ gretap_remote_ip }}
+  changed_when: false
+  failed_when: false
+
+# Linux auto-calculates a new gretap's MTU from the outbound route's MTU minus
+# encapsulation overhead — on this platform that route is a Proxmox VXLAN-backed
+# vNIC already reduced to 1450, so gretap lands on ~1412. Real traffic on this
+# network reaches ~1432 bytes, which the kernel silently drops at the gretap
+# device ("dropped over-mtu packet") well before any IP-level fragmentation could
+# help. Force 1500 explicitly so nothing legitimate gets rejected — any resulting
+# oversized encapsulated packet is fragmented transparently by IP, unlike a
+# gretap-level MTU rejection which just drops the frame with no fallback.
+- name: Set gretap interface MTU (auto-calculated MTU silently drops real traffic)
+  command: ip link set {{ gretap_iface | default('grespan') }} mtu 1500
+  changed_when: false
+
+- name: Bring gretap interface up
+  command: ip link set {{ gretap_iface | default('grespan') }} up
+  changed_when: false
+
+- name: Add gretap port to OVS bridge
+  command: >
+    ovs-vsctl --may-exist add-port {{ bridge_name | default('br-ot') }}
+    {{ gretap_iface | default('grespan') }}
+  changed_when: false
+
+- name: Wait for gretap port to get an ofport assigned
+  shell: |
+    for i in $(seq 1 60); do
+      p=$(ovs-vsctl get Interface {{ gretap_iface | default('grespan') }} ofport 2>/dev/null)
+      [ -n "$p" ] && [ "$p" != "[]" ] && exit 0
+      sleep 1
+    done
+    exit 1
+  changed_when: false
+
+# Adding a new port to an already-running vswitchd — especially a tunnel-type
+# port like gretap — has been observed to re-trigger the same handler-thread
+# "upcall thrash" bug that ovs-iface-up.service's restart fixes for the initial
+# port set (n-handler-threads resets, every packet misses the datapath cache:
+# `ovs-appctl dpif/show` showed hit:0 / missed:10000+ until a second restart).
+# Confirmed live 2026-07-03 — modbus traffic had zero connectivity, restarting
+# openvswitch-switch again immediately restored it. This restart clears the
+# runtime OpenFlow flow table (port/tag config in OVSDB survives), so it must
+# happen BEFORE the flow rules below are installed, not after.
+- name: Restart openvswitch-switch again (adding gretap can re-trigger upcall thrash)
+  systemd:
+    name: openvswitch-switch
+    state: restarted
+  changed_when: false
+
+- name: Wait for gretap ofport again after the restart
+  shell: |
+    for i in $(seq 1 60); do
+      p=$(ovs-vsctl get Interface {{ gretap_iface | default('grespan') }} ofport 2>/dev/null)
+      [ -n "$p" ] && [ "$p" != "[]" ] && exit 0
+      sleep 1
+    done
+    exit 1
+  changed_when: false
+
+- name: Delete all existing table-0 OpenFlow flows
+  command: ovs-ofctl del-flows {{ bridge_name | default('br-ot') }} table=0
+  changed_when: false
+
+# Install NORMAL immediately after del-flows so the bridge never loses forwarding.
+# A gap with an empty flow table causes vswitchd to drop all upcalls faster than
+# it can process them, breaking forwarding even after flows are added later.
+- name: Install NORMAL fallback flow (priority 0)
+  command: >
+    ovs-ofctl add-flow {{ bridge_name | default('br-ot') }}
+    "priority=0,actions=NORMAL"
+  changed_when: false
+
+# Use ofport numbers via ovs-vsctl (reads OVSDB directly) rather than passing port
+# names to ovs-ofctl, which resolves names via vswitchd's OpenFlow layer and can
+# fail if vswitchd hasn't finished loading the port table yet.
+- name: Install per-port OpenFlow mirror rules using ofport numbers
+  shell: |
+    ofport=$(ovs-vsctl get Interface {{ item }} ofport 2>/dev/null)
+    grespan_port=$(ovs-vsctl get Interface {{ gretap_iface | default('grespan') }} ofport)
+    if [ -n "$ofport" ] && [ "$ofport" != "[]" ] && [ "$ofport" -gt 0 ] 2>/dev/null; then
+      ovs-ofctl add-flow {{ bridge_name | default('br-ot') }} \
+        "priority=1000,in_port=${ofport},actions=output:${grespan_port},NORMAL"
+    fi
+  loop: "{{ mirror_ports }}"
+  changed_when: true
+
+# Write the setup script as a real file so the systemd service avoids all
+# inline-bash-in-unit-file escaping hazards.  systemd expands ${VAR} in
+# ExecStart before passing to bash, so inline for-loop variables like ${port}
+# collapse to empty string if they are not systemd environment variables.
+#
+# Self-healing (added 2026-07-05, corrected same day): confirmed live that even
+# with the double-restart fix below, a genuine cold VM reboot can still leave
+# the mirror non-functional — `ovs-span-tunnel.service` reports success, the
+# OpenFlow table looks completely correct in `dump-flows`, but
+# `ovs-appctl dpif/show` shows the datapath thrashing (almost every packet a
+# cache miss) and grespan carries zero traffic.
+#
+# First attempt at a fix (retry+verify via `ovs-appctl ofproto/trace` below)
+# turned out to be a false sense of security: `ofproto/trace` only simulates
+# vswitchd's OpenFlow-table translation logic in userspace — it never touches
+# the actual kernel datapath or the handler-thread upcall pipeline, which is
+# exactly where this bug lives. It reported "healthy on attempt 1" in under a
+# second on a boot where the mirror was, in fact, still completely broken
+# (confirmed: `dpif/show` showed hit:0 missed:626 and grespan carried zero
+# traffic minutes later, even though the service log showed success). It's
+# kept below because it's still useful for catching gross misconfiguration
+# (e.g. a missing flow rule entirely), just not the real bug.
+#
+# The actual self-healing mechanism is `ovs-span-healthcheck.service`/`.timer`
+# further down this file: it polls the real `ovs-appctl dpctl/show` hit/miss
+# counters every 30s and re-runs this setup script if it sees sustained
+# all-miss traffic, since that's the one signal that can't be faked by a
+# userspace-only simulation. This sidesteps the boot-time chicken-and-egg
+# problem too — there's no reliable way to synthesize traffic that exercises
+# the kernel-level bug before real VM traffic exists, but real traffic does
+# start flowing within the first couple minutes of boot regardless, so a
+# periodic check catches it shortly after.
+- name: Write ovs-span-setup.sh script
+  copy:
+    dest: /usr/local/sbin/ovs-span-setup.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      BRIDGE="{{ bridge_name | default('br-ot') }}"
+      GRETAP="{{ gretap_iface | default('grespan') }}"
+      LOCAL_IP="{{ gretap_local_ip }}"
+      REMOTE_IP="{{ gretap_remote_ip }}"
+      MIRROR_PORTS="{{ mirror_ports | join(' ') }}"
+      MAX_ATTEMPTS=3
+
+      log() { logger -t ovs-span-setup "$1"; echo "ovs-span-setup: $1"; }
+
+      do_setup() {
+        ip link add "$GRETAP" type gretap local "$LOCAL_IP" remote "$REMOTE_IP" 2>/dev/null || true
+        # See configure_gretap_span.yml's MTU task comment: auto-calculated MTU is too
+        # small for real traffic on this network and silently drops it at the tunnel.
+        ip link set "$GRETAP" mtu 1500
+        ip link set "$GRETAP" up
+        ovs-vsctl --may-exist add-port "$BRIDGE" "$GRETAP"
+
+        # Wait until vswitchd assigns an ofport to grespan — confirms OVSDB is fully loaded
+        for i in $(seq 1 60); do
+          p=$(ovs-vsctl get Interface "$GRETAP" ofport 2>/dev/null)
+          [ -n "$p" ] && [ "$p" != "[]" ] && break
+          sleep 1
+        done
+
+        # Adding gretap can re-trigger vswitchd's handler-thread upcall-thrash bug
+        # (same one ovs-iface-up.service's restart fixes for the initial port set).
+        # Must restart BEFORE installing flow rules below — the restart wipes the
+        # runtime flow table (port/tag config in OVSDB is unaffected).
+        systemctl restart openvswitch-switch
+        for i in $(seq 1 60); do
+          p=$(ovs-vsctl get Interface "$GRETAP" ofport 2>/dev/null)
+          [ -n "$p" ] && [ "$p" != "[]" ] && break
+          sleep 1
+        done
+
+        ovs-ofctl del-flows "$BRIDGE" table=0
+        ovs-ofctl add-flow "$BRIDGE" "priority=0,actions=NORMAL"
+
+        GRESPAN_PORT=$(ovs-vsctl get Interface "$GRETAP" ofport)
+
+        for port in $MIRROR_PORTS; do
+          ofport=$(ovs-vsctl get Interface "$port" ofport 2>/dev/null)
+          if [ -n "$ofport" ] && [ "$ofport" != "[]" ]; then
+            ovs-ofctl add-flow "$BRIDGE" \
+              "priority=1000,in_port=${ofport},actions=output:${GRESPAN_PORT},NORMAL"
+          fi
+        done
+      }
+
+      verify() {
+        grespan_port=$(ovs-vsctl get Interface "$GRETAP" ofport 2>/dev/null)
+        [ -z "$grespan_port" ] && return 1
+        for port in $MIRROR_PORTS; do
+          ofport=$(ovs-vsctl get Interface "$port" ofport 2>/dev/null)
+          [ -z "$ofport" ] && continue
+          trace=$(ovs-appctl ofproto/trace "$BRIDGE" \
+            "in_port=${ofport},dl_src=00:00:00:00:00:01,dl_dst=00:00:00:00:00:02,dl_type=0x0800,nw_src=10.255.255.1,nw_dst=10.255.255.2,nw_proto=1" 2>&1)
+          if ! echo "$trace" | grep -q "output:${grespan_port}"; then
+            log "verify FAILED: $port (ofport $ofport) does not trace to grespan (ofport $grespan_port)"
+            return 1
+          fi
+        done
+        return 0
+      }
+
+      for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+        log "setup attempt ${attempt}/${MAX_ATTEMPTS}"
+        do_setup
+        if verify; then
+          log "mirror verified healthy on attempt ${attempt}"
+          exit 0
+        fi
+        log "verification failed after attempt ${attempt}, retrying..."
+      done
+
+      log "WARNING: mirror still failing verification after ${MAX_ATTEMPTS} attempts -- traffic may not reach Malcolm. Run this script manually to retry, or check 'ovs-appctl dpif/show' on this VM for upcall-thrash symptoms."
+      exit 1
+
+- name: Write ovs-span-teardown.sh script
+  copy:
+    dest: /usr/local/sbin/ovs-span-teardown.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      ovs-vsctl del-port {{ bridge_name | default('br-ot') }} {{ gretap_iface | default('grespan') }} 2>/dev/null || true
+      ip link del {{ gretap_iface | default('grespan') }} 2>/dev/null || true
+
+- name: Install ovs-span-tunnel systemd service
+  copy:
+    dest: /etc/systemd/system/ovs-span-tunnel.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=OVS gretap SPAN tunnel to {{ gretap_remote_ip }} and OpenFlow mirror rules
+      After=ovs-iface-up.service
+      Requires=ovs-iface-up.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/ovs-span-setup.sh
+      ExecStop=/usr/local/sbin/ovs-span-teardown.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start ovs-span-tunnel service
+  systemd:
+    name: ovs-span-tunnel.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+# Real self-healing mechanism — see the comment above the ovs-span-setup.sh
+# task for why the boot-time trace-based verify() alone is insufficient.
+# Watches the real datapath hit/miss counters (the one signal that reflects
+# whether the handler-thread bug actually happened) and re-runs the setup
+# script if it sees an interval of real traffic that's all misses / no hits.
+- name: Write ovs-span-healthcheck.sh script
+  copy:
+    dest: /usr/local/sbin/ovs-span-healthcheck.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      GRETAP="{{ gretap_iface | default('grespan') }}"
+      STATE_FILE="/run/ovs-span-healthcheck.state"
+      SETUP_SCRIPT="/usr/local/sbin/ovs-span-setup.sh"
+      # Minimum packets seen since the last check before judging the ratio —
+      # avoids false positives during genuinely idle periods (0 hits / 0
+      # misses is not the same thing as 0 hits / lots of misses).
+      MIN_DELTA=20
+
+      log() { logger -t ovs-span-healthcheck "$1"; }
+
+      line=$(ovs-appctl dpctl/show 2>/dev/null | grep -m1 'lookups:')
+      hit=$(echo "$line" | grep -oP 'hit:\K[0-9]+')
+      missed=$(echo "$line" | grep -oP 'missed:\K[0-9]+')
+      grespan_tx=$(ovs-vsctl get Interface "$GRETAP" statistics:tx_packets 2>/dev/null | tr -d '"')
+
+      if [ -z "$hit" ] || [ -z "$missed" ] || [ -z "$grespan_tx" ]; then
+        log "WARNING: could not read health counters (dpctl/show or grespan tx_packets), skipping this check"
+        exit 0
+      fi
+
+      prev_hit=0
+      prev_missed=0
+      prev_grespan_tx=0
+      if [ -f "$STATE_FILE" ]; then
+        read -r prev_hit prev_missed prev_grespan_tx < "$STATE_FILE" 2>/dev/null || true
+      fi
+      echo "$hit $missed $grespan_tx" > "$STATE_FILE"
+
+      # openvswitch-switch restarting (by this same repair, or anything else)
+      # resets these counters to 0 -- treat a decrease as a new baseline
+      # rather than a nonsensical negative delta.
+      if [ "$hit" -lt "$prev_hit" ] || [ "$missed" -lt "$prev_missed" ] || [ "$grespan_tx" -lt "$prev_grespan_tx" ]; then
+        exit 0
+      fi
+
+      delta_hit=$((hit - prev_hit))
+      delta_missed=$((missed - prev_missed))
+      delta_total=$((delta_hit + delta_missed))
+      delta_grespan_tx=$((grespan_tx - prev_grespan_tx))
+
+      # Signal A: the whole datapath is thrashing (the original cold-boot bug --
+      # every packet on the bridge misses the cache, not just mirror traffic).
+      if [ "$delta_total" -ge "$MIN_DELTA" ] && [ "$delta_hit" -eq 0 ]; then
+        log "datapath cache broken: +${delta_missed} misses / +0 hits in the last interval (${delta_total} packets) -- repairing"
+        "$SETUP_SCRIPT"
+        exit 0
+      fi
+
+      # Signal B: the bridge itself is fine (real traffic is being cached and
+      # forwarded -- delta_hit is healthy) but none of it is reaching grespan.
+      # This catches the mirror-specific OpenFlow rules being missing/wrong
+      # even when the rest of the datapath shows no sign of trouble at all --
+      # confirmed live 2026-07-05 that a plain flow-table wipe produces
+      # exactly this signature (global hit count keeps climbing from normal
+      # inter-VM traffic; grespan tx_packets stays flat).
+      if [ "$delta_hit" -ge "$MIN_DELTA" ] && [ "$delta_grespan_tx" -eq 0 ]; then
+        log "mirror broken: +${delta_hit} bridge hits but +0 grespan tx packets in the last interval -- repairing"
+        "$SETUP_SCRIPT"
+      fi
+
+- name: Install ovs-span-healthcheck systemd service
+  copy:
+    dest: /etc/systemd/system/ovs-span-healthcheck.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Check OVS SPAN mirror datapath health and repair if broken
+      After=ovs-span-tunnel.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ovs-span-healthcheck.sh
+
+- name: Install ovs-span-healthcheck systemd timer
+  copy:
+    dest: /etc/systemd/system/ovs-span-healthcheck.timer
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Periodic OVS SPAN mirror health check
+
+      [Timer]
+      OnBootSec=45s
+      OnUnitActiveSec=30s
+      Unit=ovs-span-healthcheck.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable and start ovs-span-healthcheck timer
+  systemd:
+    name: ovs-span-healthcheck.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes

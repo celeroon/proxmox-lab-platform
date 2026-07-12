@@ -1,0 +1,813 @@
+version: 1
+name: Elastic Benchmark IPsec
+description: >
+  Multi-site Elasticsearch lab with site-to-site IKEv2 IPsec VPN (AES-256-GCM).
+  Edge (172.16.0.0/16): VyOS + Fleet + ingest + agent CTs. Main (172.17.0.0/16):
+  VyOS + ES cluster + Kibana. ES transport crosses the tunnel. Scale-out nodes must
+  be created (--skip-ansible) before the core cluster; never deploy without --target.
+
+vm_prefix: ""
+
+x-ipsec: &ipsec
+  ipsec_psk: vagrant
+
+# ES nodes use LAN IPs (transport crosses the tunnel); fleet/kibana/mirror use mgmt IPs.
+# es_monitoring_user_host_ip must be a data-capable node (data-hot-1).
+x-elastic-config: &elastic-config
+  elastic_nodes:
+    - {name: master-1,   ip: "172.17.1.10"}
+    - {name: data-hot-1, ip: "172.17.1.20"}
+    - {name: ingest-1,   ip: "172.16.1.20", fleet_output: true}
+    # Scale-out nodes — pre-created via Step A (--skip-ansible) so their IPs exist at bootstrap.
+    - {name: data-hot-2,  ip: "172.17.1.21"}
+    - {name: data-hot-3,  ip: "172.17.1.22"}
+    - {name: data-cold-1, ip: "172.17.2.10"}
+    - {name: coord-1,     ip: "172.17.3.10"}
+    - {name: ingest-2,    ip: "172.16.1.21", fleet_output: true}
+  elk_version: "9.4.2"
+  elk_password: "labpassword"
+  elk_cert_pass: "labcertpass"
+  kibana_ip: "{{ kibana_1_ip }}"
+  fleet_ip: "{{ fleet_1_ip }}"
+  mirror_ip: "{{ mgmt_1_ip }}"
+  es_exporter_password: "labexporterpass"
+  es_monitoring_user_host_ip: "172.17.1.20"
+  ilm_rollover_max_size: "2gb"
+
+networks:
+  - name: wan
+    type: vnet
+  - name: edge-lan
+    type: vnet
+  - name: main-lan
+    type: vnet
+
+defaults:
+  cpu_type: host
+
+vms:
+
+  # --- Edge site ---
+  #  eth0  mgmt     10.x.0.2/16     management (platform-assigned)
+  #  eth1  wan      192.0.2.1/28    IPsec endpoint (shared with vyos-main)
+  #  eth2  lan      172.16.0.1/16   edge LAN
+
+  - name: vyos-edge
+    template: vyos/current
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: wan
+      - name: eth2
+        type: vnet
+        network: edge-lan
+    ansible:
+      connection:
+        type: network_cli
+        network_os: vyos
+        user: vyos
+        password: vyos
+      gather_facts: false
+      become: false
+      vars:
+        <<: *ipsec
+      tasks:
+        - task: vyos/set_hostname
+          vars:
+            hostname: vyos-edge
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - name: eth1
+                description: "WAN — IPsec endpoint"
+                address: 192.0.2.1/28
+              - name: eth2
+                description: "Edge LAN (172.16.0.0/16)"
+                address: 172.16.0.1/16
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - rule: 10
+                description: "Exclude IPsec traffic from NAT"
+                source: 172.16.0.0/16
+                destination: 172.17.0.0/16
+                outbound_interface: eth1
+                translation: exclude
+              - rule: 100
+                description: "Edge LAN internet outbound via management"
+                source: 172.16.0.0/16
+                outbound_interface: eth0
+                translation: masquerade
+        - task: vyos/configure_ipsec
+          vars:
+            ipsec_local_ip: 192.0.2.1
+            ipsec_remote_ip: 192.0.2.2
+            ipsec_local_subnet: 172.16.0.0/16
+            ipsec_remote_subnet: 172.17.0.0/16
+            ipsec_interface: eth1
+            ipsec_peer_name: MAIN-SITE
+        - task: vyos/configure_snmp
+          vars:
+            snmp_listen_address: "{{ vm_mgmt_ip }}"
+        - task: vyos/configure_routing
+          vars:
+            routing:
+              default_route: "10.{USER_ID}.0.1"
+
+  # --- Main site ---
+  #  eth0  mgmt     10.x.0.3/16     management (platform-assigned)
+  #  eth1  wan      192.0.2.2/28    IPsec endpoint (shared with vyos-edge)
+  #  eth2  lan      172.17.0.1/16   main LAN
+
+  - name: vyos-main
+    template: vyos/current
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: wan
+      - name: eth2
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: network_cli
+        network_os: vyos
+        user: vyos
+        password: vyos
+      gather_facts: false
+      become: false
+      vars:
+        <<: *ipsec
+      tasks:
+        - task: vyos/set_hostname
+          vars:
+            hostname: vyos-main
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - name: eth1
+                description: "WAN — IPsec endpoint"
+                address: 192.0.2.2/28
+              - name: eth2
+                description: "Main LAN (172.17.0.0/16)"
+                address: 172.17.0.1/16
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - rule: 10
+                description: "Exclude IPsec traffic from NAT"
+                source: 172.17.0.0/16
+                destination: 172.16.0.0/16
+                outbound_interface: eth1
+                translation: exclude
+              - rule: 100
+                description: "Main LAN internet outbound via management"
+                source: 172.17.0.0/16
+                outbound_interface: eth0
+                translation: masquerade
+        - task: vyos/configure_ipsec
+          vars:
+            ipsec_local_ip: 192.0.2.2
+            ipsec_remote_ip: 192.0.2.1
+            ipsec_local_subnet: 172.17.0.0/16
+            ipsec_remote_subnet: 172.16.0.0/16
+            ipsec_interface: eth1
+            ipsec_peer_name: EDGE-SITE
+        - task: vyos/configure_snmp
+          vars:
+            snmp_listen_address: "{{ vm_mgmt_ip }}"
+        - task: vyos/configure_routing
+          vars:
+            routing:
+              default_route: "10.{USER_ID}.0.1"
+
+  # --- Management / monitoring (no LAN interface) ---
+
+  - name: mgmt-1
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars:
+        <<: *elastic-config
+        snmp_targets:
+          - name: vyos-edge
+            ip: "{{ vyos_edge_ip }}"
+          - name: vyos-main
+            ip: "{{ vyos_main_ip }}"
+        # Scrape ES exporters via management IPs (mgmt-1 has no LAN route).
+        prometheus_es_targets:
+          - ip: "{{ master_1_ip }}"
+          - ip: "{{ data_hot_1_ip }}"
+          - ip: "{{ ingest_1_ip }}"
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_system_packages
+        - task: linux/install_xfce
+        - task: services/apt_cacher_ng
+        - task: services/elastic_agent_mirror
+        - task: services/prometheus
+        - task: services/prometheus_snmp_exporter
+        - task: services/grafana
+        - task: linux/create_accesses_file
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "grafana.local"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "127.0.0.1"
+            hosts_entry_name: "prometheus.local"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ vm_mgmt_ip }}"
+            hosts_entry_name: "grafana.local.lab"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ vm_mgmt_ip }}"
+            hosts_entry_name: "prometheus.local.lab"
+        - task: linux/add_hosts_entry
+          vars:
+            hosts_entry_ip: "{{ kibana_1_ip }}"
+            hosts_entry_name: "elastic.local"
+
+  # --- Scale-out nodes (Step A — create with --skip-ansible; provision later via --target) ---
+
+  - name: data-hot-2
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.1.21
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.17.1.21"
+            node_roles: [data_hot, data_content, remote_cluster_client]
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.1.21"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.1.21"
+
+  - name: data-hot-3
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.1.22
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.17.1.22"
+            node_roles: [data_hot, data_content, remote_cluster_client]
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.1.22"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.1.22"
+
+  - name: data-cold-1
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.2.10
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.17.2.10"
+            node_roles: [data_cold, remote_cluster_client]
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.2.10"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.2.10"
+
+  - name: coord-1
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.3.10
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.17.3.10"
+            node_roles: []
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.3.10"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.3.10"
+
+  - name: ingest-2
+    depends_on: []
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.16.1.21
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.16.1.21"
+            node_roles: [ingest, remote_cluster_client]
+            fleet_output: true
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.16.1.21"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.16.1.21"
+
+  # --- Main site — ES cluster ---
+
+  - name: master-1
+    depends_on: [vyos-edge, vyos-main, mgmt-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.1.10
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_bootstrap
+        - task: services/elasticsearch
+          vars:
+            lab_ip: "172.17.1.10"
+            node_roles: [master, remote_cluster_client]
+        - task: services/elasticsearch_ilm
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.1.10"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.1.10"
+
+  - name: data-hot-1
+    depends_on: [master-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 16384
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.1.20
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.17.1.20"
+            node_roles: [data_hot, data_content, remote_cluster_client]
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.17.1.20"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.17.1.20"
+
+  # --- Edge site — ingest ---
+
+  - name: ingest-1
+    depends_on: [master-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.16.1.20
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elasticsearch_join
+          vars:
+            lab_ip: "172.16.1.20"
+            node_roles: [ingest, remote_cluster_client]
+        - task: services/metricbeat
+          vars:
+            lab_ip: "172.16.1.20"
+        - task: services/elasticsearch_exporter
+          vars:
+            lab_ip: "172.16.1.20"
+
+  # --- Main site — Kibana ---
+
+  - name: kibana-1
+    depends_on: [data-hot-1, ingest-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: main-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.17.1.30
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.17.0.1
+            lab_dns: 1.1.1.1
+        - task: services/kibana_fetch_certs
+        - task: services/kibana
+          vars:
+            lab_ip: "172.17.1.30"
+
+  # --- Edge site — Fleet Server ---
+  # fleet-1 binds on its mgmt IP so agent CTs (mgmt-only) can enroll; its LAN IP
+  # routes Fleet's ES output through the tunnel to ingest-1.
+
+  - name: fleet-1
+    depends_on: [kibana-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: 172.16.1.10
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/fleet_fetch_certs
+        - task: services/fleet_server
+          vars:
+            lab_ip: "{{ ansible_host }}"
+        - task: services/fleet_filestream_policy
+
+  # --- Agent batches (mgmt network only) ---
+  # Deploy incrementally to observe cluster degradation then scale-out recovery.
+  # CTs need eth1 on edge-lan to reach fleet-1/ingest-1 (same /16) and master-1
+  # (CA cert fetch via the IPsec tunnel). lab_ip = 172.16.0.<last_mgmt_octet>.
+
+  - name: agent-batch-1
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: "172.16.{{ ansible_host.split('.')[2] }}.{{ ansible_host.split('.')[3] }}"
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-2
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: "172.16.{{ ansible_host.split('.')[2] }}.{{ ansible_host.split('.')[3] }}"
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500
+
+  - name: agent-batch-3
+    type: container
+    depends_on: [fleet-1]
+    template: debian-13-standard_13.1-2_amd64
+    count: 50
+    cpus: 1
+    memory: 1024
+    disk_gb: 5
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: edge-lan
+    ansible:
+      forks: 25
+      connection:
+        type: ssh
+        user: root
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_apt_proxy
+          vars:
+            apt_proxy_ip: "{{ mgmt_1_ip }}"
+        - task: linux/install_system_packages
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1
+            lab_ip: "172.16.{{ ansible_host.split('.')[2] }}.{{ ansible_host.split('.')[3] }}"
+            lab_netmask: 255.255.0.0
+            lab_gateway: 172.16.0.1
+            lab_dns: 1.1.1.1
+        - task: services/elastic_agent_linux
+          vars:
+            fleet_ip: "{{ fleet_1_ip }}"
+            fleet_policy_id: filestream-test-policy
+        - task: services/bench_log_gen
+          vars:
+            bench_logs_per_second: 500

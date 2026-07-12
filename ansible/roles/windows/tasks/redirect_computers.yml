@@ -1,0 +1,11 @@
+---
+# Task: Redirect the default Computers container so that newly joined machines
+#       land in OU=Clients,OU=Computers,OU=<netbios> instead of CN=Computers.
+#
+# Required vars:
+#   ad_netbios — root OU name (e.g. "LAB")
+
+- name: Redirect default computer container to OU=Clients
+  ansible.windows.win_shell: |
+    $domDN = (Get-ADDomain).DistinguishedName
+    redircmp "OU=Clients,OU=Computers,OU={{ ad_netbios }},$domDN"

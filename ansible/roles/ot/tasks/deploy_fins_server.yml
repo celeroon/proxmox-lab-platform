@@ -1,0 +1,78 @@
+---
+# Deploy the FINS packaging-line conveyor simulator (Omron PLC) as a systemd service.
+#
+# Variables:
+#   fins_port:  TCP port to listen on (default: 9600)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/fins directory
+  file:
+    path: /opt/fins
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/fins/venv
+  args:
+    creates: /opt/fins/venv/bin/python3
+  become: true
+
+- name: Install rich into venv
+  pip:
+    name:
+      - rich
+    virtualenv: /opt/fins/venv
+  become: true
+
+- name: Copy fins simulation files
+  copy:
+    src: fins/
+    dest: /opt/fins/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies fins_logic.py, fins_protocol.py, fins_server.py, fins_client.py,
+  # fins_tui_common.py, fins_server_tui.py, fins_client_tui.py -- run the
+  # *_tui.py scripts manually over SSH for a live htop-style status view
+  # (/opt/fins/venv/bin/python3 /opt/fins/fins_server_tui.py)
+
+- name: Install fins-server systemd service
+  copy:
+    dest: /etc/systemd/system/fins-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=FINS Packaging-Line Conveyor Simulator (Omron PLC)
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/fins/venv/bin/python3 /opt/fins/fins_server.py \
+        --host 0.0.0.0 \
+        --port {{ fins_port | default(9600) }} \
+        --log-file /var/log/fins-server.log
+      Restart=always
+      WorkingDirectory=/opt/fins
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start fins-server
+  systemd:
+    name: fins-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

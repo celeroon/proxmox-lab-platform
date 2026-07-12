@@ -1,0 +1,154 @@
+---
+# Install and configure a single Elasticsearch node
+#
+# Required vars:
+#   lab_ip        - IP this node binds on (network.host)
+#   elk_version   - Elastic stack version e.g. "9.4.2"
+#   elk_password  - elastic superuser password (set via bootstrap.password on first start)
+#   elk_cert_pass - .p12 cert password (must match what bootstrap generated)
+#   elastic_nodes      - cluster node list (used to detect single-node vs cluster)
+#   node_roles    - list of ES roles; omit/~ for all roles (ES decides), [] for
+#                   coordinating-only (zero roles)
+#
+# Optional vars:
+#   elk_cluster_name - cluster name (default: "lab-cluster")
+#   elastic_heap          - JVM heap size e.g. "16g" (optional — if unset, ES uses JVM ergonomics: 50% RAM, max 31 GB)
+
+# ── Step 1: Add Elastic APT repository ───────────────────────────
+
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, gpg, wget]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/es-gpg.asc
+    mode: '0644'
+
+- name: Add Elasticsearch GPG keyring
+  shell: gpg --dearmor < /tmp/es-gpg.asc > /usr/share/keyrings/elasticsearch-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+  become: yes
+
+- name: Add Elasticsearch APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elk_version.split('.')[0] }}.x/apt stable main"
+    state: present
+    filename: elastic
+  become: yes
+
+# ── Step 2: Install ───────────────────────────────────────────────
+
+- name: Install Elasticsearch
+  apt:
+    name: "elasticsearch={{ elk_version }}"
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 3: Configure ─────────────────────────────────────────────
+
+- name: Deploy elasticsearch.yml
+  template:
+    src: "{{ lab_ansible_dir }}/roles/services/templates/elasticsearch.yml.j2"
+    dest: /etc/elasticsearch/elasticsearch.yml
+    owner: root
+    group: elasticsearch
+    mode: '0660'
+  become: yes
+
+- name: Set JVM heap size
+  copy:
+    content: |
+      -Xms{{ elastic_heap }}
+      -Xmx{{ elastic_heap }}
+    dest: /etc/elasticsearch/jvm.options.d/heap.options
+    owner: root
+    group: elasticsearch
+    mode: '0660'
+  become: yes
+  when: elastic_heap is defined
+
+# ── Step 4: Set keystore passwords ───────────────────────────────
+
+- name: Initialize keystore if not present
+  command: /usr/share/elasticsearch/bin/elasticsearch-keystore create
+  args:
+    creates: /etc/elasticsearch/elasticsearch.keystore
+  become: yes
+
+- name: Set elastic user bootstrap password
+  shell: echo "{{ elk_password }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f bootstrap.password
+  become: yes
+  no_log: true
+
+- name: Set HTTP SSL keystore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+  become: yes
+  no_log: true
+
+- name: Set transport SSL keystore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+  become: yes
+  no_log: true
+
+- name: Set transport SSL truststore password
+  shell: echo "{{ elk_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password
+  become: yes
+  no_log: true
+
+# ── Step 5: Start ─────────────────────────────────────────────────
+
+- name: Enable and start Elasticsearch
+  systemd:
+    name: elasticsearch
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+# ── Step 6: Wait for Elasticsearch to be ready ───────────────────
+
+- name: Wait for Elasticsearch to be ready
+  uri:
+    url: "https://{{ lab_ip }}:9200/_cluster/health"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    status_code: 200
+  register: es_health
+  until: es_health.status == 200
+  retries: 30
+  delay: 10
+
+# bootstrap.password sets the elastic user password on first start but does not
+# force a committed write to .security. Committing it here ensures full replication
+# before joining nodes start their own metricbeat.
+#
+# Only runs when the bootstrap node is data-capable (single-node / all-roles). In a
+# role-separated cluster the bootstrap node is master-only, so .security has no data
+# node to allocate its primary to yet and this write would block until the uri read
+# timeout. The elastic password is already effective via bootstrap.password, and the
+# first data node establishes .security when it joins — so skip the commit here.
+- name: Commit elastic user password to .security index
+  uri:
+    url: "https://{{ lab_ip }}:9200/_security/user/elastic/_password"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    validate_certs: no
+    body_format: json
+    body:
+      password: "{{ elk_password }}"
+    status_code: 200
+  when: >
+    (node_roles | default(None)) is none
+    or ((node_roles | join(',')) is search('data'))
+  no_log: true
+  become: yes

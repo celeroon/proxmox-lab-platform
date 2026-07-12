@@ -1,0 +1,145 @@
+---
+# Install and baseline-configure Malcolm on a fresh VM.
+#
+# Variables:
+#   malcolm_version:          Malcolm release tag to install (required) — must match
+#                             the version configure_malcolm_version pins.
+#   malcolm_dir:              Install directory                 (default: /opt/malcolm)
+#   malcolm_pcap_iface:       Capture interface for baseline    (default: eth2)
+#   malcolm_admin_user:       Web/admin username                (default: admin)
+#   malcolm_admin_password:   Web/admin password                (default: vagrant)
+
+- name: Install Malcolm configure/auth prerequisites
+  apt:
+    name:
+      - python3-ruamel.yaml
+      - python3-dotenv
+      - python3-dialog
+      - dialog
+      - jq
+      - apache2-utils
+      - openssl
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Raise vm.max_map_count for OpenSearch
+  sysctl:
+    name: vm.max_map_count
+    value: '262144'
+    sysctl_file: /etc/sysctl.d/99-opensearch.conf
+    state: present
+    reload: yes
+  become: true
+
+- name: Check whether Malcolm is already installed
+  stat:
+    path: "{{ malcolm_dir | default('/opt/malcolm') }}/.lab-malcolm-installed"
+  register: _malcolm_marker
+
+- name: Install and configure Malcolm
+  when: not _malcolm_marker.stat.exists
+  block:
+    - name: Download and extract Malcolm {{ malcolm_version }} source
+      shell: |
+        set -e
+        for ref in "{{ malcolm_version }}" "v{{ malcolm_version }}"; do
+          url="https://github.com/idaholab/Malcolm/archive/refs/tags/${ref}.tar.gz"
+          if curl -fsSL "$url" -o /opt/malcolm-src.tar.gz; then break; fi
+        done
+        test -s /opt/malcolm-src.tar.gz
+        tar -xzf /opt/malcolm-src.tar.gz -C /opt
+        rm -f /opt/malcolm-src.tar.gz
+        mv /opt/Malcolm-* "{{ malcolm_dir | default('/opt/malcolm') }}"
+      args:
+        creates: "{{ malcolm_dir | default('/opt/malcolm') }}/docker-compose.yml"
+      become: true
+
+    # Malcolm's own scripts (auth_setup in particular) refuse to run as root, and
+    # the play runs with become:true globally — so ownership must move to the
+    # connecting user before any of them run. Extraction above runs as root because
+    # /opt itself isn't writable by a regular user.
+    - name: Set ownership of Malcolm install dir to {{ ansible_user | default('vagrant') }}
+      file:
+        path: "{{ malcolm_dir | default('/opt/malcolm') }}"
+        owner: "{{ ansible_user | default('vagrant') }}"
+        group: "{{ ansible_user | default('vagrant') }}"
+        recurse: true
+      become: true
+
+    - name: Write Malcolm baseline config (non-interactive defaults)
+      command: ./scripts/configure --non-interactive --defaults
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Export Malcolm default config to JSON
+      command: >
+        ./scripts/configure --non-interactive --defaults --dry-run
+        --export-malcolm-config-file /tmp/malcolm-defaults.json
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Patch config for OT/ICS + live capture
+      shell: |
+        jq '
+          .configuration.malcolmIcs = true |
+          .configuration.captureLiveNetworkTraffic = true |
+          .configuration.liveZeek = true |
+          .configuration.liveArkime = true |
+          .configuration.liveSuricata = true |
+          .configuration.pcapNetSniff = true |
+          .configuration.pcapTcpDump = true |
+          .configuration.pcapIface = "{{ malcolm_pcap_iface | default('eth2') }}"
+        ' /tmp/malcolm-defaults.json > /tmp/malcolm-ot.json
+      become: false
+
+    - name: Apply patched Malcolm config
+      command: ./scripts/configure --non-interactive --import-malcolm-config-file /tmp/malcolm-ot.json
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Force Arkime live capture on (known JSON-import gap)
+      shell: |
+        sed -i 's/^ARKIME_LIVE_CAPTURE=.*/ARKIME_LIVE_CAPTURE=true/' config/arkime-live.env
+        sed -i 's/^ARKIME_LIVE_NODE_HOST=.*/ARKIME_LIVE_NODE_HOST=malcolm-1/' config/arkime-live.env
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Run Malcolm non-interactive auth setup
+      shell: |
+        ./scripts/auth_setup \
+          --auth-noninteractive \
+          --auth-method basic \
+          --auth-admin-username "{{ malcolm_admin_user | default('admin') }}" \
+          --auth-admin-password-openssl "$(openssl passwd -6 '{{ malcolm_admin_password | default('vagrant') }}')" \
+          --auth-admin-password-htpasswd "$(htpasswd -nbB '{{ malcolm_admin_user | default('admin') }}' '{{ malcolm_admin_password | default('vagrant') }}' | cut -d: -f2)" \
+          --auth-generate-webcerts \
+          --auth-generate-fwcerts \
+          --auth-generate-opensearch-internal-creds
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Create OpenSearch keystore placeholder
+      file:
+        path: "{{ malcolm_dir | default('/opt/malcolm') }}/opensearch/opensearch.keystore"
+        state: touch
+        mode: '0600'
+      become: false
+
+    - name: Pull Malcolm {{ malcolm_version }} images
+      command: docker compose --profile malcolm pull
+      args:
+        chdir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+      become: false
+
+    - name: Mark Malcolm as installed
+      file:
+        path: "{{ malcolm_dir | default('/opt/malcolm') }}/.lab-malcolm-installed"
+        state: touch
+        mode: '0644'
+      become: false

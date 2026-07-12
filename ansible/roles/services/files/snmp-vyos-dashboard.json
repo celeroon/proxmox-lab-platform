@@ -1,0 +1,114 @@
+{
+  "title": "VyOS Router Stats (SNMP)",
+  "uid": "vyos-snmp-lab",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ifHCInOctets, instance)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Router"
+      },
+      {
+        "name": "ifDescr",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ifHCInOctets{instance=~\"$instance\"}, ifDescr)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Interface"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Interface Bandwidth — Inbound (bits/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "irate(ifHCInOctets{instance=~\"$instance\", ifDescr=~\"$ifDescr\"}[5m]) * 8",
+          "legendFormat": "{{instance}} {{ifDescr}} rx"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Interface Bandwidth — Outbound (bits/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "irate(ifHCOutOctets{instance=~\"$instance\", ifDescr=~\"$ifDescr\"}[5m]) * 8",
+          "legendFormat": "{{instance}} {{ifDescr}} tx"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Interface Operational Status",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 4 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "up", "color": "green" }, "2": { "text": "down", "color": "red" } } }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "ifOperStatus{instance=~\"$instance\", ifDescr=~\"$ifDescr\"}",
+          "legendFormat": "{{instance}} {{ifDescr}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Interface Errors/s",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 4 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "unit": "pps" }
+      },
+      "targets": [
+        {
+          "expr": "irate(ifInErrors{instance=~\"$instance\", ifDescr=~\"$ifDescr\"}[5m])",
+          "legendFormat": "{{instance}} {{ifDescr}} rx-errors"
+        },
+        {
+          "expr": "irate(ifOutErrors{instance=~\"$instance\", ifDescr=~\"$ifDescr\"}[5m])",
+          "legendFormat": "{{instance}} {{ifDescr}} tx-errors"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+---
+# Task: Add addresses to the VyOS loopback interface (lo).
+#
+# Use this to create "fake internet" IPs that are reachable from OT VMs
+# via the router but appear as external/public to Malcolm's IP classifier.
+# Malcolm's internal_ip_tag.rb classifies RFC 5737 test-nets (192.0.2.0/24,
+# 198.51.100.0/24, 203.0.113.0/24) as internal — use addresses outside that
+# list (e.g. 9.9.9.9/32) to be treated as external.
+#
+# Variables:
+#   loopback_addresses: list of CIDR addresses to add to lo
+#     e.g. ["9.9.9.9/32"]
+
+- name: Add loopback addresses
+  vyos.vyos.vyos_config:
+    lines: "{{ loopback_addresses | map('regex_replace', '^(.*)$', 'set interfaces loopback lo address \\1') | list }}"
+  vars:
+    ansible_command_timeout: 60
+  when: loopback_addresses is defined and loopback_addresses | length > 0
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

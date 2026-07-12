@@ -1,0 +1,99 @@
+---
+# Serve elastic-agent via nginx so LAN agents never hit the internet.
+# Run this on the fleet server node AFTER fleet_server task (reuses the tarball
+# that fleet_server already downloaded to /tmp/).
+#
+# Required vars:
+#   elk_version  - Elastic stack version (must match fleet_server)
+#
+# Exposes:
+#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz  (original)
+#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar     (uncompressed, for fast agent extraction)
+
+# ── Step 1: Install nginx ─────────────────────────────────────────
+
+- name: Install nginx
+  apt:
+    name: nginx
+    state: present
+    update_cache: yes
+  become: yes
+
+# ── Step 2: Prepare mirror directory ─────────────────────────────
+
+- name: Create elastic-agent mirror directory
+  file:
+    path: /var/www/html/elastic-mirror
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: '0755'
+  become: yes
+
+# ── Step 3: Populate mirror ───────────────────────────────────────
+# Reuse tarball from /tmp if fleet_server already downloaded it;
+# fall back to a fresh download if running this task standalone.
+
+- name: Check if elastic-agent tarball is already in /tmp
+  stat:
+    path: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+  register: agent_tarball_tmp
+
+- name: Download elastic-agent tarball (not cached from fleet_server)
+  get_url:
+    url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    mode: '0644'
+  become: yes
+  when: not agent_tarball_tmp.stat.exists
+
+- name: Copy elastic-agent tarball to nginx mirror
+  copy:
+    src: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: "/var/www/html/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    remote_src: yes
+    owner: www-data
+    group: www-data
+    mode: '0644'
+  become: yes
+
+# ── Step 4: Create uncompressed tar for fast agent extraction ────
+# Agents download this .tar instead of .tar.gz — extraction is pure disk I/O,
+# not CPU-bound gzip, which matters at 50+ parallel containers.
+
+- name: Extract elastic-agent tarball for uncompressed repack
+  unarchive:
+    src: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
+    dest: /tmp/
+    remote_src: yes
+    creates: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64/elastic-agent"
+  become: yes
+
+- name: Create uncompressed tar in mirror directory
+  command:
+    argv:
+      - tar
+      - cf
+      - "/var/www/html/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar"
+      - "-C"
+      - /tmp
+      - "elastic-agent-{{ elk_version }}-linux-x86_64"
+    creates: "/var/www/html/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar"
+  become: yes
+
+- name: Set ownership of uncompressed tar
+  file:
+    path: "/var/www/html/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar"
+    owner: www-data
+    group: www-data
+    mode: '0644'
+  become: yes
+
+# ── Step 5: Start nginx ───────────────────────────────────────────
+
+- name: Enable and start nginx
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+  become: yes

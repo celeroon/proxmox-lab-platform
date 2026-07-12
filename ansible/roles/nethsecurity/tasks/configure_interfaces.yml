@@ -1,0 +1,58 @@
+---
+# Task: Configure network interfaces on NethSecurity
+# Variables:
+#   interfaces: list of interfaces to configure
+#     - name:    UCI interface name (e.g. "wan", "vlan10")
+#       device:  Physical device or VLAN device (e.g. "eth1", "eth2.10")
+#       proto:   "static", "dhcp", or "none"
+#       ipaddr:  IP in CIDR notation (e.g. "192.0.2.6/29") — static only
+
+- name: Create interface sections
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}=interface"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set interface devices
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.device={{ item.device }}"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set interface protocols
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.proto={{ item.proto }}"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: Set interface addresses
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.ipaddr={{ item.ipaddr }}"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when: item.proto == 'static' and item.ipaddr is defined
+
+- name: Set interface netmasks
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.netmask={{ item.netmask }}"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when: item.proto == 'static' and item.netmask is defined
+
+- name: Commit network config
+  ansible.builtin.command:
+    cmd: uci commit network
+
+- name: Restart network
+  ansible.builtin.command:
+    cmd: /etc/init.d/network restart

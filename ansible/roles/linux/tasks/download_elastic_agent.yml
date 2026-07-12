@@ -1,0 +1,5 @@
+- name: Extract elastic agent from http-server
+  ansible.builtin.shell:
+    cmd: "set -o pipefail && wget -qO- http://{{ http_server_ip }}/{{ agent_archive }} | tar x -C /opt/"
+    executable: /bin/bash
+    creates: "/opt/{{ agent_archive | regex_replace('\\.tar$', '') }}"

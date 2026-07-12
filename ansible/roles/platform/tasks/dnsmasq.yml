@@ -1,0 +1,62 @@
+---
+- name: Install dnsmasq
+  ansible.builtin.apt:
+    name: dnsmasq
+    state: present
+    update_cache: false
+  tags: dnsmasq
+
+- name: Create dnsmasq hosts directory
+  ansible.builtin.file:
+    path: /var/lib/dnsmasq
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: dnsmasq
+
+- name: Write base dnsmasq config
+  ansible.builtin.copy:
+    dest: /etc/dnsmasq.d/00-lab-base.conf
+    content: |
+      # Disable DNS — this instance is DHCP only
+      port=0
+      # Bind dynamically so interfaces added after start are picked up
+      bind-dynamic
+    mode: "0644"
+  notify: reload dnsmasq
+  tags: dnsmasq
+
+- name: Enable and start dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: dnsmasq
+
+- name: Install networkd-dispatcher
+  ansible.builtin.apt:
+    name: networkd-dispatcher
+    state: present
+    update_cache: false
+  tags: dnsmasq
+
+- name: Deploy dnsmasq restart hook for mgmt interfaces
+  ansible.builtin.copy:
+    dest: /etc/networkd-dispatcher/routable.d/50-restart-dnsmasq
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      case "$IFACE" in
+        mgmt*) systemctl restart dnsmasq ;;
+      esac
+  tags: dnsmasq
+
+- name: Enable and start networkd-dispatcher
+  ansible.builtin.systemd:
+    name: networkd-dispatcher
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: dnsmasq

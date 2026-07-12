@@ -1,0 +1,15 @@
+[Unit]
+Description=Lab Platform API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{ project_dir }}
+EnvironmentFile={{ project_dir }}/.env
+ExecStart={{ project_dir }}/.venv/bin/uvicorn lab.api.app:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

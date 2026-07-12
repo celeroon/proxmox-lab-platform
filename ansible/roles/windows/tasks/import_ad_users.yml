@@ -1,0 +1,24 @@
+---
+# Task: Copy AD user import scripts to the VM and populate Active Directory
+# with fake user accounts from FakeNames.csv.
+#
+# Required vars:
+#   ad_netbios — root OU name, matches the structure created by create_ad_structure (e.g. "LAB")
+
+- name: Transfer LabAccountsImport.ps1
+  ansible.windows.win_copy:
+    src: "{{ lab_ansible_dir }}/roles/global/windows/templates/LabAccountsImport.ps1"
+    dest: C:\win-setup\LabAccountsImport.ps1
+
+- name: Transfer FakeNames.csv
+  ansible.windows.win_copy:
+    src: "{{ lab_ansible_dir }}/roles/global/windows/templates/FakeNames.csv"
+    dest: C:\win-setup\FakeNames.csv
+
+- name: Import AD users from FakeNames.csv
+  ansible.windows.win_shell: |
+    $domDN = (Get-ADDomain).DistinguishedName
+    . C:\win-setup\LabAccountsImport.ps1
+    Test-LabADUserList -Path C:\win-setup\FakeNames.csv
+    Remove-LabADUsertDuplicate -Path C:\win-setup\FakeNames.csv -OutPath C:\win-setup\Unique.csv
+    Import-LabADUser -Path C:\win-setup\Unique.csv -OU "OU=Users,OU={{ ad_netbios }},$domDN"

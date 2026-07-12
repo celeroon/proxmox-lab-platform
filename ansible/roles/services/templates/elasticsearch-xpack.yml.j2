@@ -1,0 +1,8 @@
+- module: elasticsearch
+  xpack.enabled: true
+  period: 10s
+  hosts: ["https://127.0.0.1:9200"]
+  username: "elastic"
+  password: "{{ elk_password }}"
+  ssl.enabled: true
+  ssl.certificate_authorities: ["/etc/elasticsearch/certs/elasticsearch-ca.pem"]

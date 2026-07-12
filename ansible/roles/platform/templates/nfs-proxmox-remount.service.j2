@@ -1,0 +1,15 @@
+[Unit]
+Description=Remount Proxmox NFS template storage after NFS server starts
+After=nfs-kernel-server.service network-online.target
+Requires=nfs-kernel-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Brief delay to let NFS fully initialise before calling Proxmox API
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/nfs-proxmox-remount.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,77 @@
+---
+# Deploy ICS attack scripts and instructions to kali-1.
+#
+# Creates /opt/ot-attacks/ with a Python venv, installs pymodbus + python-snap7,
+# copies attack scripts, and places a plain-text instruction file on the Desktop.
+#
+# Variables (none required — all targets and ports are baked into the scripts
+# to match ot-lab network addressing; override via extra_vars if needed):
+#   attack_dir:  where scripts live on the target (default: /opt/ot-attacks)
+
+- name: Install system packages for attack tools
+  apt:
+    name:
+      - python3
+      - python3-full
+      - python3-venv
+      - libsnap7-1       # required by python-snap7
+      - nmap
+    state: present
+    update_cache: yes
+
+- name: Create attack scripts directory
+  file:
+    path: "{{ attack_dir | default('/opt/ot-attacks') }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create Python venv
+  command: python3 -m venv {{ attack_dir | default('/opt/ot-attacks') }}/venv
+  args:
+    creates: "{{ attack_dir | default('/opt/ot-attacks') }}/venv/bin/python3"
+
+- name: Install Python attack libraries into venv
+  pip:
+    name:
+      - pymodbus==3.7.4
+      - python-snap7
+      - BAC0==2025.9.15
+      - cpppo==5.2.5
+      - asyncua
+      - profinet-py
+    virtualenv: "{{ attack_dir | default('/opt/ot-attacks') }}/venv"
+
+- name: Copy attack scripts
+  copy:
+    src: kali/
+    dest: "{{ attack_dir | default('/opt/ot-attacks') }}/"
+    owner: root
+    group: root
+    mode: '0755'
+  # copies modbus_attack.py, s7comm_attack.py, bacnet_attack.py, enip_attack.py,
+  # dnp3_attack.py (+ its dnp3_logic.py/dnp3_protocol.py deps -- DNP3 is
+  # hand-rolled, no pip library needed, unlike the others), opcua_attack.py,
+  # fins_attack.py (+ its fins_logic.py/fins_protocol.py deps -- also
+  # hand-rolled, same reason as DNP3), profinet_attack.py (+ its
+  # profinet_logic.py dep -- resolves the target by static IP, not DCP,
+  # since kali-1 is on a different VLAN and PROFINET's own device discovery
+  # is raw Ethernet multicast that can't cross vyos-1's routing),
+  # ATTACK_INSTRUCTIONS.txt
+
+- name: Ensure vagrant Desktop directory exists
+  file:
+    path: /home/vagrant/Desktop
+    state: directory
+    owner: vagrant
+    group: vagrant
+    mode: '0755'
+
+- name: Place attack instructions on Desktop
+  copy:
+    src: kali/ATTACK_INSTRUCTIONS.txt
+    dest: /home/vagrant/Desktop/ATTACK_INSTRUCTIONS.txt
+    owner: vagrant
+    group: vagrant
+    mode: '0644'

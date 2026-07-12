@@ -1,0 +1,19 @@
+---
+# Task: Configure a single interface on Cisco IOS-XE
+# Variables:
+#   interface:   Interface name (e.g. GigabitEthernet2)
+#   description: Interface description
+#   ip_address:  IPv4 address (e.g. 198.51.100.2)
+#   mask:        Subnet mask (e.g. 255.255.255.252)
+#   nat_outside: Set interface as NAT outside (optional, default false)
+#   nat_inside:  Set interface as NAT inside (optional, default false)
+
+- name: Configure interface {{ interface }}
+  cisco.ios.ios_config:
+    lines:
+      - no shutdown
+      - description {{ description }}
+      - ip address {{ ip_address }} {{ mask }}
+      - "{{ 'ip nat outside' if nat_outside | default(false) else 'no ip nat outside' }}"
+      - "{{ 'ip nat inside' if nat_inside | default(false) else 'no ip nat inside' }}"
+    parents: interface {{ interface }}

@@ -1,0 +1,134 @@
+---
+# Persist two S7comm ATT&CK-for-ICS (ACID) detection fixes that otherwise revert
+# on every fresh Malcolm deploy — Malcolm bundles the ACID Zeek package and
+# re-imports its stock OpenSearch dashboards each time, so both edits below have
+# to be re-applied after every deploy (this was the long-standing "S7comm ACID
+# works, then breaks on redeploy" regression — now baked in).
+#
+# Fix 1 — ACID handshake indicator plural/singular mismatch:
+#   ACID's mDOTS_config_change ships the S7comm handshake indicator as
+#   "Function Code: 0xf0 - Setup Communications" (plural), but Zeek's
+#   icsnpp-s7comm parser logs the function name as "Setup Communication"
+#   (singular). ACID builds "Function Code: <code> - <name>" from the live
+#   record and string-matches it against the table, so the plural entry never
+#   matches — ACID never tags the S7 handshake, and the "ATT&CK for ICS
+#   Tactic/Notices - S7comm" dashboard panels stay empty. Verified live
+#   2026-07-09: the fix makes the handshake fire on every S7 connection
+#   (threat.tactic.name = "Privilege_Escalation"). Only the s7comm line is
+#   touched — the CIP handshake entry uses a different string.
+#   The edit is inside the running zeek-live container; a `zeekctl deploy`
+#   makes ACID re-read the config.
+#
+# Fix 2 — "ATT&CK for ICS Notices - S7comm" panel drops tactic-only rows:
+#   ACID only ever tags a *tactic* (e.g. the handshake -> Privilege_Escalation),
+#   never a *technique* — every ACID notice uses a tactic-level note. But the
+#   stock Notices panel groups by threat.technique.name with missingBucket=false,
+#   which filters out every doc that has no technique — i.e. all ACID notices.
+#   Fix: flip that bucket to missingBucket=true so tactic-only notices render
+#   (technique column shows "-"). This is the only reason the Tactic panel
+#   populates but the Notices panel does not.
+#
+# Variables:
+#   malcolm_dir:             Malcolm install directory        (default: /opt/malcolm)
+#   malcolm_admin_user:      Dashboards admin user            (default: admin)
+#   malcolm_admin_password:  Dashboards admin pass            (default: vagrant)
+
+- name: Set ACID working variables
+  set_fact:
+    _malcolm_dir: "{{ malcolm_dir | default('/opt/malcolm') }}"
+
+# --- Fix 1: ACID handshake plural -> singular ---
+
+# grep -c returns the plural-string count; `|| true` keeps a 0-match (grep rc 1)
+# from failing the task. Only patch + reload Zeek when the plural is still present,
+# so re-runs on an already-fixed deploy don't needlessly restart Zeek.
+- name: Check whether ACID S7comm handshake indicator still has the plural bug
+  shell: >
+    docker compose --profile malcolm exec -T zeek-live
+    grep -c 'Setup Communications'
+    /usr/local/zeek/share/zeek/site/ACID/scripts/mDOTS_config_change || true
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _acid_plural
+  changed_when: false
+  become: true
+
+- name: Fix ACID S7comm handshake indicator (Setup Communications -> Setup Communication)
+  shell: >
+    docker compose --profile malcolm exec -T zeek-live
+    sed -i 's/Setup Communications/Setup Communication/'
+    /usr/local/zeek/share/zeek/site/ACID/scripts/mDOTS_config_change
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  when: _acid_plural.stdout | trim | int > 0
+  changed_when: true
+  become: true
+
+# MUST run zeekctl as the PUSER (zeeker, uid 1000), NOT root. `docker compose exec`
+# defaults to root, and a root-run `zeekctl deploy` writes root-owned files into
+# /zeek/live/spool/installed-scripts-do-not-touch/{site,auto}. Zeek normally runs as
+# zeeker, so on the NEXT container start (e.g. after a VM stop/resume) zeekctl's
+# reinstall step tries to clean that spool as zeeker, hits "Permission denied" on the
+# root-owned dirs, and Zeek refuses to start at all — silently killing ALL capture
+# until fixed. Learned the hard way 2026-07-10 (a root zeekctl deploy on 07-09 took
+# the whole lab's logging down ~19h after the next resume). `-u zeeker` keeps the
+# spool zeeker-owned so a later restart can always clean it.
+- name: Reload Zeek so ACID re-reads the fixed indicator table (as zeeker, never root)
+  shell: >
+    docker compose --profile malcolm exec -T -u zeeker zeek-live zeekctl deploy
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  when: _acid_plural.stdout | trim | int > 0
+  changed_when: true
+  become: true
+
+# --- Fix 2: Notices panel — show tactic-only ACID notices ---
+
+# Retries until the stock built-in visualization has been imported (Malcolm
+# imports its dashboards asynchronously after OpenSearch is healthy), then flips
+# the technique bucket to missingBucket=true. Idempotent: prints UNCHANGED once
+# the setting is already correct.
+- name: Patch "ATT&CK for ICS Notices - S7comm" panel to render tactic-only ACID notices
+  shell: |
+    python3 - <<'PYEOF'
+    import json, ssl, base64, urllib.request, urllib.parse
+    AUTH = "Basic " + base64.b64encode(b"{{ malcolm_admin_user | default('admin') }}:{{ malcolm_admin_password | default('vagrant') }}").decode()
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    def req(method, url, body=None):
+        r = urllib.request.Request(
+            url, method=method,
+            data=json.dumps(body).encode() if body else None,
+            headers={"Authorization": AUTH, "osd-xsrf": "true", "Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(r, context=ctx))
+    title = "ATT&CK for ICS Notices - S7comm"
+    q = urllib.parse.quote('"' + title + '"')
+    found = req("GET", "https://localhost/dashboards/api/saved_objects/_find"
+                       "?type=visualization&search=" + q + "&search_fields=title")
+    objs = [o for o in found.get("saved_objects", []) if o["attributes"].get("title") == title]
+    if not objs:
+        print("VIZ_NOT_FOUND")
+        raise SystemExit(0)
+    vid = objs[0]["id"]
+    base = "https://localhost/dashboards/api/saved_objects/visualization/" + vid
+    obj = req("GET", base)
+    vs = json.loads(obj["attributes"]["visState"])
+    changed = False
+    for agg in vs.get("aggs", []):
+        if agg.get("params", {}).get("field") == "threat.technique.name" and not agg["params"].get("missingBucket"):
+            agg["params"]["missingBucket"] = True
+            agg["params"]["missingBucketLabel"] = "-"
+            changed = True
+    if changed:
+        req("PUT", base, {"attributes": {"visState": json.dumps(vs)}})
+        print("CHANGED")
+    else:
+        print("UNCHANGED")
+    PYEOF
+  args:
+    chdir: "{{ _malcolm_dir }}"
+  register: _acid_notices_viz
+  until: "'VIZ_NOT_FOUND' not in _acid_notices_viz.stdout"
+  retries: 30
+  delay: 10
+  changed_when: "'CHANGED' in _acid_notices_viz.stdout"
+  become: true

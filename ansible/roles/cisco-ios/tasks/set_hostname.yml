@@ -1,0 +1,11 @@
+---
+# Task: Set hostname on Cisco IOS-XE device
+# Variables:
+#   hostname: Hostname for the router (required)
+
+- name: Configure hostname
+  cisco.ios.ios_config:
+    lines:
+      - hostname {{ hostname }}
+  when: hostname is defined and hostname | length > 0
+

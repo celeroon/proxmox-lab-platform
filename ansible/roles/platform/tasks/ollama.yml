@@ -1,0 +1,23 @@
+---
+- name: Check if Ollama is installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/ollama
+  register: ollama_check
+  tags: ollama
+
+- name: Install Ollama
+  ansible.builtin.shell: |
+    curl -fsSL https://ollama.ai/install.sh | sh
+  when: not ollama_check.stat.exists
+  tags: ollama
+
+- name: Check if qwen2.5-coder:14b is already pulled
+  ansible.builtin.command: /usr/local/bin/ollama list
+  register: ollama_list
+  changed_when: false
+  tags: ollama
+
+- name: Pull qwen2.5-coder:14b
+  ansible.builtin.command: /usr/local/bin/ollama pull qwen2.5-coder:14b
+  when: "'qwen2.5-coder:14b' not in ollama_list.stdout"
+  tags: ollama

@@ -1,0 +1,69 @@
+---
+# Task: Install AD DS + DNS roles and promote the server to a Domain Controller.
+# Creates a new forest with the specified root domain.
+#
+# Install-ADDSForest triggers an automatic reboot, which drops WinRM.
+# The promotion is fired asynchronously (poll: 0) to release WinRM before the
+# reboot occurs, then wait_for checks TCP port 5985 from the Ansible controller
+# (delegate_to: localhost).
+#
+# Required vars:
+#   ad_domain            — FQDN of the new forest root domain (e.g. "lab.local")
+#   ad_netbios           — NetBIOS domain name              (e.g. "LAB")
+#   ad_safe_mode_password — DSRM safe mode password
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_shell: |
+    Install-WindowsFeature `
+        -Name AD-Domain-Services, DNS `
+        -IncludeManagementTools
+
+- name: Promote server to Domain Controller (async — will reboot automatically)
+  ansible.windows.win_shell: |
+    Import-Module ADDSDeployment
+    $SafeModePass = ConvertTo-SecureString "{{ ad_safe_mode_password }}" -AsPlainText -Force
+    Install-ADDSForest `
+        -DomainName "{{ ad_domain }}" `
+        -DomainNetbiosName "{{ ad_netbios }}" `
+        -SafeModeAdministratorPassword $SafeModePass `
+        -InstallDns `
+        -DomainMode WinThreshold `
+        -ForestMode WinThreshold `
+        -Force
+  async: 120
+  poll: 0
+
+- name: Switch to domain credentials for post-DC-promotion connections
+  ansible.builtin.set_fact:
+    ansible_user: "{{ ad_netbios }}\\vagrant"
+    ansible_winrm_transport: ntlm
+
+- name: Wait for WinRM port to be reachable after Domain Controller reboot
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ ansible_port | default(5985) }}"
+    delay: 60
+    timeout: 900
+  delegate_to: localhost
+
+- name: Wait for WinRM to be fully operational after Domain Controller reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 900
+
+- name: Pause for Active Directory services to finish initializing
+  ansible.builtin.pause:
+    seconds: 180
+
+- name: Wait for WinRM to still be operational after AD initialization pause
+  ansible.builtin.wait_for_connection:
+    delay: 0
+    timeout: 120
+
+- name: Wait for Active Directory Web Services to start
+  ansible.windows.win_shell: |
+    (Get-Service -Name ADWS).Status
+  register: adws_status
+  until: adws_status.stdout | trim == "Running"
+  retries: 10
+  delay: 15

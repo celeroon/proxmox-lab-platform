@@ -1,0 +1,287 @@
+---
+# Configure OpenSearch Alerting + a Dashboards summary dashboard for detecting
+# unauthorized OPC-UA client traffic (any source other than the legitimate HMI
+# talking to the opcua-server). Mirrors configure_fins_alerting.yml exactly
+# (TCP, client-initiated, simple client+router IP exclusion, no BACnet-style
+# `is_orig` complexity).
+#
+# Reuses the SAME Dashboards index-pattern object every other protocol's
+# dashboard creates ("modbus-alerting-index-pattern") — deliberately does NOT
+# (re)create it here, see configure_s7comm_alerting.yml's header comment for
+# why recreating it would break the field cache.
+#
+# Detection query deliberately does NOT filter by specific OPC-UA service —
+# same reasoning as every other protocol here: ANY OPC-UA session reaching
+# the server from a source other than the known HMI is inherently suspicious
+# on this flat point-to-point VLAN.
+#
+# network.protocol / function-code field: confirmed live 2026-07-05 against a
+# real opcua-server/opcua-client session — `network.protocol` is
+# "opcua-binary" (with a hyphen, unlike every other protocol's underscore
+# dataset names), and the per-message service name lives at
+# `zeek.opcua_binary.req_identifier_str` (e.g. "ReadRequest"/"WriteRequest") —
+# more specific than the generic `event.action` field (also present, e.g.
+# "MSG:Read"), so used here instead, matching DNP3/FINS's precedent of using
+# the most specific real field rather than the generic ECS one.
+#
+# Variables:
+#   malcolm_dir:              Malcolm install directory       (default: /opt/malcolm)
+#   malcolm_admin_user:       Dashboards/OpenSearch admin user (default: admin)
+#   malcolm_admin_password:   Dashboards/OpenSearch admin pass (default: vagrant)
+#   opcua_client_ip:          Legitimate OPC-UA HMI to exclude from detection
+#                             (default: 192.168.60.20)
+#   opcua_router_ip:          vyos-1's gateway IP on the OPC-UA VLAN, ALSO excluded —
+#                             this is the source IP of the legitimate hairpin traffic
+#                             from vyos/configure_external_traffic_redirect (the
+#                             "ICS/IoT External Traffic" probe's return-path masquerade),
+#                             not a real client. (default: 192.168.60.1)
+#   opcua_server_port:        OPC-UA server port                (default: 4840)
+
+- name: Write configure-opcua-alerting.sh script
+  copy:
+    dest: /usr/local/sbin/configure-opcua-alerting.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      set -e
+      cd {{ malcolm_dir | default('/opt/malcolm') }}
+
+      OS_CERT=/usr/share/opensearch/config/certs/admin.crt
+      OS_KEY=/usr/share/opensearch/config/certs/admin.key
+      DASH_AUTH="{{ malcolm_admin_user | default('admin') }}:{{ malcolm_admin_password | default('vagrant') }}"
+      CLIENT_IP="{{ opcua_client_ip | default('192.168.60.20') }}"
+      ROUTER_IP="{{ opcua_router_ip | default('192.168.60.1') }}"
+      OPCUA_PORT="{{ opcua_server_port | default(4840) }}"
+
+      # --- 1. OpenSearch Alerting monitor ---
+      # Always delete-then-recreate — see configure_malcolm_alerting.yml's header
+      # comment for why a mere toggle isn't reliable enough on its own.
+      EXISTING_ID=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        "https://localhost:9200/_plugins/_alerting/monitors/_search" -H "Content-Type: application/json" \
+        -d '{"query":{"term":{"monitor.name.keyword":"Unauthorized OPC-UA Client (non-HMI source)"}}}' \
+        | python3 -c "
+      import json, sys
+      hits = json.load(sys.stdin)['hits']['hits']
+      print(hits[0]['_id'] if hits else '')
+      ")
+
+      if [ -n "$EXISTING_ID" ]; then
+        echo "Removing existing monitor $EXISTING_ID before recreating..."
+        docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+          -X DELETE "https://localhost:9200/_plugins/_alerting/monitors/${EXISTING_ID}" > /dev/null
+      fi
+
+      echo "Creating Unauthorized OPC-UA Client monitor..."
+      MONITOR_RESPONSE=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X POST "https://localhost:9200/_plugins/_alerting/monitors" -H "Content-Type: application/json" \
+        -d @- <<'EOF'
+      {
+        "type": "monitor",
+        "name": "Unauthorized OPC-UA Client (non-HMI source)",
+        "monitor_type": "bucket_level_monitor",
+        "enabled": true,
+        "schedule": { "period": { "interval": 1, "unit": "MINUTES" } },
+        "inputs": [{
+          "search": {
+            "indices": ["arkime_sessions3-*"],
+            "query": {
+              "size": 0,
+              "query": {
+                "bool": {
+                  "filter": [
+                    { "term": { "destination.port": {{ opcua_server_port | default(4840) }} } },
+                    { "term": { "network.protocol": "opcua-binary" } },
+                    { "range": { "firstPacket": { "gte": "{{ '{{' }}period_end{{ '}}' }}||-2m", "lte": "{{ '{{' }}period_end{{ '}}' }}", "format": "epoch_millis" } } }
+                  ],
+                  "must_not": [
+                    { "term": { "source.ip": "{{ opcua_client_ip | default('192.168.60.20') }}" } },
+                    { "term": { "source.ip": "{{ opcua_router_ip | default('192.168.60.1') }}" } }
+                  ]
+                }
+              },
+              "aggregations": {
+                "sessions": {
+                  "terms": { "field": "zeek.uid", "size": 1000 },
+                  "aggregations": {
+                    "attacker_ip": { "terms": { "field": "source.ip", "size": 1 } },
+                    "function_codes": { "terms": { "field": "zeek.opcua_binary.req_identifier_str", "size": 20 } }
+                  }
+                }
+              }
+            }
+          }
+        }],
+        "triggers": [{
+          "bucket_level_trigger": {
+            "name": "New unauthorized OPC-UA session",
+            "severity": "3",
+            "condition": {
+              "buckets_path": { "_count": "_count" },
+              "parent_bucket_path": "sessions",
+              "script": { "source": "params._count >= 1", "lang": "painless" }
+            },
+            "actions": []
+          }
+        }]
+      }
+      EOF
+        )
+      MONITOR_ID=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_id'])")
+      SEQ_NO=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])")
+      PRIMARY_TERM=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])")
+      MONITOR_BODY=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['monitor']))")
+      echo "Created monitor $MONITOR_ID"
+
+      # Toggle disable/enable to force scheduler registration — see
+      # configure_malcolm_alerting.yml for why this is needed.
+      DISABLED_BODY=$(echo "$MONITOR_BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); d['enabled']=False; print(json.dumps(d))")
+      DISABLE_RESPONSE=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X PUT "https://localhost:9200/_plugins/_alerting/monitors/${MONITOR_ID}?if_seq_no=${SEQ_NO}&if_primary_term=${PRIMARY_TERM}" \
+        -H "Content-Type: application/json" -d "$DISABLED_BODY")
+      NEW_SEQ_NO=$(echo "$DISABLE_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])")
+      NEW_PRIMARY_TERM=$(echo "$DISABLE_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])")
+      ENABLED_BODY=$(echo "$MONITOR_BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); d['enabled']=True; print(json.dumps(d))")
+      docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X PUT "https://localhost:9200/_plugins/_alerting/monitors/${MONITOR_ID}?if_seq_no=${NEW_SEQ_NO}&if_primary_term=${NEW_PRIMARY_TERM}" \
+        -H "Content-Type: application/json" -d "$ENABLED_BODY" > /dev/null
+      echo "Toggled monitor to force scheduler registration"
+
+      # --- 2. Dashboards saved objects ---
+      # Reuses the SAME shared alerting index pattern every other protocol's
+      # dashboard creates ("modbus-alerting-index-pattern") — deliberately
+      # does NOT (re)create it here, see configure_s7comm_alerting.yml's
+      # header comment for why recreating it would break the field cache.
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/opcua-alert-count-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "OPC-UA Alert Count",
+          "visState": "{\"title\":\"OPC-UA Alert Count\",\"type\":\"metric\",\"params\":{\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"\",\"fontSize\":60}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}}]}",
+          "uiStateJSON": "{}",
+          "description": "Total OPC-UA unauthorized-client alerts in the selected time range",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized OPC-UA Client (non-HMI source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alert count metric ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/opcua-alerts-over-time-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "OPC-UA Alerts Over Time",
+          "visState": "{\"title\":\"OPC-UA Alerts Over Time\",\"type\":\"histogram\",\"params\":{\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"title\":{},\"scale\":{\"type\":\"linear\"},\"labels\":{\"show\":true,\"filter\":true,\"truncate\":100},\"style\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"title\":{\"text\":\"Alert Count\"},\"scale\":{\"type\":\"linear\",\"mode\":\"normal\"},\"labels\":{\"show\":true,\"rotate\":0,\"filter\":false,\"truncate\":100},\"style\":{}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"stacked\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"showCirclesOnLines\":true,\"lineWidth\":2}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"times\":[],\"addTimeMarker\":false},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"start_time\",\"timeRange\":{\"from\":\"now-24h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"interval\":\"auto\",\"drop_partials\":false,\"min_doc_count\":1,\"extended_bounds\":{}}}]}",
+          "uiStateJSON": "{}",
+          "description": "",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized OPC-UA Client (non-HMI source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alerts-over-time histogram ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/opcua-alerts-by-attacker-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "OPC-UA Alerts by Attacker IP",
+          "visState": "{\"title\":\"OPC-UA Alerts by Attacker IP\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"showTotal\":false,\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"agg_alert_content.bucket.attacker_ip.buckets.key.keyword\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}]}",
+          "uiStateJSON": "{}",
+          "description": "",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized OPC-UA Client (non-HMI source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alerts-by-attacker-IP table ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/search/opcua-alerts-recent-search?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "OPC-UA Alerts - Recent",
+          "columns": ["start_time", "state", "severity", "trigger_name", "monitor_name"],
+          "sort": [["start_time", "desc"]],
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized OPC-UA Client (non-HMI source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Recent-alerts saved search ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/search/opcua-raw-logs-search?overwrite=true" \
+        -d "{
+          \"attributes\": {
+            \"title\": \"OPC-UA Raw Logs - Unauthorized Client\",
+            \"columns\": [\"firstPacket\", \"source.ip\", \"destination.ip\", \"destination.port\", \"zeek.opcua_binary.req_identifier_str\", \"zeek.uid\"],
+            \"sort\": [[\"firstPacket\", \"desc\"]],
+            \"kibanaSavedObjectMeta\": {
+              \"searchSourceJSON\": \"{\\\"query\\\":{\\\"query\\\":\\\"destination.port: ${OPCUA_PORT} and network.protocol: \\\\\\\"opcua-binary\\\\\\\" and not source.ip: \\\\\\\"${CLIENT_IP}\\\\\\\" and not source.ip: \\\\\\\"${ROUTER_IP}\\\\\\\"\\\",\\\"language\\\":\\\"kuery\\\"},\\\"filter\\\":[],\\\"indexRefName\\\":\\\"kibanaSavedObjectMeta.searchSourceJSON.index\\\"}\"
+            }
+          },
+          \"references\": [
+            {\"name\": \"kibanaSavedObjectMeta.searchSourceJSON.index\", \"type\": \"index-pattern\", \"id\": \"arkime_sessions3-*\"}
+          ]
+        }" > /dev/null
+      echo "Raw-logs saved search ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/dashboard/opcua-detection-overview-dashboard?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "OPC-UA Detection Overview",
+          "hits": 0,
+          "description": "Alerts and activity for the Unauthorized OPC-UA Client monitor",
+          "panelsJSON": "[{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":0,\"w\":12,\"h\":8,\"i\":\"1\"},\"panelIndex\":\"1\",\"embeddableConfig\":{},\"panelRefName\":\"panel_1\"},{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":12,\"y\":0,\"w\":36,\"h\":8,\"i\":\"2\"},\"panelIndex\":\"2\",\"embeddableConfig\":{},\"panelRefName\":\"panel_2\"},{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":8,\"w\":24,\"h\":12,\"i\":\"3\"},\"panelIndex\":\"3\",\"embeddableConfig\":{},\"panelRefName\":\"panel_3\"},{\"version\":\"3.7.0\",\"type\":\"search\",\"gridData\":{\"x\":24,\"y\":8,\"w\":24,\"h\":12,\"i\":\"4\"},\"panelIndex\":\"4\",\"embeddableConfig\":{},\"panelRefName\":\"panel_4\"},{\"version\":\"3.7.0\",\"type\":\"search\",\"gridData\":{\"x\":0,\"y\":20,\"w\":48,\"h\":16,\"i\":\"5\"},\"panelIndex\":\"5\",\"embeddableConfig\":{},\"panelRefName\":\"panel_5\"}]",
+          "optionsJSON": "{\"useMargins\":true,\"syncColors\":false,\"hidePanelTitles\":false}",
+          "version": 1,
+          "timeRestore": false,
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+          }
+        },
+        "references": [
+          {"name": "panel_1", "type": "visualization", "id": "opcua-alert-count-viz"},
+          {"name": "panel_2", "type": "visualization", "id": "opcua-alerts-over-time-viz"},
+          {"name": "panel_3", "type": "visualization", "id": "opcua-alerts-by-attacker-viz"},
+          {"name": "panel_4", "type": "search", "id": "opcua-alerts-recent-search"},
+          {"name": "panel_5", "type": "search", "id": "opcua-raw-logs-search"}
+        ]
+      }
+      EOF
+      echo "OPC-UA Detection Overview dashboard ready"
+
+- name: Run configure-opcua-alerting.sh
+  command: /usr/local/sbin/configure-opcua-alerting.sh
+  register: _opcua_alerting_result
+  changed_when: true
+
+- name: Show configure-opcua-alerting.sh output
+  debug:
+    msg: "{{ _opcua_alerting_result.stdout_lines }}"

@@ -1,0 +1,194 @@
+---
+# Install esrally (query-only benchmark driver) and deploy the custom SIEM track.
+# Runs on mgmt-1. Used manually from /opt/lab/benchmark-runbook.txt — this task only
+# installs the tool and the track, it never runs a race itself.
+#
+# No data loading or index management: --pipeline=benchmark-only (used at race time,
+# not configured here) queries the existing, externally-managed logs-* data stream
+# that Elastic Agents are already writing to.
+#
+# Debian 12+ ships Python with PEP 668's externally-managed-environment marker, so a
+# plain `pip install` is blocked — --break-system-packages is required for a lab box.
+
+# ── Step 1: Install esrally ────────────────────────────────────────
+
+- name: Install python3-pip
+  apt:
+    name: python3-pip
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install esrally
+  pip:
+    name: esrally
+    state: present
+    extra_args: "--break-system-packages"
+  become: yes
+
+# ── Step 2: Deploy the custom SIEM query-only track ────────────────
+
+- name: Create rally track directory
+  file:
+    path: /opt/lab/rally-tracks/siem
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Deploy SIEM track.json
+  copy:
+    dest: /opt/lab/rally-tracks/siem/track.json
+    mode: '0644'
+    content: |
+      {
+        "version": 2,
+        "description": "Query-only SIEM benchmark against an existing logs-* data stream — no indices or corpora: the cluster and its data already exist, this track only fires queries and records client-side timing.",
+        "operations": [
+          {
+            "name": "count-all",
+            "operation-type": "search",
+            "index": "logs-*",
+            "body": {
+              "query": { "match_all": {} }
+            }
+          },
+          {
+            "name": "date-histogram",
+            "operation-type": "search",
+            "index": "logs-*",
+            "body": {
+              "size": 0,
+              "aggs": {
+                "by_time": {
+                  "date_histogram": { "field": "@timestamp", "fixed_interval": "5m" }
+                }
+              }
+            }
+          },
+          {
+            "name": "terms-src-ip",
+            "operation-type": "search",
+            "index": "logs-*",
+            "body": {
+              "size": 0,
+              "aggs": {
+                "top_ips": { "terms": { "field": "source.ip", "size": 10 } }
+              }
+            }
+          },
+          {
+            "name": "fulltext-search",
+            "operation-type": "search",
+            "index": "logs-*",
+            "body": {
+              "query": {
+                "multi_match": {
+                  "query": "failed password",
+                  "fields": ["message", "event.action"]
+                }
+              }
+            }
+          }
+        ],
+        "challenges": [
+          {
+            "name": "query-only",
+            "description": "Fires all 4 SIEM-representative queries in sequence at a fixed rate.",
+            "schedule": [
+              { "operation": "count-all",       "clients": 1, "target-throughput": 10, "warmup-iterations": 2, "iterations": 10 },
+              { "operation": "date-histogram",  "clients": 1, "target-throughput": 10, "warmup-iterations": 2, "iterations": 10 },
+              { "operation": "terms-src-ip",    "clients": 1, "target-throughput": 10, "warmup-iterations": 2, "iterations": 10 },
+              { "operation": "fulltext-search", "clients": 1, "target-throughput": 10, "warmup-iterations": 2, "iterations": 10 }
+            ]
+          }
+        ]
+      }
+  become: yes
+
+# ── Step 3: Deploy a quick-reference race command to the Desktop ───
+
+- name: Deploy quick esrally race command to Desktop
+  copy:
+    dest: "/home/{{ accesses_user | default('vagrant') }}/Desktop/rally-race-command.txt"
+    mode: '0644'
+    content: |
+      # esrally — Phase 1 baseline race (batch-1). Full runbook: /opt/lab/benchmark-runbook.txt
+      esrally race --pipeline=benchmark-only --track-path=/opt/lab/rally-tracks/siem \
+        --challenge=query-only --target-hosts=https://ingest-1:9200 \
+        --client-options="use_ssl:true,verify_certs:false,basic_auth_user:elastic,basic_auth_password:labpassword" \
+        --race-id=batch-1
+  become: yes
+
+# ── Step 4: Deploy the manual benchmark runbook ────────────────────
+
+- name: Deploy benchmark runbook
+  copy:
+    dest: /opt/lab/benchmark-runbook.txt
+    mode: '0644'
+    content: |
+      # Elasticsearch Benchmark Runbook — elastic-benchmark-ct-cluster
+      # Run each block manually. Check Grafana between steps and decide when to
+      # proceed — "stabilize" means watch the indexing rate panel until it flattens.
+      #
+      # esrally has no --target-throughput CLI flag — rate control is baked into
+      # /opt/lab/rally-tracks/siem/track.json's challenge schedule (10/sec per query).
+
+      ES_PASS="labpassword"
+      ES_OPTS="use_ssl:true,verify_certs:false,basic_auth_user:elastic,basic_auth_password:${ES_PASS}"
+      TRACK="--pipeline=benchmark-only --track-path=/opt/lab/rally-tracks/siem --challenge=query-only"
+      COORD="https://ingest-1:9200"   # switch to https://coord-1:9200 once coord-1 is provisioned (Step C)
+
+      # ── Step A — create the 4 scale-out node VMs FIRST (skip-ansible), so their
+      # IPs exist in the DB before master-1's bootstrap task needs them for cert
+      # pre-generation. Do this BEFORE Step B, never after. ──────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice \
+        --target data-2,coord-1,data-warm-1,data-cold-1 --skip-ansible
+
+      # ── Step B — provision the 6 core nodes ────────────────────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice \
+        --target master-1,data-1,ingest-1,kibana-1,fleet-1,mgmt-1
+
+      # ── Phase 1: Baseline — 50 agents ───────────────────────────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target agent-batch-1
+      # [Grafana: wait for indexing rate to flatten before running Rally]
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-1
+
+      # ── Phase 2: Load increase — 100 agents ─────────────────────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target agent-batch-2
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-2
+
+      # ── Phase 3: Degradation zone — 150 agents (expect high latency here) ──────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target agent-batch-3
+      # [Grafana: expect indexing lag and rising p99 query latency]
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-3-before-scale
+
+      # ── Phase 4: Step C — provision data-2 (VM exists from Step A; Ansible runs
+      # now for the first time). No ILM/config change needed — ES rebalances. ────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target data-2
+      # [Grafana: watch cluster health -> green; shard rebalancing completes before running Rally]
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-3-after-data2
+      esrally compare --baseline=batch-3-before-scale --contender=batch-3-after-data2
+
+      # ── Phase 5: Continue loading — 200 agents ──────────────────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target agent-batch-4
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-4
+
+      # ── Phase 6: Provision data-warm-1 — ILM policy already exists (deployed at
+      # master-1 bootstrap time); ES auto-migrates rolled-over indices once it sees
+      # the data_warm role. No manual policy change needed. ──────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target data-warm-1
+      # [Grafana: watch hot node disk usage drop as ILM migrates rolled-over indices to warm]
+      esrally race $TRACK --target-hosts=$COORD --client-options="$ES_OPTS" --race-id=batch-4-after-warm
+      esrally compare --baseline=batch-4 --contender=batch-4-after-warm
+
+      # ── Phase 7 (optional): Provision data-cold-1 — same ILM policy, cold phase ─
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target data-cold-1
+
+      # ── Phase 8 (optional): Provision coord-1 — switch COORD to coord-1:9200
+      # above once this is up, then re-run a race to confirm it's not idle dead
+      # weight (Rally must target it explicitly). ────────────────────────────────
+      lab deploy start scenarios/elastic-benchmark-ct-cluster/scenario.yml --user alice --target coord-1
+
+      # ── Final: Full experiment summary ──────────────────────────────────────────
+      esrally compare --baseline=batch-1 --contender=batch-4-after-warm
+  become: yes

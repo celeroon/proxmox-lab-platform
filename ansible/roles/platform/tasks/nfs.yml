@@ -1,0 +1,56 @@
+---
+- name: Create templates directory
+  ansible.builtin.file:
+    path: "{{ lookup('env', 'TEMPLATES_DIR') | default('/var/lib/lab-platform/templates', true) }}"
+    state: directory
+    mode: "0755"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+  tags: nfs
+
+- name: Create templates images directory
+  ansible.builtin.file:
+    path: "{{ lookup('env', 'TEMPLATES_DIR') | default('/var/lib/lab-platform/templates', true) }}/images"
+    state: directory
+    mode: "0755"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+  tags: nfs
+
+- name: Create CT template cache directory
+  ansible.builtin.file:
+    path: "{{ lookup('env', 'TEMPLATES_DIR') | default('/var/lib/lab-platform/templates', true) }}/template/cache"
+    state: directory
+    mode: "0755"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+  tags: nfs
+
+- name: Ensure nfs-kernel-server is started and enabled
+  ansible.builtin.service:
+    name: nfs-kernel-server
+    state: started
+    enabled: true
+  tags: nfs
+
+- name: Install NFS Proxmox remount script
+  ansible.builtin.template:
+    src: nfs-proxmox-remount.sh.j2
+    dest: /usr/local/bin/nfs-proxmox-remount.sh
+    mode: "0755"
+  tags: nfs
+
+- name: Install NFS Proxmox remount systemd unit
+  ansible.builtin.template:
+    src: nfs-proxmox-remount.service.j2
+    dest: /etc/systemd/system/nfs-proxmox-remount.service
+    mode: "0644"
+  notify: reload systemd
+  tags: nfs
+
+- name: Enable and start nfs-proxmox-remount service
+  ansible.builtin.service:
+    name: nfs-proxmox-remount
+    enabled: true
+    state: started
+  tags: nfs

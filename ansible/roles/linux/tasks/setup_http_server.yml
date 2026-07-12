@@ -1,0 +1,22 @@
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Enable and start nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Download elastic agent archive
+  ansible.builtin.get_url:
+    url: "{{ agent_url }}"
+    dest: "/tmp/{{ agent_url | basename }}"
+    timeout: 600
+
+- name: Decompress to plain tar in nginx web root
+  ansible.builtin.shell:
+    cmd: "gunzip -c /tmp/{{ agent_url | basename }} > /var/www/html/{{ agent_url | basename | regex_replace('\\.gz$', '') }}"
+    creates: "/var/www/html/{{ agent_url | basename | regex_replace('\\.gz$', '') }}"

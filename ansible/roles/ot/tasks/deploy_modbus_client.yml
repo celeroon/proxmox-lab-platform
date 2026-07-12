@@ -1,0 +1,81 @@
+---
+# Deploy the Modbus/TCP HMI/operator client simulator as a systemd service.
+#
+# Variables:
+#   server_ip:    IP of the modbus-server to connect to (required)
+#   modbus_port:  TCP port to connect to (default: 502)
+#   poll_seconds: How often to poll (default: 5.0)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/modbus directory
+  file:
+    path: /opt/modbus
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/modbus/venv
+  args:
+    creates: /opt/modbus/venv/bin/python3
+  become: true
+
+- name: Install pymodbus and rich into venv
+  pip:
+    name:
+      - pymodbus==3.7.4
+      - rich
+    virtualenv: /opt/modbus/venv
+  become: true
+
+- name: Copy modbus simulation files
+  copy:
+    src: modbus/
+    dest: /opt/modbus/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Install modbus-client systemd service
+  copy:
+    dest: /etc/systemd/system/modbus-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Modbus TCP Client (HMI/operator simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/modbus/venv/bin/python3 /opt/modbus/modbus_client.py \
+        --host {{ server_ip }} \
+        --port {{ modbus_port | default(502) }} \
+        --poll-seconds {{ poll_seconds | default(5.0) }} \
+        --log-file /var/log/modbus-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/modbus
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start modbus-client
+  systemd:
+    name: modbus-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

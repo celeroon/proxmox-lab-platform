@@ -1,0 +1,6 @@
+---
+# Task: Save running configuration to startup (write memory)
+
+- name: Save running configuration
+  cisco.ios.ios_config:
+    save_when: always

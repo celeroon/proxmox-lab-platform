@@ -1,0 +1,21 @@
+[Unit]
+Description=Bring up OVS bridge interfaces after openvswitch restart
+After=openvswitch-switch.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "\
+    ip link set {{ bridge_name | default('br-ot') }} up && \
+    ip link set {{ trunk_port }} up{% for p in access_ports | default([]) %} && \
+    ip link set {{ p.name }} up{% endfor %}{% if mirror_output is defined %} && \
+    ip link set {{ mirror_output }} up{% endif %}{% for s in svi_interfaces | default([]) %} && \
+    ip link set {{ s.name }} up && \
+    (ip addr show dev {{ s.name }} | grep -q '{{ s.address }}' || ip addr add {{ s.address }} dev {{ s.name }}){% endfor %}"
+# Restart vswitchd after all ports are up — on first boot with many ports, vswitchd
+# initialises with n-handler-threads=0 (upcall thrash), dropping all packets until
+# restarted. A one-shot restart here fixes it permanently after interface bring-up.
+ExecStartPost=/bin/systemctl restart openvswitch-switch
+
+[Install]
+WantedBy=multi-user.target

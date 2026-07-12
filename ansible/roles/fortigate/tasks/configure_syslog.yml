@@ -1,0 +1,36 @@
+---
+# Task: Configure syslog settings on FortiGate
+# Variables:
+#   elk_ip: IP address of the ELK server
+#   syslog_port: Syslog port (default: 514)
+#   syslog_src: Source IP for syslog (default: 0.0.0.0)
+
+- name: Configure syslog settings
+  fortios_log_syslogd_setting:
+    vdom: "{{ vdom | default('root') }}"
+    log_syslogd_setting:
+      status: "enable"
+      server: "{{ elk_ip }}"
+      port: "{{ syslog_port | default(514) }}"
+      facility: "{{ facility | default('syslog') }}"
+      source_ip: "{{ syslog_src | default('0.0.0.0') }}"
+      format: "{{ format | default('rfc5424') }}"
+      mode: "{{ mode | default('udp') }}"
+  when: elk_ip is defined
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure general log settings
+  fortinet.fortios.fortios_log_setting:
+    vdom: "{{ vdom | default('root') }}"
+    log_setting:
+      local_in_allow: "{{ local_in_allow | default('enable') }}"
+      local_in_deny_unicast: "{{ local_in_deny_unicast | default('enable') }}"
+      local_in_deny_broadcast: "{{ local_in_deny_broadcast | default('enable') }}"
+      local_out: "{{ local_out | default('enable') }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

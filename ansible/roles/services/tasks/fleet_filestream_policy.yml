@@ -1,0 +1,107 @@
+---
+# Create Filestream-Test agent policy with the Filestream integration.
+# Idempotent: agent policy guarded by ID check; integration guarded by name scan of package policies list.
+#
+# Required vars:
+#   elk_password - elastic superuser password
+
+- name: Check if filestream-test-policy already exists
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies/filestream-test-policy"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 404]
+  register: filestream_policy_check
+  no_log: true
+
+- name: Get all package policies
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: 200
+  register: all_package_policies
+  no_log: true
+
+- name: Get filestream package version
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/epm/packages/filestream"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: 200
+  register: filestream_pkg
+  no_log: true
+  when: >-
+    filestream_policy_check.status == 404 or
+    (all_package_policies.json['items'] | selectattr('name', 'equalto', 'filestream-test') | list | length) == 0
+
+- name: Extract filestream package version
+  set_fact:
+    filestream_version: "{{ filestream_pkg.json.item.version }}"
+  when: >-
+    filestream_policy_check.status == 404 or
+    (all_package_policies.json['items'] | selectattr('name', 'equalto', 'filestream-test') | list | length) == 0
+
+- name: Create Filestream-Test agent policy
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      id: filestream-test-policy
+      name: Filestream-Test
+      namespace: default
+      monitoring_enabled: [logs, metrics]
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: filestream_policy_check.status == 404
+
+- name: Add Filestream integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: filestream-test
+      namespace: filestream_test
+      description: ""
+      policy_ids: [filestream-test-policy]
+      package:
+        name: filestream
+        version: "{{ filestream_version }}"
+      inputs:
+        filestream-filestream:
+          enabled: true
+          streams:
+            filestream.filestream:
+              enabled: true
+              vars:
+                paths:
+                  - /var/log/filestream-test/*.log
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: >-
+    (all_package_policies.json['items'] | selectattr('name', 'equalto', 'filestream-test') | list | length) == 0

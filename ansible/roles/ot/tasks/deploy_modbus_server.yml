@@ -1,0 +1,75 @@
+---
+# Deploy the Modbus/TCP tank+pump field device simulator as a systemd service.
+#
+# Variables:
+#   modbus_port: TCP port to listen on (default: 502)
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/modbus directory
+  file:
+    path: /opt/modbus
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/modbus/venv
+  args:
+    creates: /opt/modbus/venv/bin/python3
+  become: true
+
+- name: Install pymodbus and rich into venv
+  pip:
+    name:
+      - pymodbus==3.7.4
+      - rich
+    virtualenv: /opt/modbus/venv
+  become: true
+
+- name: Copy modbus simulation files
+  copy:
+    src: modbus/
+    dest: /opt/modbus/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Install modbus-server systemd service
+  copy:
+    dest: /etc/systemd/system/modbus-server.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Modbus TCP Server (tank+pump simulator)
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/modbus/venv/bin/python3 /opt/modbus/modbus_server.py \
+        --host 0.0.0.0 \
+        --port {{ modbus_port | default(502) }} \
+        --log-file /var/log/modbus-server.log
+      Restart=always
+      WorkingDirectory=/opt/modbus
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start modbus-server
+  systemd:
+    name: modbus-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

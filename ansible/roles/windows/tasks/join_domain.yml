@@ -1,0 +1,37 @@
+---
+# Task: Join the Windows machine to the domain and place it in OU=Clients.
+# Builds the domain DN locally (no RSAT/AD module required on the client).
+# Fires asynchronously to survive the automatic reboot triggered by -Restart.
+#
+# Required vars:
+#   ad_domain         — domain FQDN (e.g. "lab.local")
+#   ad_netbios        — NetBIOS domain name (e.g. "LAB")
+#   ad_admin_password — domain Administrator password
+
+- name: Join domain and place in OU=Clients (async — will reboot)
+  ansible.windows.win_shell: |
+    $domDN      = ("{{ ad_domain }}" -split '\.' | ForEach-Object { "DC=$_" }) -join ','
+    $OUPath     = "OU=Clients,OU=Computers,OU={{ ad_netbios }},$domDN"
+    $SecurePass = ConvertTo-SecureString "{{ ad_admin_password }}" -AsPlainText -Force
+    $Credential = New-Object System.Management.Automation.PSCredential("{{ ad_netbios }}\Administrator", $SecurePass)
+    Add-Computer `
+        -DomainName "{{ ad_domain }}" `
+        -OUPath     $OUPath `
+        -Credential $Credential `
+        -Restart `
+        -Force
+  async: 60
+  poll: 0
+
+- name: Wait for WinRM port to be reachable after domain join reboot
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ ansible_port | default(5985) }}"
+    delay: 60
+    timeout: 600
+  delegate_to: localhost
+
+- name: Wait for WinRM to be fully operational after domain join reboot
+  ansible.builtin.wait_for_connection:
+    delay: 15
+    timeout: 300

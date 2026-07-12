@@ -1,0 +1,15 @@
+---
+# Task: Set hostname on VyOS router
+# Variables:
+#   hostname: Hostname for the router (required)
+
+- name: Configure hostname
+  vyos.vyos.vyos_config:
+    lines:
+      - set system host-name "{{ hostname }}"
+  when: hostname is defined and hostname | length > 0
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes
+  when: hostname is defined and hostname | length > 0

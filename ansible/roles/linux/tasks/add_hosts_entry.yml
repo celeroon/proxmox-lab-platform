@@ -1,0 +1,13 @@
+---
+# Add a static entry to /etc/hosts.
+#
+# Required vars:
+#   hosts_entry_ip   - IP address to map
+#   hosts_entry_name - hostname to add
+
+- name: Add /etc/hosts entry
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hosts_entry_ip }}  {{ hosts_entry_name }}"
+    state: present
+  become: yes

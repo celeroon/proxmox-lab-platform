@@ -1,0 +1,105 @@
+---
+# Fetch TLS certificates from the Elasticsearch bootstrap node (elastic_nodes[0])
+# for a Fleet Server VM that is NOT co-located with Elasticsearch or Kibana.
+# Requires elasticsearch_bootstrap to have run on elastic_nodes[0] first.
+#
+# Populates the same paths that fleet_server.yml expects:
+#   /etc/elasticsearch/certs/elasticsearch-ca.pem  (CA fingerprint)
+#   /etc/kibana/certs/elasticsearch-ca.pem         (fleet-server-es-ca)
+#   /etc/kibana/certs/fleet-server.crt
+#   /etc/kibana/certs/fleet-server.key
+#
+# Required vars:
+#   elastic_nodes - cluster node list; elastic_nodes[0] is the bootstrap node
+#   elk_cert_pass - .p12 cert password (must match bootstrap)
+
+# ── Step 1: Create directories ────────────────────────────────────
+
+- name: Create ES certs directory for CA PEM
+  file:
+    path: /etc/elasticsearch/certs
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Create Kibana certs directory for fleet-server cert + key
+  file:
+    path: /etc/kibana/certs
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+# ── Step 2: Wait for cert distribution server ─────────────────────
+
+- name: Wait for cert distribution server on bootstrap node
+  wait_for:
+    host: "{{ elastic_nodes[0].ip }}"
+    port: 19999
+    timeout: 120
+
+# ── Step 3: Fetch certs ───────────────────────────────────────────
+
+- name: Fetch CA PEM from bootstrap node
+  get_url:
+    url: "http://{{ elastic_nodes[0].ip }}:19999/elasticsearch-ca.pem"
+    dest: /etc/elasticsearch/certs/elasticsearch-ca.pem
+    owner: root
+    group: root
+    mode: '0644'
+    force: yes
+  become: yes
+
+- name: Fetch Fleet Server p12 from bootstrap node
+  get_url:
+    url: "http://{{ elastic_nodes[0].ip }}:19999/fleet-server.p12"
+    dest: /tmp/fleet-server.p12
+    mode: '0644'
+    force: yes
+  become: yes
+
+# ── Step 4: Extract cert and key from p12 ─────────────────────────
+
+- name: Extract Fleet Server certificate from p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/fleet-server.p12
+    -clcerts -nokeys
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/fleet-server.crt
+  become: yes
+  no_log: true
+
+- name: Extract Fleet Server private key from p12
+  shell: >
+    openssl pkcs12
+    -in /tmp/fleet-server.p12
+    -nocerts -nodes
+    -passin "pass:{{ elk_cert_pass }}"
+    -out /etc/kibana/certs/fleet-server.key
+  become: yes
+  no_log: true
+
+- name: Copy CA PEM into Kibana certs directory
+  copy:
+    src: /etc/elasticsearch/certs/elasticsearch-ca.pem
+    dest: /etc/kibana/certs/elasticsearch-ca.pem
+    remote_src: yes
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+
+- name: Set permissions on extracted fleet-server cert files
+  file:
+    path: "/etc/kibana/certs/{{ item }}"
+    owner: root
+    group: root
+    mode: '0640'
+  loop:
+    - fleet-server.crt
+    - fleet-server.key
+  become: yes

@@ -1,0 +1,98 @@
+---
+# Task: Configure IKEv2/IPsec site-to-site VPN on Cisco IOS-XE
+# Variables:
+#   peer_name:          Keyring peer name (e.g. FortiGate)
+#   peer_ip:            Remote peer IP address (e.g. 192.0.2.6)
+#   local_ip:           Local WAN IP for IKEv2 identity (e.g. 198.51.100.2)
+#   psk:                IKEv2 pre-shared key
+#   outside_interface:  Interface where crypto map is applied (e.g. GigabitEthernet2)
+#   ikev2_encryption:   IKEv2 proposal encryption algorithm (e.g. des, aes-cbc-128)
+#   ikev2_integrity:    IKEv2 proposal integrity algorithm (e.g. sha1, sha256)
+#   dh_group:           IKEv2 DH group number (e.g. 2, 14)
+#   transform_set_name: IPsec transform set name (e.g. ESP-DES-SHA)
+#   esp_encryption:     IPsec ESP encryption algorithm (e.g. esp-des, esp-aes)
+#   esp_integrity:      IPsec ESP integrity algorithm (e.g. esp-sha-hmac, esp-sha256-hmac)
+#   pfs_group:          PFS group keyword as used in crypto map (e.g. group2, group14)
+#   sa_lifetime:        IPsec SA lifetime in seconds (e.g. 3600)
+#   local_subnets:      Local subnets for interesting traffic
+#                       Each entry: { network: "x.x.x.x", wildcard: "0.0.0.255" }
+#   remote_subnets:     Remote subnets for interesting traffic
+#                       Each entry: { network: "x.x.x.x", wildcard: "0.0.0.255" }
+
+- name: Build S2S interesting traffic ACL entries
+  set_fact:
+    _s2s_acl_entries: >-
+      {%- set entries = [] -%}
+      {%- for local in local_subnets -%}
+        {%- for remote in remote_subnets -%}
+          {%- set _ = entries.append('permit ip ' + local.network + ' ' + local.wildcard + ' ' + remote.network + ' ' + remote.wildcard) -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ entries }}
+
+- name: Configure IKEv2 proposal
+  cisco.ios.ios_config:
+    lines:
+      - encryption {{ ikev2_encryption }}
+      - integrity {{ ikev2_integrity }}
+      - group {{ dh_group }}
+    parents: crypto ikev2 proposal IKEv2-PROP
+
+- name: Configure IKEv2 policy
+  cisco.ios.ios_config:
+    lines:
+      - proposal IKEv2-PROP
+    parents: crypto ikev2 policy PL-S2S
+
+- name: Configure IKEv2 keyring
+  cisco.ios.ios_config:
+    lines:
+      - address {{ peer_ip }}
+      - pre-shared-key {{ psk }}
+    parents:
+      - crypto ikev2 keyring S2S_KEY
+      - peer {{ peer_name }}
+
+- name: Configure IKEv2 profile
+  cisco.ios.ios_config:
+    lines:
+      - match identity remote address {{ peer_ip }}
+      - identity local address {{ local_ip }}
+      - authentication remote pre-share
+      - authentication local pre-share
+      - keyring local S2S_KEY
+    parents: crypto ikev2 profile IKEV2-PROF
+
+- name: Configure IPsec transform set
+  cisco.ios.ios_config:
+    lines:
+      - crypto ipsec transform-set {{ transform_set_name }} {{ esp_encryption }} {{ esp_integrity }}
+
+- name: Configure IPsec profile
+  cisco.ios.ios_config:
+    lines:
+      - set transform-set {{ transform_set_name }}
+      - set ikev2-profile IKEV2-PROF
+    parents: crypto ipsec profile IPSEC-PROF
+
+- name: Configure S2S interesting traffic ACL
+  cisco.ios.ios_config:
+    lines: "{{ _s2s_acl_entries }}"
+    parents: ip access-list extended ACL-S2S
+
+- name: Configure crypto map
+  cisco.ios.ios_config:
+    lines:
+      - set peer {{ peer_ip }}
+      - set pfs {{ pfs_group }}
+      - set security-association lifetime seconds {{ sa_lifetime }}
+      - set ikev2-profile IKEV2-PROF
+      - set transform-set {{ transform_set_name }}
+      - match address ACL-S2S
+    parents: crypto map CMAP-S2S 10 ipsec-isakmp
+
+- name: Apply crypto map to {{ outside_interface }}
+  cisco.ios.ios_config:
+    lines:
+      - crypto map CMAP-S2S
+    parents: interface {{ outside_interface }}

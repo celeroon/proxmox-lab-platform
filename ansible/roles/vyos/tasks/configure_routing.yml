@@ -1,0 +1,17 @@
+---
+# Task: Configure routing on VyOS router
+# Variables:
+#   routing: Routing configuration
+#     default_route: "10.1.{USER_ID}.1"  # Dynamic: replaced with actual user_id
+
+- name: Configure default route
+  vyos.vyos.vyos_config:
+    lines:
+      - "set protocols static route 0.0.0.0/0 next-hop {{ routing.default_route }}"
+  vars:
+    ansible_command_timeout: 60
+  when: routing is defined and routing.default_route is defined
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes

@@ -1,0 +1,124 @@
+---
+# Task: Configure OVS VLAN switch (trunk uplink + access ports + optional SPAN mirror + optional SVIs)
+# Variables:
+#   bridge_name: OVS bridge name (default: br-ot)
+#   trunk_port: interface name for router uplink (carries 802.1Q-tagged VLANs)
+#   trunk_vlans: list of VLAN IDs on the trunk (e.g. [10, 20, 30, 40, 50, 60, 100])
+#   access_ports: list of {name, tag} for end-device access ports
+#   mirror_output: interface for SPAN output — promiscuous, no VLAN tag (optional)
+#   mirror_vlans: list of VLAN IDs to mirror; mirrors all traffic if omitted (optional)
+#   svi_interfaces: list of {name, tag, address} — OVS internal ports with IP (optional)
+#                   e.g. [{name: svi100, tag: 100, address: 192.168.100.253/24}]
+#
+# Port model:
+#   trunk_port     → 802.1Q trunk to router (all VLANs)
+#   access_ports   → untagged access, internally tagged inside OVS
+#   mirror_output  → receives copies of selected/all traffic (no IP, promiscuous capture)
+#   svi_interfaces → OVS internal ports (type=internal), act as switch management IPs per VLAN
+#
+# OVS bridge/port/mirror config persists in /etc/openvswitch/conf.db across reboots.
+# ovs-iface-up.service handles ip link set + ip addr add for all ports at boot.
+
+- name: Install Open vSwitch
+  apt:
+    name: openvswitch-switch
+    state: present
+    update_cache: yes
+
+- name: Enable and start Open vSwitch service
+  systemd:
+    name: openvswitch-switch
+    enabled: yes
+    state: started
+
+- name: Create OVS bridge
+  command: ovs-vsctl --may-exist add-br {{ bridge_name | default('br-ot') }}
+  changed_when: false
+
+- name: Add trunk uplink port (carries all OT VLANs tagged)
+  command: >
+    ovs-vsctl --may-exist add-port {{ bridge_name | default('br-ot') }} {{ trunk_port }}
+    -- set port {{ trunk_port }} trunks={{ trunk_vlans | join(',') }}
+  changed_when: false
+
+- name: Add access ports (untagged ingress, internally tagged in OVS)
+  command: >
+    ovs-vsctl --may-exist add-port {{ bridge_name | default('br-ot') }} {{ item.name }}
+    -- set port {{ item.name }} tag={{ item.tag }}
+  loop: "{{ access_ports | default([]) }}"
+  changed_when: false
+
+- name: Add SVI internal ports (OVS layer-3 management interface per VLAN)
+  command: >
+    ovs-vsctl --may-exist add-port {{ bridge_name | default('br-ot') }} {{ item.name }}
+    -- set Interface {{ item.name }} type=internal
+    -- set Port {{ item.name }} tag={{ item.tag }}
+  loop: "{{ svi_interfaces | default([]) }}"
+  changed_when: false
+
+- name: Add mirror output port (no VLAN tag — promiscuous)
+  command: ovs-vsctl --may-exist add-port {{ bridge_name | default('br-ot') }} {{ mirror_output }}
+  changed_when: false
+  when: mirror_output is defined
+
+- name: Bring up bridge member interfaces
+  command: ip link set {{ item }} up
+  changed_when: false
+  loop: >-
+    {{ [trunk_port]
+       + (access_ports | default([]) | map(attribute='name') | list)
+       + (svi_interfaces | default([]) | map(attribute='name') | list)
+       + ([mirror_output] if mirror_output is defined else []) }}
+
+- name: Bring up OVS bridge
+  command: ip link set {{ bridge_name | default('br-ot') }} up
+  changed_when: false
+
+- name: Assign IP addresses to SVI interfaces
+  shell: |
+    if ! ip addr show dev {{ item.name }} | grep -q "{{ item.address }}"; then
+      ip addr add {{ item.address }} dev {{ item.name }}
+    fi
+  loop: "{{ svi_interfaces | default([]) }}"
+  changed_when: false
+
+- name: Configure SPAN mirror on bridge
+  shell: |
+    bridge="{{ bridge_name | default('br-ot') }}"
+    existing=$(ovs-vsctl get Bridge "$bridge" mirrors 2>/dev/null || echo "[]")
+    if [ "$existing" != "[]" ]; then
+      echo "Mirror already configured, skipping"
+      exit 0
+    fi
+    {% if mirror_vlans is defined %}
+    ovs-vsctl \
+      -- --id=@out get port {{ mirror_output }} \
+      -- --id=@m create Mirror name=span \
+         select-vlan={{ mirror_vlans | join(',') }} \
+         output-port=@out \
+      -- set Bridge "$bridge" mirrors=@m
+    {% else %}
+    ovs-vsctl \
+      -- --id=@out get port {{ mirror_output }} \
+      -- --id=@m create Mirror name=span \
+         select-all=true \
+         output-port=@out \
+      -- set Bridge "$bridge" mirrors=@m
+    {% endif %}
+  changed_when: false
+  when: mirror_output is defined
+
+- name: Write systemd service to restore interface up-state on reboot
+  template:
+    src: "{{ lab_ansible_dir }}/roles/ovs/templates/ovs-iface-up.service.j2"
+    dest: /etc/systemd/system/ovs-iface-up.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable ovs-iface-up service
+  systemd:
+    name: ovs-iface-up.service
+    enabled: yes
+    daemon_reload: yes
+    state: started

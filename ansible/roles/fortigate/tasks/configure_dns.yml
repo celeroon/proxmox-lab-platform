@@ -1,0 +1,44 @@
+---
+# Task: Configure DNS databases and DNS servers on FortiGate
+# Variables:
+#   dns_databases: List of DNS database zones
+#     - name: "lab"
+#       status: "enable"
+#       domain: "lab.local"
+#       type: "primary"
+#       view: "shadow"
+#       ttl: 86400
+#       authoritative: "enable"
+#       source_ip: "0.0.0.0"
+#       primary_name: "dns"
+#       contact: "host"
+#       dns_entry: [...]
+#   dns_servers: List of DNS server configurations for interfaces
+#     - name: "vlan10"
+#       mode: "recursive"
+#       doh: "disable"
+
+- name: Configure DNS database zones
+  fortinet.fortios.fortios_system_dns_database:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    system_dns_database: "{{ item }}"
+  loop: "{{ dns_databases | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result
+
+- name: Configure DNS server for interfaces
+  fortinet.fortios.fortios_system_dns_server:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    system_dns_server:
+      name: "{{ item.name }}"
+      mode: "{{ item.mode | default('recursive') }}"
+      doh: "{{ item.doh | default('disable') }}"
+  loop: "{{ dns_servers | default([]) }}"
+  retries: 5
+  delay: 10
+  until: result is success
+  register: result

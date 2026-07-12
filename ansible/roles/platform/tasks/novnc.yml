@@ -1,0 +1,67 @@
+---
+- name: Install nginx and novnc
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - novnc
+      - openssl
+    state: present
+    update_cache: true
+  tags: novnc
+
+- name: Create nginx SSL directory
+  ansible.builtin.file:
+    path: /etc/nginx/ssl
+    state: directory
+    mode: "0750"
+    owner: root
+    group: www-data
+  tags: novnc
+
+- name: Generate self-signed TLS certificate
+  ansible.builtin.command:
+    cmd: >
+      openssl req -x509 -newkey rsa:4096
+      -keyout /etc/nginx/ssl/novnc.key
+      -out /etc/nginx/ssl/novnc.crt
+      -days 3650 -nodes
+      -subj "/CN={{ ansible_default_ipv4.address }}"
+    creates: /etc/nginx/ssl/novnc.crt
+  tags: novnc
+
+- name: Set WEB_URL in .env
+  ansible.builtin.lineinfile:
+    path: "{{ project_dir }}/.env"
+    regexp: '^WEB_URL='
+    line: "WEB_URL=https://{{ ansible_default_ipv4.address }}"
+  tags: novnc
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+  tags: novnc
+
+- name: Deploy novnc nginx config
+  ansible.builtin.template:
+    src: novnc-nginx.conf.j2
+    dest: /etc/nginx/sites-available/novnc
+    mode: "0644"
+  notify: reload nginx
+  tags: novnc
+
+- name: Enable novnc nginx site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/novnc
+    dest: /etc/nginx/sites-enabled/novnc
+    state: link
+  notify: reload nginx
+  tags: novnc
+
+- name: Enable and start nginx
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started
+  tags: novnc

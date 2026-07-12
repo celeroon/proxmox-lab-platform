@@ -1,0 +1,55 @@
+---
+# Bring Malcolm's docker compose stack back up automatically after every boot.
+#
+# Confirmed live 2026-07-05: Malcolm's own docker-compose.yml sets
+# `restart: "no"` on every service (a deliberate upstream default, not
+# something to patch — likely so Malcolm's own control.py/upgrade scripts
+# manage restarts explicitly rather than fighting Docker's own restart
+# policy). This means NOTHING brings the stack back up after a plain VM
+# reboot: `docker.service` itself starts fine, but with restart policy "no"
+# on every container, none of the ~27 Malcolm services are ever
+# auto-restarted by Docker. Confirmed via a real `sudo reboot` test: every
+# container showed `Exited (143)` (SIGTERM, from the graceful VM shutdown
+# sequence) and never came back — no OpenSearch, no Zeek, no Dashboards, no
+# detection capability at all until someone manually ran `docker compose up
+# -d`. This is a much bigger gap than the OpenSearch Alerting scheduler delay
+# or the SPAN mirror bug found earlier the same day — those degrade
+# detection; this removes it entirely.
+#
+# Fix: a plain systemd oneshot service (matching the existing
+# malcolm-span-tunnel.service pattern in configure_gretap_span.yml) that
+# runs `docker compose --profile malcolm up -d` after `docker.service` is
+# up. Deliberately has no ExecStop — stopping/restarting this unit should
+# not imply "tear down all of Malcolm," unlike malcolm-span-tunnel.service's
+# gretap interface (which really should go away on stop).
+#
+# Variables:
+#   malcolm_dir: Malcolm install directory (default: /opt/malcolm)
+
+- name: Install malcolm-docker-autostart systemd service
+  copy:
+    dest: /etc/systemd/system/malcolm-docker-autostart.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Start Malcolm docker compose stack (restart: "no" on every container means nothing else does this)
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory={{ malcolm_dir | default('/opt/malcolm') }}
+      ExecStart=/usr/bin/docker compose --profile malcolm up -d
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start malcolm-docker-autostart service
+  systemd:
+    name: malcolm-docker-autostart.service
+    enabled: yes
+    state: started
+    daemon_reload: yes

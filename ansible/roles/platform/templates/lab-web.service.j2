@@ -1,0 +1,15 @@
+[Unit]
+Description=Lab Platform web service (console redirect)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{ project_dir }}
+EnvironmentFile={{ project_dir }}/.env
+ExecStart={{ project_dir }}/.venv/bin/uvicorn lab.web:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

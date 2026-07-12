@@ -1,0 +1,59 @@
+---
+# Task: Configure NetFlow export for OVS switch
+# Variables:
+#   collector_ip: NetFlow collector IP address
+#   collector_port: NetFlow collector port (default: 2055)
+#   version: NetFlow version (default: 9)
+#   monitored_interfaces: List of interfaces to monitor (e.g., ["eth1", "eth2", ...])
+#   flow_timeouts: {maxlife, tcp, udp, icmp} timeout values
+
+- name: Verify NetFlow VLAN interface exists
+  command: ip addr show vlan{{ netflow.vlan.id }}
+  register: vlan_check
+  changed_when: false
+  failed_when: false
+  when: netflow is defined and netflow.vlan is defined
+
+- name: Fail if NetFlow VLAN interface does not exist
+  fail:
+    msg: "NetFlow VLAN interface vlan{{ netflow.vlan.id }} does not exist. Ensure configure_ovs_switch task has been run first."
+  when:
+    - netflow is defined
+    - netflow.vlan is defined
+    - vlan_check.rc != 0
+
+- name: Create systemd service template file for NetFlow
+  template:
+    src: "{{ playbook_dir }}/../roles/global/ovs/templates/softflowd@.service.j2"
+    dest: /etc/systemd/system/softflowd@.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Enable and start NetFlow service for each monitored interface
+  systemd:
+    name: "softflowd@{{ item }}.service"
+    enabled: yes
+    state: started
+  loop: "{{ monitored_interfaces }}"
+
+- name: Verify collector reachability
+  command: ping -c 1 -W 2 {{ collector_ip }}
+  register: ping_result
+  changed_when: false
+  failed_when: false
+
+- name: Warn if collector is not reachable
+  debug:
+    msg: "Warning: NetFlow collector {{ collector_ip }} is not reachable. NetFlow export may not work."
+  when: ping_result.rc != 0
+
+- name: Restart networking service (after all configuration is complete)
+  systemd:
+    name: networking
+    state: restarted
+  ignore_errors: yes

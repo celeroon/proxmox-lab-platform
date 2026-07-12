@@ -1,0 +1,77 @@
+---
+# Install Docker and Docker Compose on Linux VMs
+# Reusable task for all Linux VMs
+
+- name: Download Docker installation script
+  get_url:
+    url: https://get.docker.com
+    dest: /tmp/get-docker.sh
+    mode: '0755'
+
+- name: Run Docker installation script
+  command: sh /tmp/get-docker.sh
+  become: yes
+  args:
+    creates: /usr/bin/docker
+
+- name: Remove Docker installation script
+  file:
+    path: /tmp/get-docker.sh
+    state: absent
+
+- name: Verify Docker installation
+  command: docker --version
+  register: docker_version_output
+  changed_when: false
+
+- name: Display Docker version
+  debug:
+    msg: "{{ docker_version_output.stdout }}"
+
+- name: Get latest Docker Compose version from GitHub API
+  uri:
+    url: https://api.github.com/repos/docker/compose/releases/latest
+    return_content: yes
+  register: docker_compose_release
+  changed_when: false
+
+- name: Set Docker Compose version
+  set_fact:
+    docker_compose_version: "{{ docker_compose_release.json.tag_name }}"
+
+- name: Download Docker Compose binary
+  get_url:
+    url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-x86_64"
+    dest: /usr/local/bin/docker-compose
+    mode: '0755'
+  become: yes
+
+- name: Create symlink for docker-compose
+  file:
+    src: /usr/local/bin/docker-compose
+    dest: /usr/bin/docker-compose
+    state: link
+  become: yes
+
+- name: Verify Docker Compose installation
+  command: docker-compose --version
+  register: docker_compose_version_output
+  changed_when: false
+
+- name: Display Docker Compose version
+  debug:
+    msg: "{{ docker_compose_version_output.stdout }}"
+
+- name: Add user to docker group
+  user:
+    name: "{{ ansible_user | default('vagrant') }}"
+    groups: docker
+    append: yes
+  become: yes
+
+# The persistent SSH connection for this play was established before the group
+# change above, so group membership is stale until a fresh login happens. Without
+# this, any later task that runs docker as the connecting user (become: false)
+# fails with a permission error on /var/run/docker.sock.
+- name: Reset connection to pick up new docker group membership
+  meta: reset_connection

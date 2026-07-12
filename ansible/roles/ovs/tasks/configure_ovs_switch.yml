@@ -1,0 +1,55 @@
+---
+# Task: Configure OVS switch with bridge, ports, VLANs, and SVI interfaces
+# Variables:
+#   bridge_name: Bridge name (e.g., "br0")
+#   management_interface: {name, address, netmask}
+#   bridge_ports: List of port configs {name, type, trunks/tag}
+#   svi_interfaces: List of SVI configs {name, tag, address, netmask}
+#   netflow: Optional NetFlow configuration {enabled, vlan: {id, ip, netmask}}
+
+# Install all required software at the beginning
+- name: Install Open vSwitch
+  apt:
+    name: openvswitch-switch
+    state: present
+    update_cache: yes
+
+- name: Install softflowd package (for NetFlow export)
+  apt:
+    name: softflowd
+    state: present
+    update_cache: yes
+
+- name: Enable and start Open vSwitch service
+  systemd:
+    name: openvswitch-switch
+    enabled: yes
+    state: started
+
+- name: Auto-add NetFlow VLAN to svi_interfaces if NetFlow is enabled
+  set_fact:
+    svi_interfaces: "{{ svi_interfaces | default([]) + [{
+      'name': 'vlan' + (netflow.vlan.id | string),
+      'tag': netflow.vlan.id,
+      'address': netflow.vlan.ip,
+      'netmask': netflow.vlan.netmask
+    }] }}"
+  when:
+    - netflow is defined
+    - netflow.enabled | default(false) | bool
+    - netflow.vlan is defined
+
+- name: Generate /etc/network/interfaces from template
+  template:
+    src: "{{ playbook_dir }}/../roles/global/ovs/templates/interfaces.j2"
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: '0644'
+    backup: yes
+
+- name: Restart networking service (apply OVS bridge and port configuration)
+  systemd:
+    name: networking
+    state: restarted
+  ignore_errors: yes

@@ -1,0 +1,39 @@
+{% set ns = namespace(mgmt='') %}
+{% for iface_name in ansible_interfaces | sort %}
+{%   if iface_name != 'lo' %}
+{%     set key = 'ansible_' + iface_name | replace('-', '_') %}
+{%     if vars[key] is defined and vars[key].ipv4 is defined %}
+{%       if vars[key].ipv4.address == ansible_host %}
+{%         set ns.mgmt = iface_name %}
+{%       endif %}
+{%     endif %}
+{%   endif %}
+{% endfor %}
+{% set mgmt_if = ns.mgmt if ns.mgmt else ansible_default_ipv4.interface %}
+{% set lab_if = lab_interface | default(ansible_interfaces | reject('match', '^(docker|veth|br-)') | difference([mgmt_if, 'lo']) | sort | first) %}
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    {{ mgmt_if }}:
+      dhcp4: false
+      addresses:
+        - {{ ansible_host }}/16
+{% if lab_ip is defined %}
+    {{ lab_if }}:
+      dhcp4: false
+      addresses:
+        - {{ lab_ip }}/{{ lab_prefix | default(24) }}
+{% if lab_gateway is defined %}
+      routes:
+        - to: default
+          via: {{ lab_gateway }}
+{% endif %}
+{% if lab_dns is defined %}
+      nameservers:
+        addresses: [{{ lab_dns }}]
+{% endif %}
+{% else %}
+    {{ lab_if }}:
+      dhcp4: true
+{% endif %}

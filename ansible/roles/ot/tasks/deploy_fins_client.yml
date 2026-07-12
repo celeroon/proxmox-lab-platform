@@ -1,0 +1,88 @@
+---
+# Deploy the FINS HMI (client) simulator as a systemd service.
+#
+# Variables:
+#   server_ip:           IP of the fins-server to connect to (required)
+#   fins_port:           TCP port to connect to (default: 9600)
+#   poll_seconds:        How often to poll (default: 3.0)
+#   external_probe_ip:   Optional — VyOS loopback (e.g. 9.9.9.9) to periodically
+#                        probe with a real FINS read, for the "ICS/IoT External
+#                        Traffic" dashboard panel. Requires a matching
+#                        vyos/configure_external_traffic_redirect hairpin rule.
+
+- name: Install python3-full and python3-venv
+  apt:
+    name: [python3, python3-full, python3-venv]
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Create /opt/fins directory
+  file:
+    path: /opt/fins
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create Python venv
+  command: python3 -m venv /opt/fins/venv
+  args:
+    creates: /opt/fins/venv/bin/python3
+  become: true
+
+- name: Install rich into venv
+  pip:
+    name:
+      - rich
+    virtualenv: /opt/fins/venv
+  become: true
+
+- name: Copy fins simulation files
+  copy:
+    src: fins/
+    dest: /opt/fins/
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  # copies fins_logic.py, fins_protocol.py, fins_server.py, fins_client.py,
+  # fins_tui_common.py, fins_server_tui.py, fins_client_tui.py -- run the
+  # *_tui.py scripts manually over SSH for a live htop-style status view
+  # (/opt/fins/venv/bin/python3 /opt/fins/fins_client_tui.py)
+
+- name: Install fins-client systemd service
+  copy:
+    dest: /etc/systemd/system/fins-client.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=FINS Client (HMI simulator)
+      After=network.target
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/opt/fins/venv/bin/python3 /opt/fins/fins_client.py \
+        --host {{ server_ip }} \
+        --port {{ fins_port | default(9600) }} \
+        --poll-seconds {{ poll_seconds | default(3.0) }} \
+        --log-file /var/log/fins-client.log{{ ' --external-probe-ip ' + external_probe_ip if external_probe_ip is defined else '' }}
+      Restart=always
+      RestartSec=5
+      WorkingDirectory=/opt/fins
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start fins-client
+  systemd:
+    name: fins-client
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: true

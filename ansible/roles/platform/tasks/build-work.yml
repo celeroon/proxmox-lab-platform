@@ -1,0 +1,9 @@
+---
+- name: Create build-work directory
+  ansible.builtin.file:
+    path: /var/lib/lab-platform/build-work
+    state: directory
+    mode: "0755"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+  tags: build_work

@@ -1,0 +1,208 @@
+---
+# Create Linux agent policy with System, Elastic Defend, and Network Traffic integrations.
+# Idempotent: skips all steps if linux-policy already exists.
+#
+# Required vars:
+#   elk_password - elastic superuser password
+
+- name: Check if linux-policy already exists
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies/linux-policy"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 404]
+  register: linux_policy_check
+  no_log: true
+
+- name: Get installed package versions
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/epm/packages/{{ item }}"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: 200
+  register: linux_pkg_versions
+  loop: [system, endpoint, network_traffic, linux]
+  no_log: true
+  when: linux_policy_check.status == 404
+
+- name: Extract package versions
+  set_fact:
+    lin_pkg_system: "{{ linux_pkg_versions.results[0].json.item.version }}"
+    lin_pkg_endpoint: "{{ linux_pkg_versions.results[1].json.item.version }}"
+    lin_pkg_nettraffic: "{{ linux_pkg_versions.results[2].json.item.version }}"
+    lin_pkg_linux: "{{ linux_pkg_versions.results[3].json.item.version }}"
+  when: linux_policy_check.status == 404
+
+- name: Create Linux agent policy
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/agent_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      id: linux-policy
+      name: Linux-Policy
+      namespace: default
+      monitoring_enabled: [logs, metrics]
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: linux_policy_check.status == 404
+
+- name: Add System integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: system-linux
+      namespace: default
+      policy_id: linux-policy
+      package:
+        name: system
+        version: "{{ lin_pkg_system }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: linux_policy_check.status == 404
+
+- name: Add Elastic Defend integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    timeout: 120
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: endpoint-linux
+      namespace: default
+      description: ""
+      enabled: true
+      policy_id: linux-policy
+      policy_ids: [linux-policy]
+      package:
+        name: endpoint
+        title: Elastic Defend
+        version: "{{ lin_pkg_endpoint }}"
+        requires_root: true
+      inputs:
+        - type: endpoint
+          enabled: true
+          config:
+            integration_config:
+              value:
+                type: endpoint
+                endpointConfig:
+                  preset: DataCollection
+            policy:
+              value:
+                windows:
+                  events:
+                    credential_access: true
+                    dll_and_driver_load: true
+                    dns: true
+                    file: true
+                    network: true
+                    process: true
+                    registry: true
+                    security: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+                mac:
+                  events:
+                    process: true
+                    file: true
+                    network: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+                linux:
+                  events:
+                    process: true
+                    file: true
+                    network: true
+                    session_data: true
+                  malware:
+                    mode: detect
+                    blocklist: true
+                  logging:
+                    file: info
+          streams: []
+      vars: {}
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: linux_policy_check.status == 404
+
+- name: Add Linux integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: linux-1
+      namespace: default
+      policy_id: linux-policy
+      package:
+        name: linux
+        version: "{{ lin_pkg_linux }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: linux_policy_check.status == 404
+
+- name: Add Network Traffic integration
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: network_traffic-linux
+      namespace: default
+      policy_id: linux-policy
+      package:
+        name: network_traffic
+        version: "{{ lin_pkg_nettraffic }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: linux_policy_check.status == 404

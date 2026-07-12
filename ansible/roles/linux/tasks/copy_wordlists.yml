@@ -1,0 +1,28 @@
+---
+# Task: Copy wordlists (users.txt, passwords.txt) to user Desktop
+# Variables:
+#   wordlist_dest_user: target user home directory name (default: vagrant)
+
+- name: Ensure Desktop directory exists
+  ansible.builtin.file:
+    path: "/home/{{ wordlist_dest_user | default('vagrant') }}/Desktop"
+    state: directory
+    owner: "{{ wordlist_dest_user | default('vagrant') }}"
+    group: "{{ wordlist_dest_user | default('vagrant') }}"
+    mode: "0755"
+
+- name: Copy users.txt to Desktop
+  ansible.builtin.copy:
+    src: "{{ lab_ansible_dir }}/roles/global/linux/files/users.txt"
+    dest: "/home/{{ wordlist_dest_user | default('vagrant') }}/Desktop/users.txt"
+    owner: "{{ wordlist_dest_user | default('vagrant') }}"
+    group: "{{ wordlist_dest_user | default('vagrant') }}"
+    mode: "0644"
+
+- name: Copy passwords.txt to Desktop
+  ansible.builtin.copy:
+    src: "{{ lab_ansible_dir }}/roles/global/linux/files/passwords.txt"
+    dest: "/home/{{ wordlist_dest_user | default('vagrant') }}/Desktop/passwords.txt"
+    owner: "{{ wordlist_dest_user | default('vagrant') }}"
+    group: "{{ wordlist_dest_user | default('vagrant') }}"
+    mode: "0644"

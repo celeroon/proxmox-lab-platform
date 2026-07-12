@@ -1,0 +1,340 @@
+---
+# Configure OpenSearch Alerting + a Dashboards summary dashboard for detecting
+# unauthorized BACnet master traffic (any source other than the legitimate
+# supervisory BAS talking to the bacnet-server). Mirrors
+# configure_s7comm_alerting.yml / configure_malcolm_alerting.yml exactly — same
+# idempotency model, same scheduler-toggle-then-delete-recreate approach, same
+# Dashboards saved-objects pattern. See configure_malcolm_alerting.yml's header
+# comment for the full rationale; only the BACnet-specific differences are
+# called out here.
+#
+# Reuses the SAME Dashboards index-pattern object ("modbus-alerting-index-pattern")
+# as the Modbus/S7comm alerting dashboards, since all three point at the same
+# underlying shared OpenSearch Alerting system index (.opendistro-alerting-alert*)
+# — there is only ever one such index cluster-wide, regardless of how many
+# protocols have their own monitors. Each protocol's dashboard visualizations
+# instead filter by monitor_name so alerts from other protocols' monitors don't
+# bleed into each other's panels.
+#
+# Detection query deliberately does NOT filter by specific BACnet service —
+# same reasoning as Modbus/S7comm: ANY BACnet session reaching the server from
+# a source other than the known supervisory BAS is inherently suspicious on
+# this flat point-to-point VLAN, there's no legitimate reason for another host
+# to be talking BACnet to this RTU at all.
+#
+# CRITICAL: the query filter MUST include network.is_orig: "T", unlike
+# Modbus/S7comm's equivalent monitors. Found live 2026-07-04: every single
+# alert this monitor ever fired (100% of them) attributed the BACnet SERVER's
+# own IP as the "attacker" — never a real attacker. Root cause: BACnet/IP is
+# UDP, and both the real BAS and the RTU use the SAME port (47808) in both
+# directions, unlike Modbus/S7comm's TCP sessions where the server's response
+# packets have the client's random ephemeral port as their destination (never
+# matching `destination.port: 502/102`, so response-direction documents are
+# naturally excluded from those monitors without needing an explicit filter
+# for it). For BACnet, a single client<->server "session" (grouped by
+# zeek.uid) contains hundreds of individual request/response log documents
+# with source.ip ALTERNATING between the client (is_orig:T) and the server
+# itself (is_orig:F) — and since only bacnet_client_ip/bacnet_router_ip were
+# excluded from `must_not`, never the server's own IP, the server's response
+# documents passed the filter untouched and dominated the attacker_ip
+# sub-aggregation. Adding `network.is_orig: "T"` restricts the whole query to
+# request-direction documents only, which is what "who initiated this" always
+# means regardless of protocol. Confirmed live: with this filter, only kali's
+# real attack traffic (192.168.100.10) matches; the legitimate
+# bacnet-client<->bacnet-server chatter disappears entirely.
+#
+# CORRECTED 2026-07-05: `is_orig:T` alone is NOT sufficient — found a second,
+# separate false-positive still attributing the server's own IP as attacker.
+# Root cause: BACnet devices periodically send unsolicited "i_am" broadcast
+# announcements (real, benign protocol behavior). Zeek assigns is_orig based
+# on whichever host sent the FIRST packet of a given UDP flow bucket
+# (zeek.uid) and keeps that assignment fixed for the flow's entire lifetime
+# — if an i_am broadcast from the server happens to start a long-lived
+# bucket that legitimate client<->server request/response traffic continues
+# to share afterward, EVERY document in that bucket (including genuinely
+# client-initiated requests logged under it) inherits is_orig:T with
+# source.ip = the server, since that's who started the bucket, not who sent
+# any individual later packet. Confirmed live: one such bucket persisted for
+# nearly an hour, continuously re-triggering the monitor with attacker_ip =
+# the server's own address. Fixed by also excluding the server's own known
+# IP in `must_not` — since we know it in this static lab topology, and
+# traffic FROM the server can never legitimately mean "an unauthorized
+# master talking to the server" (it would be the same device).
+#
+# Variables:
+#   malcolm_dir:              Malcolm install directory       (default: /opt/malcolm)
+#   malcolm_admin_user:       Dashboards/OpenSearch admin user (default: admin)
+#   malcolm_admin_password:   Dashboards/OpenSearch admin pass (default: vagrant)
+#   bacnet_client_ip:         Legitimate BACnet supervisory BAS to exclude
+#                             from detection (default: 192.168.50.20)
+#   bacnet_router_ip:         vyos-1's gateway IP on the BACnet VLAN, ALSO excluded —
+#                             this is the source IP of the legitimate hairpin traffic
+#                             from vyos/configure_external_traffic_redirect (the
+#                             "ICS/IoT External Traffic" probe's return-path masquerade),
+#                             not a real master. Same exclusion Modbus/S7comm needed
+#                             for the same reason. (default: 192.168.50.1)
+#   bacnet_server_ip:         The bacnet-server's own IP, ALSO excluded — see the
+#                             "CORRECTED 2026-07-05" note above: unsolicited i_am
+#                             broadcasts can make legitimate client traffic inherit
+#                             the server's own IP as source.ip for is_orig:T
+#                             purposes. (default: 192.168.50.10)
+#   bacnet_server_port:       BACnet server port                (default: 47808)
+
+- name: Write configure-bacnet-alerting.sh script
+  copy:
+    dest: /usr/local/sbin/configure-bacnet-alerting.sh
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      set -e
+      cd {{ malcolm_dir | default('/opt/malcolm') }}
+
+      OS_CERT=/usr/share/opensearch/config/certs/admin.crt
+      OS_KEY=/usr/share/opensearch/config/certs/admin.key
+      DASH_AUTH="{{ malcolm_admin_user | default('admin') }}:{{ malcolm_admin_password | default('vagrant') }}"
+      CLIENT_IP="{{ bacnet_client_ip | default('192.168.50.20') }}"
+      ROUTER_IP="{{ bacnet_router_ip | default('192.168.50.1') }}"
+      SERVER_IP="{{ bacnet_server_ip | default('192.168.50.10') }}"
+      BACNET_PORT="{{ bacnet_server_port | default(47808) }}"
+
+      # --- 1. OpenSearch Alerting monitor ---
+      # Always delete-then-recreate — see configure_malcolm_alerting.yml's header
+      # comment for why a mere toggle isn't reliable enough on its own.
+      EXISTING_ID=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        "https://localhost:9200/_plugins/_alerting/monitors/_search" -H "Content-Type: application/json" \
+        -d '{"query":{"term":{"monitor.name.keyword":"Unauthorized BACnet Master (non-BAS source)"}}}' \
+        | python3 -c "
+      import json, sys
+      hits = json.load(sys.stdin)['hits']['hits']
+      print(hits[0]['_id'] if hits else '')
+      ")
+
+      if [ -n "$EXISTING_ID" ]; then
+        echo "Removing existing monitor $EXISTING_ID before recreating..."
+        docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+          -X DELETE "https://localhost:9200/_plugins/_alerting/monitors/${EXISTING_ID}" > /dev/null
+      fi
+
+      echo "Creating Unauthorized BACnet Master monitor..."
+      MONITOR_RESPONSE=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X POST "https://localhost:9200/_plugins/_alerting/monitors" -H "Content-Type: application/json" \
+        -d @- <<'EOF'
+      {
+        "type": "monitor",
+        "name": "Unauthorized BACnet Master (non-BAS source)",
+        "monitor_type": "bucket_level_monitor",
+        "enabled": true,
+        "schedule": { "period": { "interval": 1, "unit": "MINUTES" } },
+        "inputs": [{
+          "search": {
+            "indices": ["arkime_sessions3-*"],
+            "query": {
+              "size": 0,
+              "query": {
+                "bool": {
+                  "filter": [
+                    { "term": { "destination.port": {{ bacnet_server_port | default(47808) }} } },
+                    { "term": { "network.protocol": "bacnet" } },
+                    { "term": { "network.is_orig": "T" } },
+                    { "range": { "firstPacket": { "gte": "{{ '{{' }}period_end{{ '}}' }}||-2m", "lte": "{{ '{{' }}period_end{{ '}}' }}", "format": "epoch_millis" } } }
+                  ],
+                  "must_not": [
+                    { "term": { "source.ip": "{{ bacnet_client_ip | default('192.168.50.20') }}" } },
+                    { "term": { "source.ip": "{{ bacnet_router_ip | default('192.168.50.1') }}" } },
+                    { "term": { "source.ip": "{{ bacnet_server_ip | default('192.168.50.10') }}" } }
+                  ]
+                }
+              },
+              "aggregations": {
+                "sessions": {
+                  "terms": { "field": "zeek.uid", "size": 1000 },
+                  "aggregations": {
+                    "attacker_ip": { "terms": { "field": "source.ip", "size": 1 } },
+                    "function_codes": { "terms": { "field": "event.action", "size": 20 } }
+                  }
+                }
+              }
+            }
+          }
+        }],
+        "triggers": [{
+          "bucket_level_trigger": {
+            "name": "New unauthorized BACnet session",
+            "severity": "3",
+            "condition": {
+              "buckets_path": { "_count": "_count" },
+              "parent_bucket_path": "sessions",
+              "script": { "source": "params._count >= 1", "lang": "painless" }
+            },
+            "actions": []
+          }
+        }]
+      }
+      EOF
+        )
+      MONITOR_ID=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_id'])")
+      SEQ_NO=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])")
+      PRIMARY_TERM=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])")
+      MONITOR_BODY=$(echo "$MONITOR_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['monitor']))")
+      echo "Created monitor $MONITOR_ID"
+
+      # Toggle disable/enable to force scheduler registration — see
+      # configure_malcolm_alerting.yml for why this is needed.
+      DISABLED_BODY=$(echo "$MONITOR_BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); d['enabled']=False; print(json.dumps(d))")
+      DISABLE_RESPONSE=$(docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X PUT "https://localhost:9200/_plugins/_alerting/monitors/${MONITOR_ID}?if_seq_no=${SEQ_NO}&if_primary_term=${PRIMARY_TERM}" \
+        -H "Content-Type: application/json" -d "$DISABLED_BODY")
+      NEW_SEQ_NO=$(echo "$DISABLE_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_seq_no'])")
+      NEW_PRIMARY_TERM=$(echo "$DISABLE_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['_primary_term'])")
+      ENABLED_BODY=$(echo "$MONITOR_BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); d['enabled']=True; print(json.dumps(d))")
+      docker compose --profile malcolm exec -T opensearch curl -sk --cert "$OS_CERT" --key "$OS_KEY" \
+        -X PUT "https://localhost:9200/_plugins/_alerting/monitors/${MONITOR_ID}?if_seq_no=${NEW_SEQ_NO}&if_primary_term=${NEW_PRIMARY_TERM}" \
+        -H "Content-Type: application/json" -d "$ENABLED_BODY" > /dev/null
+      echo "Toggled monitor to force scheduler registration"
+
+      # --- 2. Dashboards saved objects ---
+      # Reuses the SAME shared alerting index pattern the Modbus/S7comm
+      # dashboards create ("modbus-alerting-index-pattern" — see this file's
+      # header comment for why). Deliberately does NOT (re)create it here: the
+      # scenario always runs linux/configure_malcolm_alerting before this
+      # task, and that script's index-pattern step also populates the
+      # 59-field schema cache via a follow-up PUT. Recreating the object here
+      # with a bare {title, timeFieldName} attrs payload (no `fields`) would
+      # blow away that cache and break every aggregation that depends on it
+      # — confirmed live 2026-07-04: caused "Could not locate that
+      # index-pattern-field" errors across the whole Modbus/S7comm dashboards
+      # too, since all three share this one object.
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/bacnet-alert-count-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "BACnet Alert Count",
+          "visState": "{\"title\":\"BACnet Alert Count\",\"type\":\"metric\",\"params\":{\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"\",\"fontSize\":60}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}}]}",
+          "uiStateJSON": "{}",
+          "description": "Total BACnet unauthorized-master alerts in the selected time range",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized BACnet Master (non-BAS source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alert count metric ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/bacnet-alerts-over-time-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "BACnet Alerts Over Time",
+          "visState": "{\"title\":\"BACnet Alerts Over Time\",\"type\":\"histogram\",\"params\":{\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"title\":{},\"scale\":{\"type\":\"linear\"},\"labels\":{\"show\":true,\"filter\":true,\"truncate\":100},\"style\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"title\":{\"text\":\"Alert Count\"},\"scale\":{\"type\":\"linear\",\"mode\":\"normal\"},\"labels\":{\"show\":true,\"rotate\":0,\"filter\":false,\"truncate\":100},\"style\":{}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"stacked\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"showCirclesOnLines\":true,\"lineWidth\":2}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"times\":[],\"addTimeMarker\":false},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"start_time\",\"timeRange\":{\"from\":\"now-24h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"interval\":\"auto\",\"drop_partials\":false,\"min_doc_count\":1,\"extended_bounds\":{}}}]}",
+          "uiStateJSON": "{}",
+          "description": "",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized BACnet Master (non-BAS source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alerts-over-time histogram ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/visualization/bacnet-alerts-by-attacker-viz?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "BACnet Alerts by Attacker IP",
+          "visState": "{\"title\":\"BACnet Alerts by Attacker IP\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"showTotal\":false,\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"agg_alert_content.bucket.attacker_ip.buckets.key.keyword\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}]}",
+          "uiStateJSON": "{}",
+          "description": "",
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized BACnet Master (non-BAS source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Alerts-by-attacker-IP table ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/search/bacnet-alerts-recent-search?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "BACnet Alerts - Recent",
+          "columns": ["start_time", "state", "severity", "trigger_name", "monitor_name"],
+          "sort": [["start_time", "desc"]],
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"monitor_name: \\\"Unauthorized BACnet Master (non-BAS source)\\\"\",\"language\":\"kuery\"},\"filter\":[],\"indexRefName\":\"kibanaSavedObjectMeta.searchSourceJSON.index\"}"
+          }
+        },
+        "references": [
+          {"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "modbus-alerting-index-pattern"}
+        ]
+      }
+      EOF
+      echo "Recent-alerts saved search ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/search/bacnet-raw-logs-search?overwrite=true" \
+        -d "{
+          \"attributes\": {
+            \"title\": \"BACnet Raw Logs - Unauthorized Master\",
+            \"columns\": [\"firstPacket\", \"source.ip\", \"destination.ip\", \"destination.port\", \"event.action\", \"zeek.uid\"],
+            \"sort\": [[\"firstPacket\", \"desc\"]],
+            \"kibanaSavedObjectMeta\": {
+              \"searchSourceJSON\": \"{\\\"query\\\":{\\\"query\\\":\\\"destination.port: ${BACNET_PORT} and network.protocol: \\\\\\\"bacnet\\\\\\\" and network.is_orig: \\\\\\\"T\\\\\\\" and not source.ip: \\\\\\\"${CLIENT_IP}\\\\\\\" and not source.ip: \\\\\\\"${ROUTER_IP}\\\\\\\" and not source.ip: \\\\\\\"${SERVER_IP}\\\\\\\"\\\",\\\"language\\\":\\\"kuery\\\"},\\\"filter\\\":[],\\\"indexRefName\\\":\\\"kibanaSavedObjectMeta.searchSourceJSON.index\\\"}\"
+            }
+          },
+          \"references\": [
+            {\"name\": \"kibanaSavedObjectMeta.searchSourceJSON.index\", \"type\": \"index-pattern\", \"id\": \"arkime_sessions3-*\"}
+          ]
+        }" > /dev/null
+      echo "Raw-logs saved search ready"
+
+      curl -sk -u "$DASH_AUTH" -H "osd-xsrf: true" -H "Content-Type: application/json" \
+        -X POST "https://localhost/dashboards/api/saved_objects/dashboard/bacnet-detection-overview-dashboard?overwrite=true" \
+        -d @- <<'EOF' > /dev/null
+      {
+        "attributes": {
+          "title": "BACnet Detection Overview",
+          "hits": 0,
+          "description": "Alerts and activity for the Unauthorized BACnet Master monitor",
+          "panelsJSON": "[{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":0,\"w\":12,\"h\":8,\"i\":\"1\"},\"panelIndex\":\"1\",\"embeddableConfig\":{},\"panelRefName\":\"panel_1\"},{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":12,\"y\":0,\"w\":36,\"h\":8,\"i\":\"2\"},\"panelIndex\":\"2\",\"embeddableConfig\":{},\"panelRefName\":\"panel_2\"},{\"version\":\"3.7.0\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":8,\"w\":24,\"h\":12,\"i\":\"3\"},\"panelIndex\":\"3\",\"embeddableConfig\":{},\"panelRefName\":\"panel_3\"},{\"version\":\"3.7.0\",\"type\":\"search\",\"gridData\":{\"x\":24,\"y\":8,\"w\":24,\"h\":12,\"i\":\"4\"},\"panelIndex\":\"4\",\"embeddableConfig\":{},\"panelRefName\":\"panel_4\"},{\"version\":\"3.7.0\",\"type\":\"search\",\"gridData\":{\"x\":0,\"y\":20,\"w\":48,\"h\":16,\"i\":\"5\"},\"panelIndex\":\"5\",\"embeddableConfig\":{},\"panelRefName\":\"panel_5\"}]",
+          "optionsJSON": "{\"useMargins\":true,\"syncColors\":false,\"hidePanelTitles\":false}",
+          "version": 1,
+          "timeRestore": false,
+          "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+          }
+        },
+        "references": [
+          {"name": "panel_1", "type": "visualization", "id": "bacnet-alert-count-viz"},
+          {"name": "panel_2", "type": "visualization", "id": "bacnet-alerts-over-time-viz"},
+          {"name": "panel_3", "type": "visualization", "id": "bacnet-alerts-by-attacker-viz"},
+          {"name": "panel_4", "type": "search", "id": "bacnet-alerts-recent-search"},
+          {"name": "panel_5", "type": "search", "id": "bacnet-raw-logs-search"}
+        ]
+      }
+      EOF
+      echo "BACnet Detection Overview dashboard ready"
+
+- name: Run configure-bacnet-alerting.sh
+  command: /usr/local/sbin/configure-bacnet-alerting.sh
+  register: _bacnet_alerting_result
+  changed_when: true
+
+- name: Show configure-bacnet-alerting.sh output
+  debug:
+    msg: "{{ _bacnet_alerting_result.stdout_lines }}"

@@ -1,0 +1,45 @@
+---
+# Install XFCE desktop environment with LightDM, configured for autologin.
+#
+# Optional vars:
+#   xfce_user - user to autologin (default: vagrant)
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  become: yes
+
+- name: Install XFCE desktop and LightDM
+  apt:
+    name:
+      - task-xfce-desktop
+      - lightdm
+      - lightdm-gtk-greeter
+    state: present
+  become: yes
+
+- name: Set default display manager to LightDM
+  copy:
+    content: "/usr/sbin/lightdm\n"
+    dest: /etc/X11/default-display-manager
+    mode: '0644'
+  become: yes
+
+- name: Configure LightDM autologin
+  copy:
+    content: |
+      [SeatDefaults]
+      autologin-user={{ xfce_user | default('vagrant') }}
+      autologin-user-timeout=0
+    dest: /etc/lightdm/lightdm.conf
+    mode: '0644'
+  become: yes
+
+- name: Enable and start LightDM
+  systemd:
+    name: lightdm
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes

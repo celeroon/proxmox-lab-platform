@@ -1,0 +1,960 @@
+version: 1
+name: OT Lab
+description: >
+  OT/ICS simulation lab: 8 protocol pairs (Modbus, S7comm, DNP3, OPC-UA, BACnet,
+  EtherNet/IP-CIP, FINS, PROFINET), each on its own VLAN, mirrored via an OVS switch
+  to Malcolm for ICS traffic analysis and ATT&CK-for-ICS detection.
+vm_prefix: ""
+
+networks:
+  - name: vyos-sw
+    type: vnet
+
+  - name: sw-modbus-client    # VLAN 10 on ot-switch
+    type: vnet
+  - name: sw-modbus-server    # VLAN 10 on ot-switch
+    type: vnet
+
+  - name: sw-malcolm-mgmt
+    type: vnet
+  - name: sw-malcolm-mirror
+    type: vnet
+
+  # One client/server VNet per protocol, each its own VLAN on ot-switch.
+  - name: sw-s7comm-client    # VLAN 20 on ot-switch
+    type: vnet
+  - name: sw-s7comm-server    # VLAN 20 on ot-switch
+    type: vnet
+
+  - name: sw-dnp3-client      # VLAN 30 on ot-switch
+    type: vnet
+  - name: sw-dnp3-server      # VLAN 30 on ot-switch
+    type: vnet
+
+  - name: sw-enip-client      # VLAN 40 on ot-switch
+    type: vnet
+  - name: sw-enip-server      # VLAN 40 on ot-switch
+    type: vnet
+
+  - name: sw-bacnet-client    # VLAN 50 on ot-switch
+    type: vnet
+  - name: sw-bacnet-server    # VLAN 50 on ot-switch
+    type: vnet
+
+  - name: sw-opcua-client     # VLAN 60 on ot-switch
+    type: vnet
+  - name: sw-opcua-server     # VLAN 60 on ot-switch
+    type: vnet
+
+  - name: sw-fins-client      # VLAN 70 on ot-switch
+    type: vnet
+  - name: sw-fins-server      # VLAN 70 on ot-switch
+    type: vnet
+
+  - name: sw-profinet-client  # VLAN 80 on ot-switch
+    type: vnet
+  - name: sw-profinet-server  # VLAN 80 on ot-switch
+    type: vnet
+
+  - name: sw-kali             # VLAN 100 (mgmt/test) — attacker on same VLAN as malcolm mgmt
+    type: vnet
+
+vms:
+  - name: vyos-1
+    template: vyos/current
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-sw
+    ansible:
+      connection:
+        type: network_cli
+        network_os: vyos
+        user: vyos
+        password: vyos
+      gather_facts: false
+      become: false
+      tasks:
+        - task: vyos/set_hostname
+          vars:
+            hostname: vyos-1
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - name: eth1
+                description: "To ot-switch (802.1Q trunk)"
+                vifs:
+                  - id: 10
+                    description: "Modbus VLAN"
+                    address: 192.168.10.1/24
+                  - id: 20
+                    description: "S7comm VLAN"
+                    address: 192.168.20.1/24
+                  - id: 30
+                    description: "DNP3 VLAN"
+                    address: 192.168.30.1/24
+                  - id: 40
+                    description: "EtherNet/IP-CIP VLAN"
+                    address: 192.168.40.1/24
+                  - id: 50
+                    description: "BACnet VLAN"
+                    address: 192.168.50.1/24
+                  - id: 60
+                    description: "OPC-UA VLAN"
+                    address: 192.168.60.1/24
+                  - id: 70
+                    description: "FINS VLAN"
+                    address: 192.168.70.1/24
+                  - id: 80
+                    description: "PROFINET VLAN (experimental)"
+                    address: 192.168.80.1/24
+                  - id: 100
+                    description: "Mgmt/test VLAN"
+                    address: 192.168.100.1/24
+        - task: vyos/configure_loopback
+          vars:
+            loopback_addresses:
+              - 9.9.9.9/32   # "fake internet" IP for Malcolm external-traffic demo
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - rule: 100
+                description: "OT/ICS + mgmt outbound NAT"
+                source: 192.168.0.0/16
+                outbound_interface: eth0
+                translation: masquerade
+        - task: vyos/configure_firewall_acl
+          vars:
+            network_groups:
+              - name: OT-VLANS
+                networks:
+                  - 192.168.10.0/24
+                  - 192.168.20.0/24
+                  - 192.168.30.0/24
+                  - 192.168.40.0/24
+                  - 192.168.50.0/24
+                  - 192.168.60.0/24
+                  - 192.168.70.0/24
+                  - 192.168.80.0/24
+            forward_filter:
+              default_action: accept
+              rules:
+                - rule: 10
+                  action: accept
+                  match_established: true
+                  match_related: true
+                - rule: 20
+                  action: accept
+                  source_address: 192.168.100.0/24    # mgmt/test → OT VLANs allowed
+                  destination_group: OT-VLANS
+                - rule: 100
+                  action: drop
+                  source_group: OT-VLANS              # OT → OT or OT → mgmt blocked
+                  destination_address: 192.168.0.0/16
+                  # Must be numbered above the per-protocol allow rules (15/25/35/45) so
+                  # hairpinned OT→internet traffic isn't dropped before they're evaluated.
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 502
+            real_target_ip: 192.168.10.10
+            real_target_port: 502
+            outbound_vif: eth1.10
+            prober_ip: 192.168.10.20   # modbus-client — the only host expected to probe 9.9.9.9
+            rule_number: 10
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 102
+            real_target_ip: 192.168.20.10
+            real_target_port: 102
+            outbound_vif: eth1.20
+            prober_ip: 192.168.20.20   # s7comm-client — the only host expected to probe 9.9.9.9:102
+            rule_number: 20
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 47808
+            real_target_ip: 192.168.50.10
+            real_target_port: 47808
+            outbound_vif: eth1.50
+            prober_ip: 192.168.50.20   # bacnet-client — the only host expected to probe 9.9.9.9:47808
+            rule_number: 30
+            protocol: udp   # BACnet/IP is UDP, unlike Modbus/S7comm's TCP
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 44818
+            real_target_ip: 192.168.40.10
+            real_target_port: 44818
+            outbound_vif: eth1.40
+            prober_ip: 192.168.40.20   # enip-client — the only host expected to probe 9.9.9.9:44818
+            rule_number: 40
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 20000
+            real_target_ip: 192.168.30.10
+            real_target_port: 20000
+            outbound_vif: eth1.30
+            prober_ip: 192.168.30.20   # dnp3-client — the only host expected to probe 9.9.9.9:20000
+            rule_number: 50
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 4840
+            real_target_ip: 192.168.60.10
+            real_target_port: 4840
+            outbound_vif: eth1.60
+            prober_ip: 192.168.60.20   # opcua-client — the only host expected to probe 9.9.9.9:4840
+            rule_number: 60
+        - task: vyos/configure_external_traffic_redirect
+          vars:
+            fake_external_ip: 9.9.9.9
+            fake_external_port: 9600
+            real_target_ip: 192.168.70.10
+            real_target_port: 9600
+            outbound_vif: eth1.70
+            prober_ip: 192.168.70.20   # fins-client — the only host expected to probe 9.9.9.9:9600
+            rule_number: 70
+
+  - name: switch-1
+    depends_on: [vyos-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-sw
+      - name: eth2
+        type: vnet
+        network: sw-malcolm-mirror
+      - name: eth3
+        type: vnet
+        network: sw-malcolm-mgmt
+      - name: eth4
+        type: vnet
+        network: sw-modbus-client
+      - name: eth5
+        type: vnet
+        network: sw-modbus-server
+      - name: eth6
+        type: vnet
+        network: sw-s7comm-client
+      - name: eth7
+        type: vnet
+        network: sw-s7comm-server
+      - name: eth8
+        type: vnet
+        network: sw-dnp3-client
+      - name: eth9
+        type: vnet
+        network: sw-dnp3-server
+      - name: eth10
+        type: vnet
+        network: sw-enip-client
+      - name: eth11
+        type: vnet
+        network: sw-enip-server
+      - name: eth12
+        type: vnet
+        network: sw-bacnet-client
+      - name: eth13
+        type: vnet
+        network: sw-bacnet-server
+      - name: eth14
+        type: vnet
+        network: sw-opcua-client
+      - name: eth15
+        type: vnet
+        network: sw-opcua-server
+      - name: eth16
+        type: vnet
+        network: sw-kali
+      - name: eth17
+        type: vnet
+        network: sw-fins-client
+      - name: eth18
+        type: vnet
+        network: sw-fins-server
+      - name: eth19
+        type: vnet
+        network: sw-profinet-client
+      - name: eth20
+        type: vnet
+        network: sw-profinet-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: ovs/configure_vlan_switch
+          vars:
+            bridge_name: br-ot
+            trunk_port: eth1
+            trunk_vlans: [10, 20, 30, 40, 50, 60, 70, 80, 100]
+            access_ports:
+              - {name: eth3,  tag: 100}  # malcolm-mgmt → VLAN 100
+              - {name: eth4,  tag: 10}   # modbus-client
+              - {name: eth5,  tag: 10}   # modbus-server
+              - {name: eth6,  tag: 20}   # s7comm-client
+              - {name: eth7,  tag: 20}   # s7comm-server
+              - {name: eth8,  tag: 30}   # dnp3-client
+              - {name: eth9,  tag: 30}   # dnp3-server
+              - {name: eth10, tag: 40}   # enip-client
+              - {name: eth11, tag: 40}   # enip-server
+              - {name: eth12, tag: 50}   # bacnet-client
+              - {name: eth13, tag: 50}   # bacnet-server
+              - {name: eth14, tag: 60}   # opcua-client
+              - {name: eth15, tag: 60}   # opcua-server
+              - {name: eth16, tag: 100}  # kali-1 → VLAN 100 (mgmt/test)
+              - {name: eth17, tag: 70}   # fins-client
+              - {name: eth18, tag: 70}   # fins-server
+              - {name: eth19, tag: 80}   # profinet-client
+              - {name: eth20, tag: 80}   # profinet-server
+            mirror_output: eth2
+            mirror_vlans: [10, 20, 30, 40, 50, 60, 70, 80]  # OT VLANs only; excludes VLAN 100 mgmt
+            svi_interfaces:
+              - name: svi100
+                tag: 100
+                address: 192.168.100.253/24  # in-band management IP on mgmt/test VLAN
+        - task: ovs/configure_gretap_span
+          vars:
+            bridge_name: br-ot
+            gretap_local_ip: "192.168.100.253"
+            gretap_remote_ip: "192.168.100.254"
+            mirror_ports:
+              - eth1    # VyOS trunk — captures kali-via-VyOS attack requests + OT→external probes
+              # - eth3    # malcolm-mgmt   VLAN 100
+              - eth4    # modbus-client  VLAN 10
+              - eth5    # modbus-server  VLAN 10
+              - eth6    # s7comm-client  VLAN 20
+              - eth7    # s7comm-server  VLAN 20
+              - eth8    # dnp3-client    VLAN 30
+              - eth9    # dnp3-server    VLAN 30
+              - eth10   # enip-client    VLAN 40
+              - eth11   # enip-server    VLAN 40
+              - eth12   # bacnet-client  VLAN 50
+              - eth13   # bacnet-server  VLAN 50
+              - eth14   # opcua-client   VLAN 60
+              - eth15   # opcua-server   VLAN 60
+              - eth17   # fins-client    VLAN 70
+              - eth18   # fins-server    VLAN 70
+              - eth19   # profinet-client VLAN 80
+              - eth20   # profinet-server VLAN 80
+              # - eth16   # kali-1         VLAN 100 — redundant with eth1 (double-counts kali packets)
+
+  - name: malcolm-1
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpu_type: host
+    cpus: 16
+    memory: 65536
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-malcolm-mgmt
+      - name: eth2
+        type: vnet
+        network: sw-malcolm-mirror
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/install_docker
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_interface: eth1   # explicit — malcolm-1 also has eth2 (mirror), auto-detect is unsafe here
+            lab_ip: 192.168.100.254
+            lab_prefix: 24
+            lab_gateway: 192.168.100.1
+            lab_dns: 8.8.8.8
+        - task: linux/configure_promisc_interface
+          vars:
+            interface: eth2
+        - task: linux/install_malcolm
+          vars:
+            malcolm_version: "26.06.1"
+            malcolm_pcap_iface: eth2
+        - task: linux/configure_malcolm_version
+          vars:
+            malcolm_version: "26.06.1"
+        - task: linux/fix_malcolm_startup
+        - task: linux/configure_malcolm_docker_autostart
+        - task: linux/configure_gretap_span
+          vars:
+            gretap_local_ip: "192.168.100.254"
+            gretap_remote_ip: "192.168.100.253"
+        - task: linux/configure_malcolm_alerting
+          vars:
+            modbus_hmi_ip: 192.168.10.20
+            modbus_router_ip: 192.168.10.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            modbus_server_port: 502
+        - task: linux/configure_s7comm_alerting
+          vars:
+            s7comm_client_ip: 192.168.20.20
+            s7comm_router_ip: 192.168.20.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            s7comm_server_port: 102
+        # Re-applies two ACID/dashboard fixes Malcolm reverts on each fresh deploy so
+        # the S7comm ATT&CK/Notices panels populate.
+        - task: linux/configure_acid_s7comm_detection
+        - task: linux/configure_bacnet_alerting
+          vars:
+            bacnet_client_ip: 192.168.50.20
+            bacnet_router_ip: 192.168.50.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            bacnet_server_ip: 192.168.50.10   # excludes the server's own unsolicited i_am broadcasts
+            bacnet_server_port: 47808
+        - task: linux/configure_enip_alerting
+          vars:
+            enip_client_ip: 192.168.40.20
+            enip_router_ip: 192.168.40.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            enip_server_port: 44818
+        - task: linux/configure_dnp3_alerting
+          vars:
+            dnp3_client_ip: 192.168.30.20
+            dnp3_router_ip: 192.168.30.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            dnp3_server_port: 20000
+        - task: linux/configure_fins_alerting
+          vars:
+            fins_client_ip: 192.168.70.20
+            fins_router_ip: 192.168.70.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            fins_server_port: 9600
+        - task: linux/configure_opcua_alerting
+          vars:
+            opcua_client_ip: 192.168.60.20
+            opcua_router_ip: 192.168.60.1   # vyos-1's hairpin masquerade IP — legitimate, not a real master
+            opcua_server_port: 4840
+        - task: linux/configure_profinet_alerting
+          vars:
+            profinet_client_ip: 192.168.80.20   # no vyos hairpin on VLAN 80 yet, nothing else to exclude
+            profinet_server_port: 34964
+        - task: linux/configure_alerting_scheduler_nudge
+
+  - name: modbus-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-modbus-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.10.20
+            lab_prefix: 24
+            lab_gateway: 192.168.10.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_modbus_client
+          vars:
+            server_ip: 192.168.10.10
+            external_probe_ip: 9.9.9.9   # VyOS loopback — appears as external to Malcolm
+
+  - name: modbus-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-modbus-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.10.10
+            lab_prefix: 24
+            lab_gateway: 192.168.10.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_modbus_server
+
+  - name: s7comm-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-s7comm-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.20.10
+            lab_prefix: 24
+            lab_gateway: 192.168.20.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_s7comm_server
+
+  - name: s7comm-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-s7comm-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.20.20
+            lab_prefix: 24
+            lab_gateway: 192.168.20.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_s7comm_client
+          vars:
+            server_ip: 192.168.20.10
+            external_probe_ip: 9.9.9.9
+
+  - name: dnp3-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-dnp3-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.30.10
+            lab_prefix: 24
+            lab_gateway: 192.168.30.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_dnp3_server
+
+  - name: dnp3-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-dnp3-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.30.20
+            lab_prefix: 24
+            lab_gateway: 192.168.30.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_dnp3_client
+          vars:
+            server_ip: 192.168.30.10
+            external_probe_ip: 9.9.9.9
+
+  - name: bacnet-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-bacnet-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.50.10
+            lab_prefix: 24
+            lab_gateway: 192.168.50.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_bacnet_server
+          vars:
+            lab_ip: 192.168.50.10
+
+  - name: bacnet-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-bacnet-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.50.20
+            lab_prefix: 24
+            lab_gateway: 192.168.50.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_bacnet_client
+          vars:
+            lab_ip: 192.168.50.20
+            server_ip: 192.168.50.10
+            external_probe_ip: 9.9.9.9
+
+  - name: enip-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-enip-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.40.10
+            lab_prefix: 24
+            lab_gateway: 192.168.40.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_enip_server
+
+  - name: enip-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-enip-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.40.20
+            lab_prefix: 24
+            lab_gateway: 192.168.40.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_enip_client
+          vars:
+            server_ip: 192.168.40.10
+            external_probe_ip: 9.9.9.9
+
+  - name: opcua-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-opcua-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.60.10
+            lab_prefix: 24
+            lab_gateway: 192.168.60.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_opcua_server
+
+  - name: opcua-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-opcua-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.60.20
+            lab_prefix: 24
+            lab_gateway: 192.168.60.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_opcua_client
+          vars:
+            server_ip: 192.168.60.10
+            external_probe_ip: 9.9.9.9
+
+  - name: fins-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-fins-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.70.10
+            lab_prefix: 24
+            lab_gateway: 192.168.70.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_fins_server
+
+  - name: fins-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-fins-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.70.20
+            lab_prefix: 24
+            lab_gateway: 192.168.70.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_fins_client
+          vars:
+            server_ip: 192.168.70.10
+            external_probe_ip: 9.9.9.9
+
+  # PROFINET: EXPERIMENTAL — p-net + profinet-py only negotiate AR/IOCR, not live
+  # cyclic I/O data (a virtio-NIC real-time limitation).
+
+  - name: profinet-server
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-profinet-server
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.80.10
+            lab_prefix: 24
+            lab_gateway: 192.168.80.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_profinet_server
+          vars:
+            profinet_interface: eth1
+            profinet_station_name: profinet-server
+
+  - name: profinet-client
+    depends_on: [switch-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-profinet-client
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.80.20
+            lab_prefix: 24
+            lab_gateway: 192.168.80.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_profinet_client
+          vars:
+            profinet_target: profinet-server
+            profinet_interface: eth1
+            profinet_poll_seconds: 30
+
+  - name: kali-1
+    depends_on: [switch-1]
+    template: kalilinux/rolling
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: sw-kali
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/disable_network_manager
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: 192.168.100.10
+            lab_prefix: 24
+            lab_gateway: 192.168.100.1
+            lab_dns: 8.8.8.8
+        - task: ot/deploy_kali_ics_attacks

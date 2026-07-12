@@ -1,0 +1,23 @@
+---
+# Task: Create the base OU structure under the domain root.
+#
+# Required vars:
+#   ad_netbios — root OU name, typically the NetBIOS domain name (e.g. "LAB")
+
+- name: Create AD OU structure
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $domDN = (Get-ADDomain).DistinguishedName
+
+    # Root OU
+    New-ADOrganizationalUnit -Name "{{ ad_netbios }}"  -Path $domDN
+
+    # Under root
+    New-ADOrganizationalUnit -Name "Computers" -Path "OU={{ ad_netbios }},$domDN"
+    New-ADOrganizationalUnit -Name "Users"     -Path "OU={{ ad_netbios }},$domDN"
+    New-ADOrganizationalUnit -Name "Groups"    -Path "OU={{ ad_netbios }},$domDN"
+    New-ADOrganizationalUnit -Name "Printers"  -Path "OU={{ ad_netbios }},$domDN"
+
+    # Under Computers
+    New-ADOrganizationalUnit -Name "Clients"   -Path "OU=Computers,OU={{ ad_netbios }},$domDN"
+    New-ADOrganizationalUnit -Name "Servers"   -Path "OU=Computers,OU={{ ad_netbios }},$domDN"

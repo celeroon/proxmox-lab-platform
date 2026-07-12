@@ -1,0 +1,168 @@
+---
+# Task: Install Prometheus SNMP exporter and write a working if_mib config.
+#
+# The Debian prometheus-snmp-exporter package ships a stub snmp.yml (no MIB
+# definitions, licensing reasons). This task writes a minimal if_mib module
+# covering IF-MIB interface counters — sufficient for VyOS bandwidth monitoring.
+# Config file location: /etc/prometheus/snmp.yml (default for this package version).
+
+- name: Install prometheus-snmp-exporter
+  apt:
+    name: prometheus-snmp-exporter
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Write snmp.yml with if_mib module
+  copy:
+    dest: /etc/prometheus/snmp.yml
+    owner: root
+    group: prometheus
+    mode: '0640'
+    content: |
+      if_mib:
+        walk:
+          - 1.3.6.1.2.1.2
+          - 1.3.6.1.2.1.31.1.1
+        metrics:
+          - name: ifDescr
+            oid: 1.3.6.1.2.1.2.2.1.2
+            type: DisplayString
+            help: A textual string containing information about the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+          - name: ifAdminStatus
+            oid: 1.3.6.1.2.1.2.2.1.7
+            type: gauge
+            help: The desired state of the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            enum_values:
+              1: up
+              2: down
+              3: testing
+          - name: ifOperStatus
+            oid: 1.3.6.1.2.1.2.2.1.8
+            type: gauge
+            help: The current operational state of the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            enum_values:
+              1: up
+              2: down
+              3: testing
+              4: unknown
+              5: dormant
+              6: notPresent
+              7: lowerLayerDown
+          - name: ifInOctets
+            oid: 1.3.6.1.2.1.2.2.1.10
+            type: counter
+            help: The total number of octets received on the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+          - name: ifOutOctets
+            oid: 1.3.6.1.2.1.2.2.1.16
+            type: counter
+            help: The total number of octets transmitted out of the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+          - name: ifInErrors
+            oid: 1.3.6.1.2.1.2.2.1.14
+            type: counter
+            help: Inbound packets that contained errors
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+          - name: ifOutErrors
+            oid: 1.3.6.1.2.1.2.2.1.20
+            type: counter
+            help: Outbound packets that could not be transmitted because of errors
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+          - name: ifName
+            oid: 1.3.6.1.2.1.31.1.1.1.1
+            type: DisplayString
+            help: The textual name of the interface
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+          - name: ifHCInOctets
+            oid: 1.3.6.1.2.1.31.1.1.1.6
+            type: counter
+            help: The total number of octets received on the interface (64-bit)
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+              - labels: [ifIndex]
+                labelname: ifName
+                oid: 1.3.6.1.2.1.31.1.1.1.1
+                type: DisplayString
+          - name: ifHCOutOctets
+            oid: 1.3.6.1.2.1.31.1.1.1.10
+            type: counter
+            help: The total number of octets transmitted out of the interface (64-bit)
+            indexes:
+              - labelname: ifIndex
+                type: gauge
+            lookups:
+              - labels: [ifIndex]
+                labelname: ifDescr
+                oid: 1.3.6.1.2.1.2.2.1.2
+                type: DisplayString
+              - labels: [ifIndex]
+                labelname: ifName
+                oid: 1.3.6.1.2.1.31.1.1.1.1
+                type: DisplayString
+        version: 2
+        auth:
+          community: "{{ snmp_community | default('labsnmp') }}"
+  become: yes
+  register: snmp_config
+
+- name: Restart prometheus-snmp-exporter to apply config
+  systemd:
+    name: prometheus-snmp-exporter
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+  when: snmp_config.changed
+
+- name: Enable prometheus-snmp-exporter
+  systemd:
+    name: prometheus-snmp-exporter
+    state: started
+    enabled: yes
+  become: yes

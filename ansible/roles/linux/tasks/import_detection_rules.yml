@@ -1,0 +1,54 @@
+---
+# Task: Import custom detection rules into Kibana via Detection Engine API
+# Rule .ndjson files must exist in: roles/global/linux/files/detection_rules/
+#
+# Variables:
+#   elastic_password:  Elasticsearch password (default: labpassword)
+#   kibana_url:        Kibana base URL (default: https://localhost:5601)
+#   detection_rules:   List of rule names to import (without .ndjson extension)
+#   overwrite_rules:   Overwrite existing rules (default: true)
+
+- name: Ensure jq is installed
+  ansible.builtin.apt:
+    name: jq
+    state: present
+
+- name: Create temp directory for rules
+  ansible.builtin.file:
+    path: /tmp/detection_rules
+    state: directory
+    mode: "0755"
+
+- name: Copy rule files to target
+  ansible.builtin.copy:
+    src: "{{ lab_ansible_dir }}/roles/global/linux/files/detection_rules/{{ item }}.ndjson"
+    dest: "/tmp/detection_rules/{{ item }}.ndjson"
+    mode: "0644"
+  loop: "{{ detection_rules }}"
+
+- name: Fix NDJSON format with jq
+  ansible.builtin.shell:
+    cmd: "jq -c . /tmp/detection_rules/{{ item }}.ndjson > /tmp/detection_rules/{{ item }}_fixed.ndjson"
+  loop: "{{ detection_rules }}"
+  changed_when: false
+
+- name: Import detection rules via Kibana API
+  ansible.builtin.shell: >
+    curl -k -s
+    -o /tmp/detection_rules/{{ item }}_response.json
+    -w "%{http_code}"
+    -u "elastic:{{ elastic_password | default('labpassword') }}"
+    -X POST
+    -H "kbn-xsrf: true"
+    -H "Content-Type: multipart/form-data"
+    --form "file=@/tmp/detection_rules/{{ item }}_fixed.ndjson"
+    "{{ kibana_url | default('https://localhost:5601') }}/api/detection_engine/rules/_import?overwrite={{ overwrite_rules | default(true) | lower }}"
+  register: _import_result
+  loop: "{{ detection_rules }}"
+  failed_when: _import_result.stdout != "200"
+  changed_when: _import_result.stdout == "200"
+
+- name: Clean up temp directory
+  ansible.builtin.file:
+    path: /tmp/detection_rules
+    state: absent

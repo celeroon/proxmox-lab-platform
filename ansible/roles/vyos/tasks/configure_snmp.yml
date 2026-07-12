@@ -1,0 +1,19 @@
+---
+# Task: Enable SNMP v2c read-only on VyOS (StrongSwan/1.5+)
+# Variables:
+#   snmp_community:      community string (default: labsnmp)
+#   snmp_listen_address: IP to bind to — use the management IP so mgmt-1 can reach it
+
+- name: Build SNMP configuration lines
+  set_fact:
+    snmp_lines:
+      - "set service snmp community {{ snmp_community | default('labsnmp') }} authorization ro"
+      - "set service snmp listen-address {{ snmp_listen_address }}"
+
+- name: Apply SNMP configuration
+  vyos.vyos.vyos_config:
+    lines: "{{ snmp_lines }}"
+
+- name: Commit and save configuration
+  vyos.vyos.vyos_config:
+    save: yes
