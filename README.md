@@ -68,7 +68,7 @@ Custom appliance templates (built via Packer):
 lab template build nethsecurity 8.7.2
 
 # Custom download URL (e.g. a mirror or a pre-release build)
-lab template build nethsecurity 8.7.2 --url https://example.com/nethsecurity-8.7.2.img
+lab template build nethsecurity 8.7.2 --url https://updates.nethsecurity.nethserver.org/stable/8.7.2/targets/x86/64/nethsecurity-8.7.2-x86-64-generic-squashfs-combined-efi.img.gz
 ```
 
 ---
