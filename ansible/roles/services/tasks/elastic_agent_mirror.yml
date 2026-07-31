@@ -1,15 +1,4 @@
 ---
-# Serve elastic-agent via nginx so LAN agents never hit the internet.
-# Run this on the fleet server node AFTER fleet_server task (reuses the tarball
-# that fleet_server already downloaded to /tmp/).
-#
-# Required vars:
-#   elk_version  - Elastic stack version (must match fleet_server)
-#
-# Exposes:
-#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz  (original)
-#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar     (uncompressed, for fast agent extraction)
-
 # ── Step 1: Install nginx ─────────────────────────────────────────
 
 - name: Install nginx
