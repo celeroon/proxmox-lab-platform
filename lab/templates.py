@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import IO
 
 import httpx
 
@@ -16,6 +20,10 @@ TEMPLATE_VMID_MIN = 9000
 TEMPLATE_VMID_MAX = 9999
 _NFS_STORAGE = "nfs-templates"
 _VAGRANT_API = "https://app.vagrantup.com/api/v2/box"
+_COPY_CHUNK = 4 << 20
+_CACHE_DROP_BYTES = 256 << 20   # bytes written between page-cache drops while extracting
+_CACHE_DROP_INTERVAL = 5.0      # seconds between page-cache drops while downloading
+_DOWNLOAD_TIMEOUT = 3 * 60 * 60
 
 
 def next_template_vmid(existing_vmids: list[int]) -> int:
@@ -37,56 +45,142 @@ def _get_download_url(box: str) -> str:
     resp = httpx.get(f"{_VAGRANT_API}/{user}/{name}", timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    for provider in data["current_version"]["providers"]:
-        if provider["name"] == "libvirt":
+    providers = [p for p in data["current_version"]["providers"] if p["name"] == "libvirt"]
+    if not providers:
+        raise RuntimeError(
+            f"no libvirt provider found for '{box}' — only QEMU/libvirt boxes are supported"
+        )
+    # One provider entry per architecture; take the box's default rather than the first listed.
+    for provider in providers:
+        if provider.get("default_architecture"):
             return provider["download_url"]
-    raise RuntimeError(
-        f"no libvirt provider found for '{box}' — only QEMU/libvirt boxes are supported"
-    )
+    return providers[0]["download_url"]
+
+
+def _drop_cache(fd: int, offset: int = 0, length: int = 0) -> None:
+    """Release fd's clean page cache (whole file when length is 0).
+
+    Boxes run to ~13 GB compressed and ~15 GB extracted. Left cached, a single
+    fetch evicts everything else on the management VM and reports as 100% memory
+    use, since the kernel counts page cache as used.
+    """
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
+
+
+def _drop_cache_path(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _drop_cache(fd)
+    finally:
+        os.close(fd)
 
 
 def _download(url: str, dest: Path) -> None:
-    """Download url to dest via wget (GnuTLS) with resume support.
+    """Download url to dest via wget, resuming any previous partial transfer.
 
     wget uses GnuTLS rather than OpenSSL, avoiding SSL record-layer failures
     seen with both curl and httpx on Vagrant Cloud CDN long-running downloads.
-    -c resumes a partial download; -q suppresses progress noise.
+
+    -nv rather than -q: -q suppresses wget's error line too, which leaves a
+    failure with no diagnosis at all. The .part file is kept on failure on
+    purpose — the CDN redirects to a presigned URL valid for only 900s, so a
+    13 GB box on a link slower than ~15 MB/s cannot finish in one attempt and
+    has to resume across runs.
     """
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    cmd = ["wget", "-q", "-c", "-O", str(tmp), url]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "wget", "-nv", "-c",
+        "--tries=10",
+        "--waitretry=15",
+        "--timeout=60",   # wget's 900s default read timeout outlives the presigned URL
+        "-O", str(part),
+        url,
+    ]
+    with tempfile.TemporaryFile("w+") as errfile:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errfile)
+        deadline = time.monotonic() + _DOWNLOAD_TIMEOUT
+        try:
+            while proc.poll() is None:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"download exceeded {_DOWNLOAD_TIMEOUT // 3600}h — "
+                        "partial file kept, re-run to resume"
+                    )
+                time.sleep(_CACHE_DROP_INTERVAL)
+                _drop_cache_path(part)
+        except BaseException:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            raise
+        errfile.seek(0)
+        stderr = errfile.read()
+
     if proc.returncode != 0:
-        tmp.unlink(missing_ok=True)
-        stderr = proc.stderr.strip().splitlines()
-        raise RuntimeError(stderr[-1] if stderr else f"wget exited {proc.returncode}")
-    tmp.rename(dest)
+        lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+        detail = lines[-1] if lines else f"wget exited {proc.returncode}"
+        raise RuntimeError(f"{detail} — partial file kept, re-run to resume")
+    _drop_cache_path(part)
+    part.rename(dest)
+
+
+def _copy_release_cache(src: IO[bytes], dst: IO[bytes], src_fd: int) -> None:
+    """Copy src → dst, releasing page cache for both as the copy progresses."""
+    dst_fd = dst.fileno()
+    written = dropped = 0
+    while True:
+        chunk = src.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        dst.write(chunk)
+        written += len(chunk)
+        if written - dropped >= _CACHE_DROP_BYTES:
+            dst.flush()
+            os.fsync(dst_fd)
+            _drop_cache(dst_fd, dropped, written - dropped)
+            _drop_cache(src_fd)
+            dropped = written
+    dst.flush()
+    os.fsync(dst_fd)
+    _drop_cache(dst_fd)
+    _drop_cache(src_fd)
 
 
 def _extract_qcow2(box_path: Path, dest: Path) -> None:
-    with tarfile.open(box_path) as tar:
-        member = None
-        for candidate in ("box.img", "disk.img"):
-            try:
-                member = tar.getmember(candidate)
-                break
-            except KeyError:
-                continue
-        if member is None:
-            for m in tar.getmembers():
-                if m.name.endswith((".img", ".qcow2")):
-                    member = m
-                    break
-        if member is None:
-            available = [m.name for m in tar.getmembers()]
-            raise RuntimeError(
-                f"no disk image found in {box_path.name} — "
-                f"contents: {available} — is this a libvirt/QEMU box?"
-            )
-        src = tar.extractfile(member)
-        if src is None:
-            raise RuntimeError(f"could not read {member.name} from archive")
-        with src, dest.open("wb") as dst:
-            shutil.copyfileobj(src, dst)
+    """Stream the box's disk image out of the tar.gz into dest.
+
+    Stream mode ("r|gz") reads the archive exactly once. The seekable mode needs
+    a full member index before it can extract anything, which decompresses the
+    whole archive an extra time — ~13 GB of wasted reads for a Windows box.
+    Member names are not fixed: HashiCorp-hosted boxes nest the disk in a
+    numbered directory ('15140074115/box_0.img'), so match on suffix.
+    """
+    seen: list[str] = []
+    with open(box_path, "rb") as raw:
+        with tarfile.open(fileobj=raw, mode="r|gz") as tar:
+            for member in tar:
+                seen.append(member.name)
+                if not member.isfile():
+                    continue
+                if not Path(member.name).name.endswith((".img", ".qcow2")):
+                    continue
+                stream = tar.extractfile(member)
+                if stream is None:
+                    raise RuntimeError(f"could not read {member.name} from archive")
+                with stream, dest.open("wb") as dst:
+                    _copy_release_cache(stream, dst, raw.fileno())
+                return
+    raise RuntimeError(
+        f"no disk image found in {box_path.name} — "
+        f"contents: {seen} — is this a libvirt/QEMU box?"
+    )
 
 
 class TemplateManager:
@@ -258,14 +352,28 @@ class TemplateManager:
         node = nodes[0].name
 
         vmid, vm_dir, qcow2_path = self._allocate_slot()
-        box_path = vm_dir / "box.tar.gz"
+        # Staged outside the VMID slot: a retry allocates a fresh VMID, so a
+        # partial download parked in the old slot could never be resumed.
+        box_path = Path(self._settings.templates_dir) / ".downloads" / f"{tpl_name}.box"
 
         log_fn(f"resolving {box} on Vagrant Cloud")
         url = _get_download_url(box)
-        log_fn("downloading box")
-        _download(url, box_path)
-        log_fn("extracting qcow2")
-        _extract_qcow2(box_path, qcow2_path)
+        try:
+            log_fn("downloading box")
+            _download(url, box_path)
+            log_fn("extracting qcow2")
+            _extract_qcow2(box_path, qcow2_path)
+        except Exception:
+            # _all_vmids_in_range counts slot directories, so leaving one behind
+            # burns the VMID until cleanup_orphaned_slots runs. The staged
+            # download is deliberately left in place for the next attempt.
+            log_fn(f"error: releasing VMID slot {vmid}")
+            qcow2_path.unlink(missing_ok=True)
+            try:
+                vm_dir.rmdir()
+            except OSError:
+                pass
+            raise
         box_path.unlink(missing_ok=True)
 
         # description stores the original box name (with /) for display in lab template list

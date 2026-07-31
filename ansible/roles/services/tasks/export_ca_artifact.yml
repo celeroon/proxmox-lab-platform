@@ -1,0 +1,31 @@
+---
+# Fetch the Elasticsearch CA back to the controller so non-Linux guests can be
+# given it as a file. Run on the Elasticsearch node after elasticsearch_bootstrap.
+#
+# windows/setup_certificate reads the result from the controller with win_copy —
+# a Windows guest has no way to pull it itself here, because the bootstrap node's
+# cert distribution server on port 19999 only starts for multi-node clusters
+# (see elasticsearch_bootstrap: when elastic_nodes | length > 1).
+#
+# Writes: data/artifacts/elk/elasticsearch-ca.pem  (relative to the repo root)
+
+- name: Fetch elasticsearch-ca.pem to the controller
+  fetch:
+    src: /etc/elasticsearch/certs/elasticsearch-ca.pem
+    dest: "{{ lab_ansible_dir }}/../data/artifacts/elk/elasticsearch-ca.pem"
+    flat: yes
+  become: yes
+
+- name: Verify the CA artifact is present and non-empty
+  delegate_to: localhost
+  become: false
+  stat:
+    path: "{{ lab_ansible_dir }}/../data/artifacts/elk/elasticsearch-ca.pem"
+  register: _ca_artifact
+
+- name: Fail if the CA artifact is empty
+  delegate_to: localhost
+  become: false
+  fail:
+    msg: "elasticsearch-ca.pem was not fetched to the controller — Windows enrollment will fail"
+  when: not _ca_artifact.stat.exists or _ca_artifact.stat.size == 0

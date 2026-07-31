@@ -2,9 +2,36 @@
 # Task: Enroll Windows host into Elastic Fleet via pre-rendered PowerShell script
 # Requires: C:\win-setup\deploy-elastic-agent.ps1 (rendered during setup_directory_files)
 #           C:\win-setup\elasticsearch-ca.pem (copied during setup_certificate)
+#
+# The script generates its own enrollment key from Kibana, downloads the agent
+# from artifacts.elastic.co and runs `elastic-agent install`. It is skipped
+# outright when the agent service already exists, so a re-run or `deploy resume`
+# does not re-enroll a working host.
+
+- name: Check whether the Elastic Agent service already exists
+  ansible.windows.win_service_info:
+    name: "Elastic Agent"
+  register: _agent_service
+  failed_when: false
 
 - name: Run Elastic Agent deployment script
   ansible.windows.win_shell: |
     C:\win-setup\deploy-elastic-agent.ps1
-  async: 600
+  async: 1800
   poll: 15
+  register: _agent_deploy
+  when: (_agent_service.services | default([]) | length) == 0
+
+- name: Show deployment script output
+  debug:
+    var: _agent_deploy.stdout_lines
+  when: _agent_deploy is not skipped
+
+- name: Wait for the Elastic Agent service to report running
+  ansible.windows.win_service_info:
+    name: "Elastic Agent"
+  register: _agent_final
+  until: (_agent_final.services | default([]) | length) > 0
+         and _agent_final.services[0].state == 'started'
+  retries: 20
+  delay: 15

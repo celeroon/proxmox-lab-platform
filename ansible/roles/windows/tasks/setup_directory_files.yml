@@ -1,10 +1,4 @@
 ---
-# Task: Create working directory, copy support files and scripts to Windows VM
-# Variables:
-#   elk_ip:       IP of the ELK stack (used in deploy-elastic-agent.ps1 template)
-#   elk_version:  Elastic stack version (e.g. "9.0.3")
-#   elk_password: Elastic 'elastic' user password
-
 - name: Create C:\win-setup directory
   ansible.windows.win_file:
     path: C:\win-setup
@@ -12,15 +6,15 @@
 
 - name: Transfer Clear-EventLogs.ps1
   ansible.windows.win_copy:
-    src: "{{ lab_ansible_dir }}/roles/global/windows/files/Clear-EventLogs.ps1"
+    src: "{{ lab_ansible_dir }}/roles/windows/files/Clear-EventLogs.ps1"
     dest: C:\win-setup\Clear-EventLogs.ps1
 
 - name: Transfer audit-policy.ps1
   ansible.windows.win_copy:
-    src: "{{ lab_ansible_dir }}/roles/global/windows/files/audit-policy.ps1"
+    src: "{{ lab_ansible_dir }}/roles/windows/files/audit-policy.ps1"
     dest: C:\win-setup\audit-policy.ps1
 
 - name: Render and transfer deploy-elastic-agent.ps1
   ansible.windows.win_template:
-    src: "{{ lab_ansible_dir }}/roles/global/windows/templates/deploy-elastic-agent.ps1.j2"
+    src: "{{ lab_ansible_dir }}/roles/windows/templates/deploy-elastic-agent.ps1.j2"
     dest: C:\win-setup\deploy-elastic-agent.ps1

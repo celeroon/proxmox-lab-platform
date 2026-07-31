@@ -192,6 +192,12 @@ class ProxmoxClient:
         full: bool = True,
         qemu_agent: bool = True,
         cpu_type: str | None = None,
+        bios: str | None = None,
+        machine: str | None = None,
+        ostype: str | None = None,
+        efidisk: bool = False,
+        tpm: bool = False,
+        vga: str | None = None,
     ) -> None:
         """Clone a template into a new VM. Waits for the clone task before configuring.
 
@@ -222,31 +228,61 @@ class ProxmoxClient:
             storage_info = next((s for s in self.get_storage() if s.name == storage), None)
             needs_migrate = not (storage_info and storage_info.shared)
 
-        if needs_migrate:
-            self._log("clone        node=%s vmid=%s from=%s name=%s full=%s storage=%s (local on %s, then migrate)",
-                        node, vmid, template_vmid, name, full, storage, template_node)
-            upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
-            if upid:
-                self.wait_for_task(template_node, upid)
-            self._log("migrate      vmid=%s %s -> %s (with local disks)", vmid, template_node, node)
-            upid = self._px.nodes(template_node).qemu(vmid).migrate.post(
-                target=node, **{"with-local-disks": 1, "targetstorage": storage}
-            )
-            if upid:
-                self.wait_for_task(template_node, upid)
-        else:
-            if cross_node:
-                kwargs["target"] = node
-            self._log("clone        node=%s vmid=%s from=%s name=%s full=%s storage=%s",
-                        node, vmid, template_vmid, name, full, storage)
-            upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
-            if upid:
-                self.wait_for_task(template_node, upid)
+        # Clone and configure are kept atomic: a VM that exists but never got its
+        # config is worse than no VM at all, because the caller's "already exists"
+        # path would later adopt it and start a misconfigured guest.
+        try:
+            if needs_migrate:
+                self._log("clone        node=%s vmid=%s from=%s name=%s full=%s storage=%s (local on %s, then migrate)",
+                            node, vmid, template_vmid, name, full, storage, template_node)
+                upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
+                if upid:
+                    self.wait_for_task(template_node, upid)
+                self._log("migrate      vmid=%s %s -> %s (with local disks)", vmid, template_node, node)
+                upid = self._px.nodes(template_node).qemu(vmid).migrate.post(
+                    target=node, **{"with-local-disks": 1, "targetstorage": storage}
+                )
+                if upid:
+                    self.wait_for_task(template_node, upid)
+            else:
+                if cross_node:
+                    kwargs["target"] = node
+                self._log("clone        node=%s vmid=%s from=%s name=%s full=%s storage=%s",
+                            node, vmid, template_vmid, name, full, storage)
+                upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
+                if upid:
+                    self.wait_for_task(template_node, upid)
 
-        config_kwargs: dict = dict(cores=cpus, memory=memory, agent=1 if qemu_agent else 0)
-        if cpu_type is not None:
-            config_kwargs["cpu"] = cpu_type
-        self._px.nodes(node).qemu(vmid).config.put(**config_kwargs)
+            config_kwargs: dict = dict(cores=cpus, memory=memory, agent=1 if qemu_agent else 0)
+            if cpu_type is not None:
+                config_kwargs["cpu"] = cpu_type
+            if bios is not None:
+                config_kwargs["bios"] = bios
+            if machine is not None:
+                config_kwargs["machine"] = machine
+            if ostype is not None:
+                config_kwargs["ostype"] = ostype
+            if vga is not None:
+                config_kwargs["vga"] = vga
+            # ":1" asks Proxmox to allocate the volume itself; the size it picks for these
+            # is fixed by type (1M efivars, 4M TPM), so the 1 is a placeholder not a GB count.
+            # pre-enrolled-keys=0 leaves Secure Boot without Microsoft's keys — a Vagrant
+            # box image is not signed for it and would refuse to boot with them enrolled.
+            if efidisk:
+                config_kwargs["efidisk0"] = f"{storage}:1,efitype=4m,pre-enrolled-keys=0"
+            if tpm:
+                config_kwargs["tpmstate0"] = f"{storage}:1,version=v2.0"
+            self._log("config       vmid=%s %s", vmid,
+                      " ".join(f"{k}={v}" for k, v in config_kwargs.items() if k not in ("cores", "memory")))
+            self._px.nodes(node).qemu(vmid).config.put(**config_kwargs)
+        except Exception:
+            if self.vm_exists(vmid):
+                self._log("cleanup      vmid=%s partial clone (create failed), deleting", vmid)
+                try:
+                    self.delete_vm(self.find_vm_node(vmid), vmid)
+                except Exception:
+                    self._log("cleanup      vmid=%s could not be removed — delete it manually", vmid)
+            raise
 
     def start_vm(self, node: str, vmid: int, wait: bool = True) -> None:
         self._log("start_vm     node=%s vmid=%s", node, vmid)
@@ -274,7 +310,8 @@ class ProxmoxClient:
         if wait and upid:
             self.wait_for_task(node, upid)
 
-    _DISK_KEY_RE = re.compile(r'^(scsi|virtio|ide|sata)\d+$')
+    # efidisk/tpmstate are included so UEFI guests don't leak their NVRAM volumes.
+    _DISK_KEY_RE = re.compile(r'^(scsi|virtio|ide|sata|efidisk|tpmstate)\d+$')
 
     def get_vm_disk_volumes(self, node: str, vmid: int) -> list[str]:
         """Return full volume IDs for a VM's data disks (e.g. 'pmoxpool1:vm-200001-disk-0').

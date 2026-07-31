@@ -1,0 +1,59 @@
+---
+- name: Wait for the lab NIC to obtain a DHCP lease
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $deadline = (Get-Date).AddMinutes(3)
+    do {
+      $addr = Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { $_.IPAddress -ne '{{ management_ip }}' -and
+                       $_.InterfaceAlias -notlike 'Loopback*' -and
+                       $_.IPAddress -notlike '169.254.*' }
+      if ($addr) { $addr[0].IPAddress; exit 0 }
+      Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+    throw 'lab NIC never received a DHCP lease'
+  register: _lab_nic_ip
+  changed_when: false
+
+- name: Report the lab NIC address
+  debug:
+    msg: "lab NIC has {{ _lab_nic_ip.stdout | trim }} (management NIC is {{ management_ip }})"
+
+- name: Make the lab NIC the preferred path for off-subnet traffic
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $mgmt = Get-NetIPAddress -AddressFamily IPv4 |
+      Where-Object { $_.IPAddress -eq '{{ management_ip }}' } | Select-Object -First 1
+    if (-not $mgmt) { throw 'no adapter holds {{ management_ip }}' }
+    $iface = Get-NetIPInterface -InterfaceIndex $mgmt.InterfaceIndex -AddressFamily IPv4
+    if ($iface.InterfaceMetric -eq {{ mgmt_route_metric | default(300) }}) { 'present'; exit 0 }
+    Set-NetIPInterface -InterfaceIndex $mgmt.InterfaceIndex -AddressFamily IPv4 `
+                       -InterfaceMetric {{ mgmt_route_metric | default(300) }}
+    'changed'
+  register: _mgmt_metric
+  changed_when: "'changed' in _mgmt_metric.stdout"
+
+- name: Verify traffic leaves via the lab NIC and the controller stays on management
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    # Find-NetRoute answers what Windows would actually choose, which is the only
+    # thing that matters here — it accounts for both interface and route metrics.
+    $out = (Find-NetRoute -RemoteIPAddress '8.8.8.8' | Select-Object -First 1).IPAddress
+    $elk = (Find-NetRoute -RemoteIPAddress '{{ fleet_ip }}' | Select-Object -First 1).IPAddress
+    $ctl = (Find-NetRoute -RemoteIPAddress '{{ gateway_ip }}' | Select-Object -First 1).IPAddress
+    if ($out -eq '{{ management_ip }}') { throw "internet traffic would bypass the lab NIC (src $out)" }
+    if ($elk -eq '{{ management_ip }}') { throw "lab traffic would bypass the lab NIC (src $elk)" }
+    if ($ctl -ne '{{ management_ip }}') { throw "controller would be reached via $ctl, not {{ management_ip }}" }
+    "internet src $out; lab src $elk; controller src $ctl"
+  register: _path_check
+  changed_when: false
+
+- name: Report the resulting path selection
+  debug:
+    msg: "{{ _path_check.stdout | trim }}"
+
+- name: Verify the Fleet server is reachable over the lab NIC
+  ansible.windows.win_wait_for:
+    host: "{{ fleet_ip }}"
+    port: 8220
+    timeout: 120
