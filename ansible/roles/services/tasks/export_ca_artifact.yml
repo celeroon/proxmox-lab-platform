@@ -1,14 +1,4 @@
 ---
-# Fetch the Elasticsearch CA back to the controller so non-Linux guests can be
-# given it as a file. Run on the Elasticsearch node after elasticsearch_bootstrap.
-#
-# windows/setup_certificate reads the result from the controller with win_copy —
-# a Windows guest has no way to pull it itself here, because the bootstrap node's
-# cert distribution server on port 19999 only starts for multi-node clusters
-# (see elasticsearch_bootstrap: when elastic_nodes | length > 1).
-#
-# Writes: data/artifacts/elk/elasticsearch-ca.pem  (relative to the repo root)
-
 - name: Fetch elasticsearch-ca.pem to the controller
   fetch:
     src: /etc/elasticsearch/certs/elasticsearch-ca.pem
