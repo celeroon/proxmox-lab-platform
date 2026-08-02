@@ -7,12 +7,12 @@
 
 - name: Transfer LabAccountsImport.ps1
   ansible.windows.win_copy:
-    src: "{{ lab_ansible_dir }}/roles/global/windows/templates/LabAccountsImport.ps1"
+    src: "{{ lab_ansible_dir }}/roles/windows/templates/LabAccountsImport.ps1"
     dest: C:\win-setup\LabAccountsImport.ps1
 
 - name: Transfer FakeNames.csv
   ansible.windows.win_copy:
-    src: "{{ lab_ansible_dir }}/roles/global/windows/templates/FakeNames.csv"
+    src: "{{ lab_ansible_dir }}/roles/windows/templates/FakeNames.csv"
     dest: C:\win-setup\FakeNames.csv
 
 - name: Import AD users from FakeNames.csv

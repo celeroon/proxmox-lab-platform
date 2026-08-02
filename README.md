@@ -51,6 +51,7 @@ lab template fetch generic-x64/debian12
 lab template fetch vyos/current
 lab template fetch joaobrlt/ubuntu-desktop-24.04
 lab template fetch kalilinux/rolling
+lab template fetch gusztavvargadr/windows-11-22h2-enterprise
 lab template list
 ```
 
@@ -70,6 +71,28 @@ lab template build nethsecurity 8.7.2
 # Custom download URL (e.g. a mirror or a pre-release build)
 lab template build nethsecurity 8.7.2 --url https://updates.nethsecurity.nethserver.org/stable/8.7.2/targets/x86/64/nethsecurity-8.7.2-x86-64-generic-squashfs-combined-efi.img.gz
 ```
+
+#### Windows
+
+Builds a Windows template **directly on a Proxmox node** with [rgl/windows-vagrant](https://github.com/rgl/windows-vagrant) via Packer's `proxmox-iso` builder — an alternative to fetching a prebuilt box from Vagrant Cloud.
+
+```bash
+lab template build windows 11      # Windows 11 24H2 (UEFI)     → template: windows-11
+lab template build windows 2025    # Windows Server 2025 (UEFI) → template: windows-2025
+
+# flags (Windows only):
+lab template build windows 11 --dry-run         # preview detected node/storage/bridge/VLAN + config, build nothing
+lab template build windows 11 --skip-update     # skip Windows Update during the build (default: it runs)
+lab template build windows 11 --skip-optimize   # skip the SDelete free-space zero-fill (default: it runs)
+```
+
+The build runs on the Proxmox node's real hardware — **no nesting on the management VM**, so nested virtualization is not required. It auto-detects the node, disk storage (Ceph → ZFS → LVM-thin), an ISO-capable store, and the management VM's bridge/VLAN, then creates the template in the platform's 9000–9999 range as `windows-<variant>`. Point a scenario's `template:` at it (e.g. `windows-11`); the `11`/`2025` variants are UEFI, matching the `bios: ovmf` / `q35` settings the `net-basic-win` scenario expects.
+
+- **Windows Update runs by default** (`--skip-update` to skip); the SDelete free-space compaction also runs by default (`--skip-optimize` to skip).
+- The temporary build VM uses **4 vCPUs / 8 GB RAM** — override with the `BUILD_CPUS` / `BUILD_MEMORY_MB` environment variables.
+- **Requirement:** the bridge the build VM joins (the management VM's bridge/VLAN) must provide **DHCP** — Packer waits for the guest's IP over that network. Overridable via `BUILD_BRIDGE` / `BUILD_VLAN_TAG` / `DISK_STORAGE` / `ISO_STORAGE` / `PROXMOX_NODE`.
+
+These images intentionally **disable Windows Defender and UAC** (rgl's provisioning), which lets adversary-simulation tooling such as [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) run without payloads being quarantined — so use them **only inside the closed lab**.
 
 ---
 
@@ -245,6 +268,20 @@ python3 /opt/ot-attacks/profinet_attack.py --target 192.168.80.10               
 ```
 
 `modbus_attack.py` also accepts `--continuous` to repeat every 30s. The full runbook — what each script triggers and where it shows up in Malcolm — is in `/opt/ot-attacks/ATTACK_INSTRUCTIONS.txt` on kali-1 (also on its Desktop).
+
+---
+
+### net-basic-win
+
+Basic setup with a Windows 11 endpoint: VyOS → NethSecurity → OVS core → single-node Elastic (ELK/Kibana/Fleet), with a Windows 11 VM (`win-1`) enrolled into Fleet via the Windows policy. A minimal starting point for Windows/endpoint scenarios — to be developed further in the future.
+
+[scenario.yml](scenarios/net-basic-win/scenario.yml)
+
+```bash
+lab deploy start net-basic-win --user <user>
+```
+
+![net-basic-win topology](docs/images/net-basic-win.png)
 
 ---
 

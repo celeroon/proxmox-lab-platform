@@ -91,6 +91,10 @@ def incomplete_operation(op_id: int) -> None:
 
 
 def append_log(op_id: int, message: str, level: str = "info") -> None:
+    # Postgres text columns reject NUL (0x00). Build tools stream raw output here
+    # (SDelete/defrag emit lines containing NUL), and one stray byte would raise
+    # ValueError and crash the whole operation — strip NULs before inserting.
+    message = message.replace("\x00", "")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(

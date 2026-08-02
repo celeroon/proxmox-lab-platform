@@ -13,6 +13,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import httpx
 import yaml
 
 from lab import dnsmasq, ids
@@ -358,6 +359,27 @@ def _create_vm(
     if proxmox.vm_exists(vmid_val):
         node = proxmox.find_vm_node(vmid_val)
         log_fn(f"VM {vmid_val} ({vm_spec.name}) already exists on {node}, re-registering in DB")
+        # Adopting an existing VMID assumes it was built from this same spec. Report
+        # anything that contradicts that rather than starting a guest that silently
+        # differs from the scenario — a half-created VM boots in ways that are hard
+        # to trace back to here.
+        try:
+            existing = proxmox.get_vm_config(node, vmid_val)
+            drift = []
+            if len([k for k in existing if re.fullmatch(r"net\d+", k)]) != len(nics):
+                drift.append(f"has {len([k for k in existing if re.fullmatch(r'net.', k)])} NIC(s), scenario declares {len(nics)}")
+            for field in ("bios", "machine", "ostype"):
+                want = getattr(vm_spec, field)
+                if want and existing.get(field) != want:
+                    drift.append(f"{field}={existing.get(field) or 'unset'}, scenario wants {want}")
+            if vm_spec.efidisk and "efidisk0" not in existing:
+                drift.append("no efidisk0, scenario wants one")
+            if drift:
+                log_fn(f"warning: VM {vmid_val} does not match the scenario — " + "; ".join(drift))
+                log_fn(f"warning: it was likely left behind by a failed run; "
+                       f"destroy it and redeploy to rebuild it correctly")
+        except Exception as exc:
+            log_fn(f"warning: could not verify existing VM {vmid_val} against the scenario: {exc}")
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -380,7 +402,9 @@ def _create_vm(
         return node
 
     log_fn(f"cloning template {template_vmid} → VMID {vmid_val} ({vm_spec.name}) on {node}")
-    proxmox.create_vm(node, vmid_val, template_vmid, vm_spec.name, vm_spec.cpus, vm_spec.memory, storage, full=full, qemu_agent=vm_spec.qemu_agent, cpu_type=vm_spec.cpu_type)
+    proxmox.create_vm(node, vmid_val, template_vmid, vm_spec.name, vm_spec.cpus, vm_spec.memory, storage, full=full, qemu_agent=vm_spec.qemu_agent, cpu_type=vm_spec.cpu_type,
+                      bios=vm_spec.bios, machine=vm_spec.machine, ostype=vm_spec.ostype,
+                      efidisk=vm_spec.efidisk, tpm=vm_spec.tpm, vga=vm_spec.vga)
 
     log_fn(f"  net0: MAC={mgmt_mac_addr} bridge={mgmt_vnet} IP={mgmt_ip_addr}")
     proxmox.add_nic(node, vmid_val, "net0", mgmt_vnet, mgmt_mac_addr)
@@ -605,21 +629,243 @@ def _wait_for_ssh_password_auth(
     raise TimeoutError(f"SSH password auth to {ip} (VMID {vmid}) did not succeed within {timeout}s")
 
 
+# How long the guest must read clean, continuously and without rebooting, before
+# it counts as settled. A count of polls is the wrong unit — two reads ten seconds
+# apart says nothing about a reboot a minute later. Measured first boot: WinRM
+# opened 312s after power-on and the guest stayed busy for a further 56s, so this
+# needs to comfortably outlast that tail.
+_WINRM_SETTLE_SECONDS = 90
+
+# Upper bound on "boot, then finish first boot" for a Windows guest.
+_WINRM_FIRST_BOOT_TIMEOUT = 1800
+
+# Measured on a real first boot of a Windows 11 Vagrant box: at the moment WinRM
+# starts accepting connections, every registry marker below already reads clean
+# (SystemSetupInProgress=0, GeneralizationState=7, CleanupState=2, no reboot
+# flags) while the guest is still on the "This might take a few minutes" screen
+# and about to reboot itself. The running-process and servicing checks are the
+# ones that actually catch that window; the registry markers are kept because
+# they catch the *other* cases (a pending servicing reboot, an interrupted
+# sysprep) that the process checks do not.
+_WINRM_READY_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$reasons = @()
+$setup = Get-ItemProperty 'HKLM:\SYSTEM\Setup'
+if ($setup -and $setup.SystemSetupInProgress -ne 0) { $reasons += 'setup in progress' }
+if ($setup -and $setup.OOBEInProgress -ne 0) { $reasons += 'OOBE in progress' }
+$ss = Get-ItemProperty 'HKLM:\SYSTEM\Setup\Status\SysprepStatus'
+if ($ss.GeneralizationState -ne $null -and $ss.GeneralizationState -ne 7) {
+    $reasons += "sysprep generalization state $($ss.GeneralizationState)" }
+if ($ss.CleanupState -ne $null -and $ss.CleanupState -ne 2) {
+    $reasons += "sysprep cleanup state $($ss.CleanupState)" }
+# Reported with a REBOOT: prefix so the caller can act on it. These flags never
+# clear by themselves — a freshly built image can ship with servicing already
+# pending — so blocking on them would burn the entire timeout.
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+    $reasons += 'REBOOT:servicing reboot pending' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+    $reasons += 'REBOOT:update reboot pending' }
+$procs = @(Get-Process msoobe,oobeldr,sysprep,FirstLogonAnim -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Name -Unique)
+# setup.exe is matched by path, not name: plenty of third-party installers are
+# called setup.exe and some linger for minutes. Edge WebView's updater
+# ("...\EdgeWebView\...\Installer\setup.exe --msedgewebview") held this gate open
+# until it timed out on an otherwise idle guest.
+if (Get-CimInstance Win32_Process -Filter "Name='setup.exe'" |
+    Where-Object { $_.ExecutablePath -like 'C:\Windows\*' -or $_.ExecutablePath -like 'C:\$WINDOWS.~BT\*' }) {
+    $procs += 'setup (Windows)'
+}
+if ($procs) { $reasons += "first-boot process running: $($procs -join ',')" }
+if ((Get-Service TrustedInstaller).Status -eq 'Running') { $reasons += 'servicing (TrustedInstaller) active' }
+$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+if ($reasons) { "NOTREADY|$boot|" + ($reasons -join '; ') } else { "READY|$boot|" }
+"""
+
+
+def _winrm_first_boot_state(ip: str, port: int, user: str, password: str) -> tuple[str, str, str]:
+    """Return (state, boot_time, detail) for a Windows guest.
+
+    state is READY, NOTREADY, or UNKNOWN. UNKNOWN means the check itself could not
+    run — missing pywinrm, bad credentials, a WinRM hiccup — and callers treat it
+    as "carry on", so this can only ever delay a deploy, never block one outright.
+    """
+    try:
+        import winrm  # noqa: PLC0415 — optional at import time, only Windows guests need it
+    except ImportError:
+        return "UNKNOWN", "", "pywinrm not installed"
+    try:
+        session = winrm.Session(
+            f"http://{ip}:{port}/wsman", auth=(user, password), transport="basic"
+        )
+        result = session.run_ps(_WINRM_READY_PS)
+        if result.status_code != 0:
+            return "UNKNOWN", "", "readiness script failed"
+        parts = result.std_out.decode(errors="replace").strip().split("|")
+        if len(parts) < 2:
+            return "UNKNOWN", "", "unparseable readiness output"
+        return parts[0], parts[1], (parts[2] if len(parts) > 2 else "")
+    except Exception as exc:
+        return "UNKNOWN", "", f"{type(exc).__name__}: {exc}"
+
+
+def _winrm_reboot(ip: str, port: int, user: str, password: str) -> None:
+    """Reboot a Windows guest over WinRM, best effort.
+
+    The connection drops as the command runs, so an exception here is the normal
+    outcome rather than a failure.
+    """
+    try:
+        import winrm  # noqa: PLC0415
+        winrm.Session(f"http://{ip}:{port}/wsman", auth=(user, password),
+                      transport="basic", read_timeout_sec=30,
+                      operation_timeout_sec=20).run_ps("shutdown /r /t 0 /f")
+    except Exception:
+        pass
+
+
+def _wait_for_winrm(
+    ip: str,
+    vmid: int,
+    port: int = 5985,
+    timeout: int = 900,
+    interval: int = 10,
+    deployment_id: int | None = None,
+    user: str = "",
+    password: str = "",
+    log_fn: Callable[[str], None] | None = None,
+) -> None:
+    """Poll the WinRM port until the WSMan endpoint answers, then return.
+
+    An open socket is not enough: Windows starts the listener well before WinRM
+    can serve requests. An unauthenticated POST to /wsman is the cheapest proof
+    the service is live — it answers 401 (or 405) once ready, and refuses the
+    connection or hangs before that.
+
+    The default timeout is deliberately longer than the SSH equivalent: a Windows
+    first boot runs sysprep and a reboot cycle before WinRM comes up.
+    """
+    deadline = time.monotonic() + timeout
+    url = f"http://{ip}:{port}/wsman"
+    listening = False
+    while not listening and time.monotonic() < deadline:
+        if deployment_id is not None:
+            _check_cancelled(deployment_id)
+        try:
+            # Any HTTP status back — 401 unauthenticated, 405 bad verb — proves WSMan
+            # is serving. Only a transport-level failure means "not ready yet".
+            httpx.post(url, content=b"", timeout=10)
+            listening = True
+        except httpx.HTTPError:
+            time.sleep(interval)
+    if not listening:
+        raise TimeoutError(f"VM {vmid} at {ip} did not answer WinRM on port {port} within {timeout}s")
+
+    if not password:
+        return
+
+    # WinRM answers well before Windows has finished first boot. Provisioning into
+    # that window races the guest's own reboot, so hold until the state reads clean
+    # continuously for _WINRM_SETTLE_SECONDS with no reboot in between. Any dirty
+    # read, or a change in boot time, restarts the clock.
+    stable_since: float | None = None
+    last_boot = ""
+    reported = ""
+    ever_answered = False
+    rebooted_for_pending = False
+    while time.monotonic() < deadline:
+        if deployment_id is not None:
+            _check_cancelled(deployment_id)
+        state, boot, detail = _winrm_first_boot_state(ip, port, user, password)
+        now = time.monotonic()
+        if state == "UNKNOWN":
+            # Only proceed when the check was never usable at all (no pywinrm, bad
+            # credentials). Once it has answered, losing it means the guest went
+            # away mid-reboot — the worst possible moment to release Ansible.
+            if ever_answered:
+                stable_since = None
+                if log_fn and reported != "guest unreachable":
+                    log_fn("  waiting for Windows first boot to finish: guest unreachable (rebooting?)")
+                    reported = "guest unreachable"
+                time.sleep(interval)
+                continue
+            if log_fn:
+                log_fn(f"  first-boot check unavailable ({detail}) — proceeding")
+            return
+        ever_answered = True
+
+        # A pending servicing reboot never clears on its own. Trigger it once,
+        # then keep waiting for the guest to come back and settle.
+        if state != "READY" and all(r.startswith("REBOOT:") for r in detail.split("; ") if r):
+            if not rebooted_for_pending:
+                rebooted_for_pending = True
+                if log_fn:
+                    log_fn(f"  {detail.replace('REBOOT:', '')} — rebooting the guest to clear it")
+                _winrm_reboot(ip, port, user, password)
+                stable_since = None
+                last_boot = ""
+                time.sleep(interval)
+                continue
+        detail = detail.replace("REBOOT:", "")
+        if state != "READY":
+            stable_since = None
+            if log_fn and detail and detail != reported:
+                log_fn(f"  waiting for Windows first boot to finish: {detail}")
+                reported = detail
+        elif stable_since is not None and boot == last_boot:
+            if now - stable_since >= _WINRM_SETTLE_SECONDS:
+                if log_fn:
+                    log_fn(f"  Windows settled (clean for {_WINRM_SETTLE_SECONDS}s)")
+                return
+        else:
+            # First clean read, or the guest rebooted since the last one.
+            if log_fn and last_boot and boot != last_boot:
+                log_fn("  waiting for Windows first boot to finish: guest rebooted")
+                reported = "guest rebooted"
+            elif log_fn:
+                # Say so explicitly: without this the countdown is silent, and a
+                # deliberate quiet period is indistinguishable from a hang.
+                log_fn(f"  Windows looks idle — holding {_WINRM_SETTLE_SECONDS}s to confirm "
+                       "it does not reboot again")
+            stable_since = now
+        last_boot = boot
+        time.sleep(interval)
+    raise TimeoutError(
+        f"VM {vmid} at {ip} answered WinRM but never finished first boot within {timeout}s"
+    )
+
+
 def _wait_for_ssh_ready(
     ip: str,
     vmid: int,
     connection: dict,
     timeout: int,
     deployment_id: int | None = None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> None:
-    """Wait for SSH readiness, verifying real password auth when applicable.
+    """Wait for the VM's management transport to accept connections.
 
-    Falls back to the banner-only check for non-ssh connection types (winrm,
-    network_cli) or key-based auth, where a password-auth probe doesn't apply.
+    Dispatches on connection type: winrm guests have no sshd, so probing port 22
+    would burn the whole timeout and fail every Windows VM. network_cli and
+    key-based auth get the banner-only check, where a password probe doesn't apply.
     """
     user = connection.get("user", "")
     password = connection.get("password", "")
-    if connection.get("type") == "ssh" and password:
+    conn_type = connection.get("type", "ssh")
+    if conn_type == "winrm":
+        _wait_for_winrm(
+            ip, vmid,
+            port=int(connection.get("winrm_port", 5985)),
+            # Floor, not the scenario's SSH timeout: a Windows first boot measured
+            # ~5 min to open WinRM and several more minutes of on-and-off servicing
+            # (FirstLogonAnim, then setup.exe, with TrustedInstaller cycling
+            # throughout) before it stays quiet. 900s left no margin for that.
+            timeout=max(timeout, _WINRM_FIRST_BOOT_TIMEOUT),
+            deployment_id=deployment_id,
+            user=user,
+            password=password,
+            log_fn=log_fn,
+        )
+    elif conn_type == "ssh" and password:
         _wait_for_ssh_password_auth(ip, vmid, user, password, timeout=timeout, deployment_id=deployment_id)
     else:
         _wait_for_ssh(ip, vmid, timeout=timeout, deployment_id=deployment_id)
@@ -699,7 +945,11 @@ def _generate_vm_playbook(
             block["vars"] = task_vars
         tasks.append(block)
 
-    play_vars = {"lab_ansible_dir": str(_ANSIBLE_DIR), "gateway_ip": ids.gateway_ip(user_id)}
+    play_vars = {
+        "lab_ansible_dir": str(_ANSIBLE_DIR),
+        "gateway_ip": ids.gateway_ip(user_id),
+        "mgmt_timezone": _local_timezone(),
+    }
     for name, ip in other_vms:
         play_vars[f"{name.replace('-', '_')}_ip"] = ip
     play_vars.update(ansible_section.get("vars", {}))
@@ -714,6 +964,28 @@ def _generate_vm_playbook(
     }
     playbook_path.write_text(yaml.dump([play], default_flow_style=False, sort_keys=False))
     return playbook_path
+
+
+def _local_timezone() -> str:
+    """This host's IANA timezone (e.g. 'Europe/Warsaw'), or '' if undetermined.
+
+    Exposed to plays as mgmt_timezone so guests can be set to the same wall clock
+    as the management VM. /etc/localtime is a symlink into the zoneinfo tree on
+    Debian; timedatectl is the fallback for hosts where it is a plain copy.
+    """
+    try:
+        target = Path("/etc/localtime").resolve()
+        parts = target.parts
+        if "zoneinfo" in parts:
+            return "/".join(parts[parts.index("zoneinfo") + 1:])
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["timedatectl", "show", "-p", "Timezone", "--value"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _build_inventory(vm_name: str, mgmt_ip: str, conn: dict) -> str:
@@ -1741,7 +2013,7 @@ class DeployEngine:
                 _set_vm_status(deployment_id, _vm_name, "running")
 
                 _wait_for_ssh_ready(_mgmt_ip, _vmid_val, _vm_spec.ansible.get("connection", {}),
-                                    timeout=s.deploy_ssh_timeout, deployment_id=deployment_id)
+                                    timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                 _check_cancelled(deployment_id)
                 _set_vm_ansible_status(deployment_id, _vm_name, "running")
                 ok = _provision_vm(_vm_name, _mgmt_ip, _vm_spec, user_id, log_fn, other_vms=standalone_vm_ips)
@@ -1773,7 +2045,7 @@ class DeployEngine:
                 _group_conn = _group_specs[0].ansible.get("connection", {})
                 for _info, _ip in zip(_group_infos, _group_ips):
                     _wait_for_ssh_ready(_ip, _info["vmid"], _group_conn,
-                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id)
+                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                 _check_cancelled(deployment_id)
 
                 for _name in _group_names:
@@ -2090,7 +2362,7 @@ class DeployEngine:
                     mgmt_ip = ids.mgmt_ip(user_id, vm_index)
 
                     _wait_for_ssh_ready(mgmt_ip, vmid_val, vm_spec.ansible.get("connection", {}),
-                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id)
+                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                     _check_cancelled(deployment_id)
                     _set_vm_ansible_status(deployment_id, vm_name, "running")
                     ok = _provision_vm(vm_name, mgmt_ip, vm_spec, user_id, log_fn, other_vms=standalone_vm_ips)
@@ -2124,7 +2396,7 @@ class DeployEngine:
                     _group_conn = group_specs[0].ansible.get("connection", {})
                     for vm_name, mgmt_ip, vmid_val in zip(group_names, group_ips, group_vmids):
                         _wait_for_ssh_ready(mgmt_ip, vmid_val, _group_conn,
-                                            timeout=s.deploy_ssh_timeout, deployment_id=deployment_id)
+                                            timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                     _check_cancelled(deployment_id)
 
                     for vm_name in group_names:

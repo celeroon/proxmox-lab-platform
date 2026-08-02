@@ -33,6 +33,18 @@ class VMSpec:
     cpu_type: str | None = None  # QEMU CPU model e.g. "host"; None = use template default (VMs only)
     replica_index: int = 0   # 0 = not a replica; 1..N = sequence number within group
     replica_base: str = ""   # "" = not a replica; "agent" = part of the agent replica group
+    # Firmware/chipset overrides (VMs only). Needed for UEFI guests: a Windows 11
+    # image is GPT with an EFI System Partition and will not boot the SeaBIOS
+    # default. efidisk allocates the NVRAM volume OVMF needs to persist boot vars.
+    bios: str | None = None      # "ovmf" | "seabios"; None = Proxmox default (seabios)
+    machine: str | None = None   # e.g. "q35"; None = Proxmox default (i440fx)
+    ostype: str | None = None    # e.g. "win11"; None = Proxmox default
+    efidisk: bool = False        # allocate efidisk0 (required with bios: ovmf)
+    tpm: bool = False            # allocate tpmstate0 with TPM v2.0
+    # Display adapter, e.g. "virtio", "qxl", "std". None = Proxmox default (std),
+    # which presents QEMU's Bochs VGA — a guest with no driver for it falls back
+    # to a basic adapter locked at whatever resolution the firmware handed over.
+    vga: str | None = None
 
 
 @dataclass
@@ -160,6 +172,43 @@ def parse_scenario(path: Path) -> ScenarioSpec:
                 f"VM '{base_name}': cpu_type must be a string, got {cpu_type!r}"
             )
 
+        bios = v.get("bios", defaults.get("bios", None))
+        if bios is not None and bios not in ("ovmf", "seabios"):
+            raise ValueError(
+                f"VM '{base_name}': bios must be 'ovmf' or 'seabios', got {bios!r}"
+            )
+
+        machine = v.get("machine", defaults.get("machine", None))
+        if machine is not None and not isinstance(machine, str):
+            raise ValueError(
+                f"VM '{base_name}': machine must be a string, got {machine!r}"
+            )
+
+        ostype = v.get("ostype", defaults.get("ostype", None))
+        if ostype is not None and not isinstance(ostype, str):
+            raise ValueError(
+                f"VM '{base_name}': ostype must be a string, got {ostype!r}"
+            )
+
+        vga = v.get("vga", defaults.get("vga", None))
+        if vga is not None and not isinstance(vga, str):
+            raise ValueError(
+                f"VM '{base_name}': vga must be a string, got {vga!r}"
+            )
+
+        efidisk = v.get("efidisk", defaults.get("efidisk", False))
+        tpm = v.get("tpm", defaults.get("tpm", False))
+        for field, val in (("efidisk", efidisk), ("tpm", tpm)):
+            if not isinstance(val, bool):
+                raise ValueError(
+                    f"VM '{base_name}': {field} must be a boolean, got {val!r}"
+                )
+        if bios == "ovmf" and not efidisk:
+            raise ValueError(
+                f"VM '{base_name}': bios 'ovmf' requires 'efidisk: true' — "
+                "OVMF has nowhere to persist boot entries without it"
+            )
+
         group = v.get("group", "")
         if group and group not in groups:
             raise ValueError(
@@ -204,6 +253,12 @@ def parse_scenario(path: Path) -> ScenarioSpec:
             group=group,
             ansible=v.get("ansible") or {},
             type=vm_type,
+            bios=bios,
+            machine=machine,
+            ostype=ostype,
+            efidisk=efidisk,
+            tpm=tpm,
+            vga=vga,
         )
 
         if count == 1:

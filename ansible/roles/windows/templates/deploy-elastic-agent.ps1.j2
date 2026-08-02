@@ -1,0 +1,106 @@
+# Enforce the use of TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Function to generate a random alphanumeric string
+function Get-RandomString($length) {
+    $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    $random = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count $length | % {[char]$_})
+    return $random
+}
+
+# Bypass SSL certificate validation
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { return $true }
+
+$Username = "elastic"
+$Password = "{{ elk_password }}"
+$Base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($Username):$($Password)"))
+
+$Headers = @{
+    "kbn-xsrf" = "true"
+    "Content-Type" = "application/json"
+    "Authorization" = "Basic $Base64AuthInfo"
+}
+
+# Generate a random string of 6 alphanumeric characters
+$randomString = Get-RandomString -length 6
+
+$Body = @{
+    name = "Windows-enrollment-$randomString"
+    policy_id = "{{ fleet_policy_id | default('windows-policy') }}"
+} | ConvertTo-Json
+
+$response = Invoke-RestMethod -Uri "https://{{ kibana_ip | default(elk_ip) | default(elastic_nodes[0].ip) }}:5601/api/fleet/enrollment_api_keys" -Method Post -Headers $Headers -Body $Body
+
+# Extract and display the api_key
+$api_key = $response.item.api_key
+Write-Output "API Key: $api_key"
+
+# Set the version and download URL for Elastic Agent.
+# Pulled from the lab mirror, not artifacts.elastic.co: this guest routes all
+# traffic through the lab firewall, and that path measured 0.07 MB/s to the
+# internet versus 255 MB/s to the mirror — the direct download cannot finish
+# inside the install timeout. Override mirror_ip to point elsewhere.
+$download_url = "http://{{ mirror_ip | default(fleet_ip) | default(elk_ip) | default(elastic_nodes[0].ip) }}/elastic-mirror/elastic-agent-{{ elk_version }}-windows-x86_64.zip"
+
+# Set the paths for the downloaded zip file and the extraction folder
+$zip_file = "C:\elastic-agent.zip"
+$extraction_path = "C:\win-setup\"
+
+# Step 1: Download the Elastic Agent (curl.exe avoids .NET TLS issues)
+Write-Output "Downloading Elastic Agent from $download_url"
+& curl.exe -fL --no-progress-meter --ssl-no-revoke -o $zip_file $download_url 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to download Elastic Agent (curl exit code $LASTEXITCODE)"
+    exit 1
+}
+Write-Output "Elastic Agent downloaded to $zip_file"
+
+# Step 2: Unzip the Elastic Agent to the extraction path
+# Uses .NET ZipFile directly — Expand-Archive buffers the entire archive in memory
+# and freezes the VM on large files.
+Write-Output "Unzipping Elastic Agent..."
+try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    # ExtractToDirectory throws if the target already exists, so a leftover folder
+    # from an interrupted run would make every retry fail. Clear it first.
+    Get-ChildItem -Path $extraction_path -Directory -Filter "elastic-agent-*" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip_file, $extraction_path)
+    Write-Output "Elastic Agent unzipped to $extraction_path"
+} catch {
+    Write-Error "Failed to unzip Elastic Agent: $_"
+    exit 1
+}
+
+# Step 3: Find the directory that matches the pattern "elastic-agent-*"
+$extracted_folder = Get-ChildItem -Path $extraction_path -Directory -Filter "elastic-agent-*" | Select-Object -First 1
+
+# Ensure a matching directory was found
+if ($extracted_folder) {
+    # Change directory to the found folder
+    $elastic_agent_path = $extracted_folder.FullName
+    Write-Output "Found extracted folder: $elastic_agent_path"
+} else {
+    Write-Error "No directory matching the pattern 'elastic-agent-*' found"
+    exit 1
+}
+
+# Step 4: Run the Elastic Agent installation command using the extracted enrollment token
+$fleet_server_url = "https://{{ fleet_ip | default(elk_ip) | default(elastic_nodes[0].ip) }}:8220"
+
+try {
+    Start-Process -FilePath (Join-Path $elastic_agent_path "elastic-agent.exe") -ArgumentList "install --url=$fleet_server_url --enrollment-token=$api_key --certificate-authorities=C:\win-setup\elasticsearch-ca.pem --force" -NoNewWindow -Wait
+    Write-Output "Elastic Agent installation started"
+} catch {
+    Write-Error "Failed to start Elastic Agent installation: $_"
+    exit 1
+}
+
+# Step 5: Clean up - Remove the zip file
+try {
+    Remove-Item -Path $zip_file -Force
+    Write-Output "Zip file $zip_file removed"
+} catch {
+    Write-Error "Failed to remove zip file: $_"
+    exit 1
+}

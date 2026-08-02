@@ -1,0 +1,103 @@
+---
+- name: Resolve the Windows timezone ID
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $override = '{{ windows_timezone | default("") }}'
+    if ($override) { $override; exit 0 }
+    $map = @{
+      'Europe/Warsaw'='Central European Standard Time'; 'Europe/Berlin'='W. Europe Standard Time'
+      'Europe/Prague'='Central Europe Standard Time';   'Europe/Paris'='Romance Standard Time'
+      'Europe/Madrid'='Romance Standard Time';          'Europe/Rome'='W. Europe Standard Time'
+      'Europe/Amsterdam'='W. Europe Standard Time';     'Europe/Stockholm'='W. Europe Standard Time'
+      'Europe/London'='GMT Standard Time';              'Europe/Dublin'='GMT Standard Time'
+      'Europe/Lisbon'='GMT Standard Time';              'Europe/Helsinki'='FLE Standard Time'
+      'Europe/Kyiv'='FLE Standard Time';                'Europe/Kiev'='FLE Standard Time'
+      'Europe/Riga'='FLE Standard Time';                'Europe/Vilnius'='FLE Standard Time'
+      'Europe/Tallinn'='FLE Standard Time';             'Europe/Athens'='GTB Standard Time'
+      'Europe/Bucharest'='GTB Standard Time';           'Europe/Sofia'='FLE Standard Time'
+      'Europe/Budapest'='Central Europe Standard Time'; 'Europe/Vienna'='W. Europe Standard Time'
+      'Europe/Zurich'='W. Europe Standard Time';        'Europe/Oslo'='W. Europe Standard Time'
+      'Europe/Copenhagen'='Romance Standard Time';      'Europe/Brussels'='Romance Standard Time'
+      'Europe/Moscow'='Russian Standard Time';          'Europe/Istanbul'='Turkey Standard Time'
+      'America/New_York'='Eastern Standard Time';       'America/Chicago'='Central Standard Time'
+      'America/Denver'='Mountain Standard Time';        'America/Los_Angeles'='Pacific Standard Time'
+      'America/Sao_Paulo'='E. South America Standard Time'
+      'Asia/Tokyo'='Tokyo Standard Time';               'Asia/Shanghai'='China Standard Time'
+      'Asia/Kolkata'='India Standard Time';             'Asia/Calcutta'='India Standard Time'
+      'Asia/Dubai'='Arabian Standard Time';             'Asia/Jerusalem'='Israel Standard Time'
+      'Australia/Sydney'='AUS Eastern Standard Time';   'Pacific/Auckland'='New Zealand Standard Time'
+      'UTC'='UTC';                                      'Etc/UTC'='UTC'
+    }
+    $iana = '{{ mgmt_timezone | default("") }}'
+    if (-not $iana) { throw 'mgmt_timezone was not provided and windows_timezone is unset' }
+    if (-not $map.ContainsKey($iana)) {
+      throw "no Windows timezone mapped for '$iana' — set windows_timezone explicitly (see: tzutil /l)"
+    }
+    $map[$iana]
+  register: _win_tz
+  changed_when: false
+
+- name: Set the timezone to match the management VM
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $want = '{{ _win_tz.stdout | trim }}'
+    if ((Get-TimeZone).Id -eq $want) { 'present'; exit 0 }
+    Set-TimeZone -Id $want
+    'changed'
+  register: _tz_set
+  changed_when: "'changed' in _tz_set.stdout"
+
+- name: Enable and start the Windows Time service
+  ansible.windows.win_service:
+    name: w32time
+    start_mode: auto
+    state: started
+
+- name: Point w32time at the configured NTP peers
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $peers = '{{ ntp_peers | default("time.windows.com") }}'
+    $current = (w32tm /query /peers 2>&1 | Out-String)
+    if ($current -match [regex]::Escape($peers.Split(' ')[0])) { 'present'; exit 0 }
+    w32tm /config /manualpeerlist:"$peers" /syncfromflags:manual /update | Out-Null
+    Restart-Service w32time
+    'changed'
+  register: _ntp_cfg
+  changed_when: "'changed' in _ntp_cfg.stdout"
+
+# /resync fails when no NTP server is reachable, which is easy to hit here: this
+# guest routes through the lab firewall, so UDP 123 outbound has to be permitted.
+# Reported rather than fatal by default — a lab with no NTP path is still usable,
+# and the guest keeps the timezone regardless. Set ntp_required to make it fatal.
+- name: Force an NTP resync
+  ansible.windows.win_shell: |
+    $out = (w32tm /resync 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { "UNSYNCED: $out" } else { "SYNCED: $out" }
+  register: _ntp_resync
+  changed_when: "'SYNCED' in _ntp_resync.stdout"
+  retries: 3
+  delay: 10
+  until: "'SYNCED' in _ntp_resync.stdout"
+  failed_when: false
+
+- name: Report clock state
+  ansible.windows.win_shell: |
+    "timezone : $((Get-TimeZone).Id)"
+    "utc      : $((Get-Date).ToUniversalTime().ToString('o'))"
+    "source   : $((w32tm /query /source 2>&1 | Out-String).Trim())"
+  register: _clock
+  changed_when: false
+
+- name: Show clock state
+  debug:
+    msg: "{{ _clock.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+
+- name: Fail if NTP never synchronised and it was required
+  fail:
+    msg: >-
+      w32tm could not reach an NTP peer ({{ ntp_peers | default('time.windows.com') }}).
+      This guest routes through the lab firewall, so UDP 123 outbound must be allowed.
+      Output: {{ _ntp_resync.stdout | trim }}
+  when:
+    - ntp_required | default(false) | bool
+    - "'SYNCED' not in _ntp_resync.stdout"

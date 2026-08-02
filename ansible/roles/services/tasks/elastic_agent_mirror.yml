@@ -1,15 +1,4 @@
 ---
-# Serve elastic-agent via nginx so LAN agents never hit the internet.
-# Run this on the fleet server node AFTER fleet_server task (reuses the tarball
-# that fleet_server already downloaded to /tmp/).
-#
-# Required vars:
-#   elk_version  - Elastic stack version (must match fleet_server)
-#
-# Exposes:
-#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz  (original)
-#   http://{{ lab_ip }}/elastic-mirror/elastic-agent-{{ elk_version }}-linux-x86_64.tar     (uncompressed, for fast agent extraction)
-
 # ── Step 1: Install nginx ─────────────────────────────────────────
 
 - name: Install nginx
@@ -88,6 +77,28 @@
     group: www-data
     mode: '0644'
   become: yes
+
+# ── Step 4b: Mirror the Windows agent ─────────────────────────────
+# Served as-is: the Windows agent ships as a .zip, which the guest expands
+# natively, so there is no uncompressed-repack equivalent to build here.
+#
+# Windows guests route all traffic through the lab firewall, and that path is
+# far slower than the management network — measured at 0.07 MB/s against
+# artifacts.elastic.co, which is ~56 minutes for the 237 MB agent and times the
+# install out. The same file off this mirror measured 255 MB/s.
+#
+# Skipped unless a scenario asks for it, to avoid a ~240 MB pull on Linux-only labs.
+
+- name: Download elastic-agent Windows archive
+  get_url:
+    url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ elk_version }}-windows-x86_64.zip"
+    dest: "/var/www/html/elastic-mirror/elastic-agent-{{ elk_version }}-windows-x86_64.zip"
+    owner: www-data
+    group: www-data
+    mode: '0644'
+    timeout: 300
+  become: yes
+  when: mirror_windows_agent | default(false) | bool
 
 # ── Step 5: Start nginx ───────────────────────────────────────────
 
