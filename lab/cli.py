@@ -731,20 +731,44 @@ def ct_downloaded():
 
 @template_app.command("build", hidden=not _caller_is_admin)
 def template_build(
-    build_name: str = typer.Argument(..., help="Build name (e.g. nethsecurity)."),
-    version: str = typer.Argument(default="", help="Version string (e.g. 8.7.2)."),
+    build_name: str = typer.Argument(..., help="Build name (e.g. nethsecurity, windows)."),
+    version: str = typer.Argument(default="", help="Version (nethsecurity, e.g. 8.7.2) or Windows variant (11 | 2025)."),
     url: str = typer.Option("", "--url", help="Custom download URL (nethsecurity only)."),
+    skip_update: bool = typer.Option(False, "--skip-update", help="Windows only: skip Windows Update during the build (default: updates run)."),
+    skip_optimize: bool = typer.Option(False, "--skip-optimize", help="Windows only: skip the SDelete free-space zero-fill (default: it runs)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Windows only: print the detected node/storage/bridge/VLAN + patched config and exit, building nothing."),
 ):
-    """Build a Proxmox template via Packer and import it (background)."""
+    """Build a Proxmox template via Packer (background).
+
+    nethsecurity is built via libvirt and imported; windows is built directly on a
+    Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only).
+    """
     if not is_admin():
         typer.echo("error: lab template build requires admin", err=True)
         raise typer.Exit(1)
     s = get_settings()
     require_proxmox(s)
+
+    # --dry-run runs synchronously so the preview prints right here (no background op).
+    if dry_run:
+        from lab.build import BuildManager
+        try:
+            BuildManager(ProxmoxClient(s), s).build(
+                build_name, version, log_fn=typer.echo,
+                skip_update=skip_update, skip_optimize=skip_optimize, dry_run=True,
+            )
+        except (RuntimeError, ValueError, FileNotFoundError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1)
+        return
+
     command = " ".join(sys.argv)
     target = f"{build_name}-{version}" if version else build_name
     op_id = create_operation("template_build", command, current_username(), target)
-    spawn_background(op_id, "template_build", build_name, version, url)
+    spawn_background(
+        op_id, "template_build", build_name, version, url,
+        "1" if skip_update else "0", "1" if skip_optimize else "0",
+    )
     typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
 
 

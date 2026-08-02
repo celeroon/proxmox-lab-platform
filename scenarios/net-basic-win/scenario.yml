@@ -285,9 +285,10 @@ vms:
         # node's cert server only runs for multi-node clusters.
         - task: services/export_ca_artifact
 
-  - name: win-1
+  - name: win-user-1
     depends_on: [elk-1]
-    template: gusztavvargadr/windows-11-22h2-enterprise
+    # template: gusztavvargadr/windows-11-22h2-enterprise
+    template: windows-11
     clone_mode: full
     cpus: 4
     memory: 8192

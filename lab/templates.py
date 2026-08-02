@@ -81,20 +81,24 @@ def _drop_cache_path(path: Path) -> None:
         os.close(fd)
 
 
-def _download(url: str, dest: Path) -> None:
-    """Download url to dest via wget, resuming any previous partial transfer.
+# Consecutive download attempts that make zero progress before the URL is
+# treated as genuinely broken rather than an expired presigned link.
+_MAX_STALLED_ATTEMPTS = 3
+
+
+def _run_wget(url: str, part: Path, deadline: float) -> str | None:
+    """Run one `wget -c` pass against url, appending to part.
+
+    Returns None on success, or a short error-detail string on failure. Raises
+    TimeoutError if the overall deadline passes while wget is still running.
+    Drops the page cache periodically so a multi-GB transfer doesn't evict
+    everything else on the management VM.
 
     wget uses GnuTLS rather than OpenSSL, avoiding SSL record-layer failures
     seen with both curl and httpx on Vagrant Cloud CDN long-running downloads.
-
-    -nv rather than -q: -q suppresses wget's error line too, which leaves a
-    failure with no diagnosis at all. The .part file is kept on failure on
-    purpose — the CDN redirects to a presigned URL valid for only 900s, so a
-    13 GB box on a link slower than ~15 MB/s cannot finish in one attempt and
-    has to resume across runs.
+    -nv rather than -q: -q suppresses wget's error line too, which would leave a
+    failure with no diagnosis at all.
     """
-    part = dest.with_suffix(dest.suffix + ".part")
-    part.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "wget", "-nv", "-c",
         "--tries=10",
@@ -105,10 +109,11 @@ def _download(url: str, dest: Path) -> None:
     ]
     with tempfile.TemporaryFile("w+") as errfile:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errfile)
-        deadline = time.monotonic() + _DOWNLOAD_TIMEOUT
         try:
             while proc.poll() is None:
                 if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
                     raise TimeoutError(
                         f"download exceeded {_DOWNLOAD_TIMEOUT // 3600}h — "
                         "partial file kept, re-run to resume"
@@ -123,10 +128,58 @@ def _download(url: str, dest: Path) -> None:
         errfile.seek(0)
         stderr = errfile.read()
 
-    if proc.returncode != 0:
-        lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
-        detail = lines[-1] if lines else f"wget exited {proc.returncode}"
-        raise RuntimeError(f"{detail} — partial file kept, re-run to resume")
+    if proc.returncode == 0:
+        return None
+    lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+    return lines[-1] if lines else f"wget exited {proc.returncode}"
+
+
+def _download(resolve_url: Callable[[], str], dest: Path, log_fn: Callable[[str], None] = print) -> None:
+    """Download dest via wget, resuming automatically across presigned-URL expiries.
+
+    Vagrant Cloud's download_url 302-redirects to a CDN presigned URL valid for
+    only ~900s. A box on a link slower than ~15 MB/s cannot finish inside that
+    window: when the URL expires mid-transfer wget stops with 'ERROR 400: Bad
+    Request' and won't retry a 4xx. Re-resolving the redirect mints a fresh
+    presigned URL, so we loop — resolving a new URL and resuming the .part file
+    with `wget -c` — until the file is complete. This previously required the
+    operator to re-run `lab template fetch` by hand after every expiry; the loop
+    now does that within a single operation.
+
+    The .part file is kept on hard failure on purpose so a later re-run can still
+    resume it. Gives up only when the overall deadline passes or several
+    consecutive attempts make no progress at all (a genuinely bad URL, not an
+    expiry).
+    """
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+
+    deadline = time.monotonic() + _DOWNLOAD_TIMEOUT
+    stalled = 0
+    while True:
+        size_before = part.stat().st_size if part.exists() else 0
+        detail = _run_wget(resolve_url(), part, deadline)
+        if detail is None:
+            break
+        size_after = part.stat().st_size if part.exists() else 0
+
+        if size_after > size_before:
+            stalled = 0
+            log_fn(
+                f"download interrupted at {size_after >> 20} MB ({detail}) "
+                f"— resuming with a fresh URL"
+            )
+            continue
+
+        stalled += 1
+        if stalled >= _MAX_STALLED_ATTEMPTS:
+            raise RuntimeError(
+                f"{detail} — no progress after {_MAX_STALLED_ATTEMPTS} attempts, "
+                "partial file kept, re-run to resume"
+            )
+        log_fn(f"download made no progress ({detail}) — retry {stalled}/{_MAX_STALLED_ATTEMPTS}")
+        time.sleep(15)
+
     _drop_cache_path(part)
     part.rename(dest)
 
@@ -357,10 +410,11 @@ class TemplateManager:
         box_path = Path(self._settings.templates_dir) / ".downloads" / f"{tpl_name}.box"
 
         log_fn(f"resolving {box} on Vagrant Cloud")
-        url = _get_download_url(box)
         try:
             log_fn("downloading box")
-            _download(url, box_path)
+            # Resolve inside _download so each resume gets a fresh presigned URL —
+            # the redirect target expires in ~900s, shorter than a full box fetch.
+            _download(lambda: _get_download_url(box), box_path, log_fn)
             log_fn("extracting qcow2")
             _extract_qcow2(box_path, qcow2_path)
         except Exception:

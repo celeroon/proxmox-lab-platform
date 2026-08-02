@@ -45,14 +45,26 @@ def _template_source_add(op_id: int, build_name: str, source_path: str) -> None:
     mgr.add(build_name, Path(source_path), log_fn=lambda msg: _log(op_id, msg))
 
 
-def _template_build(op_id: int, build_name: str, version: str, url: str = "") -> None:
+def _template_build(
+    op_id: int,
+    build_name: str,
+    version: str,
+    url: str = "",
+    skip_update: str = "0",
+    skip_optimize: str = "0",
+) -> None:
     from lab.build import BuildManager
     from lab.config import get_settings
     from lab.proxmox import ProxmoxClient
 
     s = get_settings()
     mgr = BuildManager(ProxmoxClient(s), s)
-    mgr.build(build_name, version, url=url, log_fn=lambda msg: _log(op_id, msg))
+    mgr.build(
+        build_name, version, url=url,
+        log_fn=lambda msg: _log(op_id, msg),
+        skip_update=skip_update == "1",
+        skip_optimize=skip_optimize == "1",
+    )
 
 
 def _deploy_start(op_id: int, scenario_path: str, username: str, skip_ansible: str, target: str = "", no_headroom: str = "0") -> None:
