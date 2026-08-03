@@ -1,7 +1,10 @@
 ---
 # Task: Install Chocolatey package manager and software packages
 # Variables:
-#   chocolatey_software_list: list of {name, version?, ignore_checksums?} dicts
+#   chocolatey_software_list: list of {name, version?, ignore_checksums?, timeout?} dicts
+#   chocolatey_timeout: per-package execution timeout in seconds (default 900).
+#     Large installers (e.g. googlechrome pulls its MSI from dl.google.com) can
+#     exceed the old 300s over a slow lab path; raise per-item with `timeout:`.
 
 - name: Install Chocolatey
   ansible.windows.win_powershell:
@@ -19,5 +22,26 @@
     state: present
     version: "{{ item.version | default(omit) }}"
     ignore_checksums: "{{ item.ignore_checksums | default(omit) }}"
-    timeout: 300
+    timeout: "{{ item.timeout | default(chocolatey_timeout | default(900)) }}"
   loop: "{{ chocolatey_software_list | default([]) }}"
+  # Show the package name (not the whole dict) on each iteration line, so the
+  # log reads "changed: [host] => (item=googlechrome)" as each one installs.
+  loop_control:
+    label: "{{ item.name }}"
+  register: _choco_install
+  # Retry transient CDN failures (e.g. a reset mid-download). This does not
+  # substitute for the MTU/MSS fix on the firewall — a path-MTU blackhole would
+  # fail every attempt — but it absorbs the occasional dropped connection.
+  retries: "{{ item.retries | default(chocolatey_retries | default(2)) }}"
+  delay: 20
+  until: _choco_install is succeeded
+
+- name: Software install summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.name }}:
+      {{ 'FAILED' if (item.failed | default(false))
+         else ('installed/updated' if (item.changed | default(false)) else 'already present') }}
+  loop: "{{ _choco_install.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"

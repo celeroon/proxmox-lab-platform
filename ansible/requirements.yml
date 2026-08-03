@@ -8,3 +8,4 @@ collections:
   - name: ansible.windows
   - name: community.windows
   - name: community.network
+  - name: chocolatey.chocolatey

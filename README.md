@@ -285,6 +285,26 @@ lab deploy start net-basic-win --user <user>
 
 ---
 
+### art-topology-a1
+
+Atomic Red Team endpoint lab. Same network spine as `net-basic-win` (VyOS →
+NethSecurity → OVS core → single-node Elastic), with a Windows 11 workstation
+(`win-user-1`) enrolled into Fleet. On top of the baseline endpoint it installs a
+set of red-team tooling via Chocolatey — Chrome, Firefox, 7-Zip, Python, PuTTY,
+Sysinternals, Nmap, Notepad++ — chosen from the third-party software the common
+Windows [atomic tests](https://github.com/redcanaryco/atomic-red-team) actually
+invoke, so those atomics run without hunting for prerequisites. Software is
+installed **before** the Elastic Agent so the agent also captures the install
+activity. No domain join. 
+
+[scenario.yml](scenarios/art-topology-a1/scenario.yml)
+
+```bash
+lab deploy start art-topology-a1 --user <user>
+```
+
+---
+
 ## Disclaimer
 
 This project is for **educational and research use in a closed, virtual lab environment only**. Do **not** use any techniques, tools, or configurations from this repository against real systems, production networks, or assets you do not own or lack explicit written permission to test. Always comply with all applicable laws, regulations, licenses, and organizational policies.

@@ -1,0 +1,21 @@
+---
+# Task: Drop an Atomic Red Team cheat-sheet on the attacker VM (home dir + the
+# desktop) so anyone who logs into art-1 has ready-made examples for running
+# tests by hand. Rendered with the actual target host/user.
+
+- name: Ensure ~/Desktop exists
+  become: false
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user | default('vagrant') }}/Desktop"
+    state: directory
+    mode: "0755"
+
+- name: Render the Atomic Red Team runbook
+  become: false
+  ansible.builtin.template:
+    src: "{{ lab_ansible_dir }}/roles/linux/templates/art-hints.txt.j2"
+    dest: "{{ item }}"
+    mode: "0644"
+  loop:
+    - "/home/{{ ansible_user | default('vagrant') }}/art-hints.txt"
+    - "/home/{{ ansible_user | default('vagrant') }}/Desktop/art-hints.txt"

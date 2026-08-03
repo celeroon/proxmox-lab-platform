@@ -1,0 +1,77 @@
+---
+# Task: Configure Windows advanced audit policy on a STANDALONE (non-domain) host.
+#
+# Uses auditpol.exe to set the effective local audit policy per subcategory, so
+# no Active Directory / GPO is required (the domain/SYSVOL variant lives in
+# windows/configure_gpo_audit). Subcategories are addressed by GUID so the task
+# is independent of the guest's display language.
+#
+# Also sets two registry values that the subcategory policy relies on:
+#   SCENoApplyLegacyAuditPolicy = 1        -> subcategory policy wins over the
+#                                             legacy nine-category audit policy
+#   ProcessCreationIncludeCmdLine_Enabled = 1 -> 4688 events carry the full
+#                                                command line (key for detection)
+#
+# Verify afterwards with `auditpol /get /category:*` (see verify-logging.ps1 in
+# the scenario directory).
+
+- name: Force advanced (subcategory) audit policy over legacy policy
+  ansible.windows.win_regedit:
+    path: HKLM:\System\CurrentControlSet\Control\Lsa
+    name: SCENoApplyLegacyAuditPolicy
+    data: 1
+    type: dword
+
+- name: Include command line in Process Creation (4688) events
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit
+    name: ProcessCreationIncludeCmdLine_Enabled
+    data: 1
+    type: dword
+
+- name: Apply advanced audit policy subcategories
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      # Subcategory GUID -> success/failure setting. GUIDs are locale-independent,
+      # so this works regardless of the guest's Windows display language.
+      $audit = [ordered]@{
+        '{0CCE923F-69AE-11D9-BED3-505054503030}' = 'failure'          # Credential Validation
+        '{0CCE9237-69AE-11D9-BED3-505054503030}' = 'success'          # Security Group Management
+        '{0CCE9235-69AE-11D9-BED3-505054503030}' = 'success,failure'  # User Account Management
+        '{0CCE922D-69AE-11D9-BED3-505054503030}' = 'success,failure'  # DPAPI Activity
+        '{0CCE9248-69AE-11D9-BED3-505054503030}' = 'success'          # Plug and Play Events
+        '{0CCE922B-69AE-11D9-BED3-505054503030}' = 'success'          # Process Creation
+        '{0CCE922C-69AE-11D9-BED3-505054503030}' = 'success'          # Process Termination
+        '{0CCE9217-69AE-11D9-BED3-505054503030}' = 'failure'          # Account Lockout
+        '{0CCE9249-69AE-11D9-BED3-505054503030}' = 'success'          # Group Membership
+        '{0CCE9216-69AE-11D9-BED3-505054503030}' = 'success'          # Logoff
+        '{0CCE9215-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Logon
+        '{0CCE921C-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Other Logon/Logoff Events
+        '{0CCE921B-69AE-11D9-BED3-505054503030}' = 'success'          # Special Logon
+        '{0CCE9247-69AE-11D9-BED3-505054503030}' = 'success'          # User / Device Claims
+        '{0CCE9244-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Detailed File Share
+        '{0CCE9224-69AE-11D9-BED3-505054503030}' = 'success,failure'  # File Share
+        '{0CCE921D-69AE-11D9-BED3-505054503030}' = 'success,failure'  # File System
+        '{0CCE9223-69AE-11D9-BED3-505054503030}' = 'success'          # Handle Manipulation
+        '{0CCE921F-69AE-11D9-BED3-505054503030}' = 'failure'          # Kernel Object
+        '{0CCE9227-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Other Object Access Events
+        '{0CCE921E-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Registry
+        '{0CCE9245-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Removable Storage
+        '{0CCE922F-69AE-11D9-BED3-505054503030}' = 'success'          # Audit Policy Change
+        '{0CCE9230-69AE-11D9-BED3-505054503030}' = 'success'          # Authentication Policy Change
+        '{0CCE9231-69AE-11D9-BED3-505054503030}' = 'success'          # Authorization Policy Change
+        '{0CCE9234-69AE-11D9-BED3-505054503030}' = 'success,failure'  # Other Policy Change Events
+        '{0CCE9228-69AE-11D9-BED3-505054503030}' = 'success'          # Sensitive Privilege Use
+        '{0CCE9210-69AE-11D9-BED3-505054503030}' = 'success'          # Security State Change
+        '{0CCE9211-69AE-11D9-BED3-505054503030}' = 'success'          # Security System Extension
+        '{0CCE9212-69AE-11D9-BED3-505054503030}' = 'failure'          # System Integrity
+      }
+      foreach ($guid in $audit.Keys) {
+        $v = $audit[$guid]
+        $s = if ($v -match 'success') { 'enable' } else { 'disable' }
+        $f = if ($v -match 'failure') { 'enable' } else { 'disable' }
+        & auditpol.exe /set /subcategory:"$guid" /success:$s /failure:$f | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "auditpol failed for $guid (exit $LASTEXITCODE)" }
+      }
+      $Ansible.Changed = $true

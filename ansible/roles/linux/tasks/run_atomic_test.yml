@@ -1,0 +1,54 @@
+---
+# Task: Run one or more Windows atomic tests from the Linux attacker, over
+# PowerShell-remoting-over-SSH. Each test executes ON the Windows target, so its
+# endpoint telemetry (Sysmon, 4688, PowerShell 4104) is generated there and
+# shipped to Elastic by the agent.
+#
+# vars:
+#   atomic_target_host — Windows target host/IP (default: injected mgmt IP)
+#   atomic_target_user — SSH/remoting user on the target (default: vagrant)
+#   atomic_tests       — list of tests to run, each a dict:
+#       technique     (required) ATT&CK ID, e.g. "T1059.001"
+#       tests         (optional) comma-separated test numbers, e.g. "1,2".
+#                     Omit to run every test defined for the technique.
+#       get_prereqs   (optional, default false) run -GetPrereqs first
+#       cleanup       (optional, default false) run -Cleanup afterwards. Leave
+#                     false for tests whose artifact you want to keep, or whose
+#                     cleanup is unreliable.
+#       timeout       (optional, default 120) per-command timeout in seconds
+#
+# A fresh SSH session is opened per test (so each shows up as its own logon on
+# the target — useful telemetry, and it isolates a hanging test).
+
+- name: Run atomic tests on the Windows target over SSH
+  become: false
+  ansible.builtin.shell:
+    cmd: |
+      pwsh -NoProfile -Command '
+        $ErrorActionPreference = "Stop"
+        Import-Module invoke-atomicredteam -Force
+        $sess = New-PSSession -HostName {{ atomic_target_host }} -UserName {{ atomic_target_user | default("vagrant") }} -KeyFilePath "$HOME/.ssh/id_ed25519" -SSHTransport
+        try {
+          $common = @{ Session = $sess; PathToAtomicsFolder = "$HOME/AtomicRedTeam/atomics"; TimeoutSeconds = {{ item.timeout | default(120) }} }
+          {% if item.tests is defined %}$common.TestNumbers = @({{ item.tests }}){% endif %}
+          {% if item.get_prereqs | default(false) %}
+          Invoke-AtomicTest "{{ item.technique }}" @common -GetPrereqs
+          {% endif %}
+          Invoke-AtomicTest "{{ item.technique }}" @common
+          {% if item.cleanup | default(false) %}
+          Invoke-AtomicTest "{{ item.technique }}" @common -Cleanup
+          {% endif %}
+        } finally { Remove-PSSession $sess }
+      '
+  loop: "{{ atomic_tests | default([]) }}"
+  loop_control:
+    label: "{{ item.technique }}{{ ' #' ~ item.tests if item.tests is defined else '' }}"
+  register: _atomic_runs
+  changed_when: true
+
+- name: Show atomic test output
+  ansible.builtin.debug:
+    msg: "{{ item.item.technique }}: {{ item.stdout_lines | default([]) }}"
+  loop: "{{ _atomic_runs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.technique }}"

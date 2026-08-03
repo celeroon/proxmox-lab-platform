@@ -1,0 +1,28 @@
+---
+# Task: Enable TCP timestamps (RFC 1323) on Windows.
+#
+# Windows leaves timestamps "allowed" but never INITIATES them. On this lab's
+# multi-NAT WAN path (neth -> vyos -> mgmt gateway, three sequential SNATs), a
+# timestamp-less TCP connection using SACK + window scaling gets mistracked by
+# the NAT/conntrack layers: the remote server's data appears unacked, so it falls
+# into exponential RTO backoff and single-flow internet throughput collapses to a
+# few KB/s. Internal lab traffic (no multi-NAT) and Linux guests (timestamps on by
+# default) are unaffected — which is why this looked Windows/internet-specific.
+#
+# Forcing timestamps on fixes it completely (verified on win-user-1:
+# ~1.7 KB/s -> ~55 MB/s). It is a persistent global setting and must run before
+# anything that downloads from the internet (e.g. install_chocolatey).
+
+- name: Enable TCP timestamps
+  ansible.windows.win_shell: netsh int tcp set global timestamps=enabled
+  register: _tcp_ts
+  changed_when: "'Ok' in (_tcp_ts.stdout | default(''))"
+
+- name: Read back the global TCP settings
+  ansible.windows.win_shell: netsh int tcp show global
+  register: _tcp_global
+  changed_when: false
+
+- name: Show timestamp state
+  ansible.builtin.debug:
+    msg: "{{ _tcp_global.stdout_lines | select('search', 'Timestamps') | list }}"

@@ -1,0 +1,33 @@
+---
+# Task: Give the Linux attacker the lab SSH private key (generated on the
+# controller during the Windows host's authorize_ssh_key run) and trust the
+# Windows target's host key, so PowerShell-remoting-over-SSH can authenticate
+# non-interactively with the key.
+#
+# vars:
+#   art_ssh_key_path  — controller path of the private key (must match the value
+#                       used by windows/authorize_ssh_key)
+#   atomic_target_host — hostname/IP of the Windows target to add to known_hosts
+
+- name: Ensure ~/.ssh exists
+  become: false
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user | default('vagrant') }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: Install the lab SSH private key from the controller
+  become: false
+  ansible.builtin.copy:
+    src: "{{ art_ssh_key_path | default(lab_ansible_dir + '/../data/artifacts/art/art_ed25519') }}"
+    dest: "/home/{{ ansible_user | default('vagrant') }}/.ssh/id_ed25519"
+    mode: "0600"
+
+- name: Trust the Windows target's SSH host key
+  become: false
+  ansible.builtin.shell:
+    cmd: >-
+      ssh-keyscan -T 10 {{ atomic_target_host }} >> /home/{{ ansible_user | default('vagrant') }}/.ssh/known_hosts
+  register: _keyscan
+  changed_when: "'no hostkey' not in _keyscan.stderr | default('')"
+  failed_when: false

@@ -1,0 +1,79 @@
+---
+# Task: Ensure the Windows OpenSSH Server (Feature-on-Demand capability) is
+# installed, running, reachable, and usable as a PowerShell-remoting-over-SSH
+# endpoint. Idempotent: the install step is skipped when the capability is
+# already present.
+#
+# PSRemoting over SSH requires PowerShell 6+ on BOTH ends. The pwsh subsystem
+# line is only added when pwsh.exe is present on this host, so install
+# PowerShell 7 first (chocolatey package: powershell-core) if you intend to run
+# `New-PSSession -HostName <this-host> -SSHTransport` against it.
+
+- name: Detect the OpenSSH Server capability
+  ansible.windows.win_powershell:
+    script: |
+      $cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+      $Ansible.Result = @{
+        name      = "$($cap.Name)"
+        installed = ($cap.State -eq 'Installed')
+      }
+      $Ansible.Changed = $false
+  register: _openssh_cap
+
+- name: Install the OpenSSH Server capability
+  ansible.windows.win_powershell:
+    script: |
+      $cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+      Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+      $Ansible.Changed = $true
+  when: not _openssh_cap.result.installed
+
+- name: Ensure the sshd service is running and set to start automatically
+  ansible.windows.win_service:
+    name: sshd
+    start_mode: auto
+    state: started
+
+- name: Ensure the inbound firewall rule for SSH (TCP 22) exists and is enabled
+  ansible.windows.win_powershell:
+    script: |
+      $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+      if (-not $rule) {
+        New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+          -DisplayName 'OpenSSH SSH Server (sshd)' -Enabled True -Direction Inbound `
+          -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+        $Ansible.Changed = $true
+      } else {
+        Enable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP'
+        $Ansible.Changed = $false
+      }
+
+- name: Register the PowerShell subsystem for PSRemoting over SSH (needs pwsh)
+  ansible.windows.win_powershell:
+    script: |
+      $cfg  = 'C:\ProgramData\ssh\sshd_config'
+      $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty Source
+      # choco may not have refreshed PATH in this WinRM session; check the
+      # default install location too.
+      if (-not $pwsh -and (Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe')) {
+        $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+      }
+      if (-not $pwsh) {
+        $Ansible.Result  = @{ pwsh = $false
+          note = 'pwsh not found; subsystem skipped. Install powershell-core for SSH remoting.' }
+        $Ansible.Changed = $false
+        return
+      }
+      # 8.3 short path avoids the space in "Program Files" inside sshd_config.
+      $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile($pwsh).ShortPath
+      $line  = "Subsystem powershell $short -sshs -NoLogo"
+      $body  = if (Test-Path $cfg) { Get-Content $cfg -Raw } else { '' }
+      if ($body -match '(?im)^\s*Subsystem\s+powershell\b') {
+        $Ansible.Changed = $false
+      } else {
+        Add-Content -Path $cfg -Value "`r`n$line`r`n"
+        Restart-Service sshd
+        $Ansible.Changed = $true
+      }
+      $Ansible.Result = @{ pwsh = $true; subsystem = $line }

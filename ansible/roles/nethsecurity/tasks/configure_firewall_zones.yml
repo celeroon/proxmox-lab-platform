@@ -69,6 +69,19 @@
     label: "{{ item.name }}"
   when: item.masq | default(false)
 
+# MSS clamping (--clamp-mss-to-pmtu). Needed on reduced-MTU paths (e.g. VXLAN
+# vnets at 1450) so forwarded TCP handshakes advertise an MSS that fits the path;
+# without it, large downloads stall/reset (small ones still work). Relies on the
+# zone's interface MTU being set correctly (see configure_interfaces `mtu`).
+- name: Enable MSS clamping (mtu_fix) on zone
+  ansible.builtin.command:
+    cmd: "uci set firewall.ns_{{ item.name }}.mtu_fix=1"
+  loop: "{{ zones }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when: item.mtu_fix | default(false)
+
 - name: Commit firewall config
   ansible.builtin.command:
     cmd: uci commit firewall

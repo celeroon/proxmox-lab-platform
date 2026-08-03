@@ -284,7 +284,34 @@ class ProxmoxClient:
                     self._log("cleanup      vmid=%s could not be removed — delete it manually", vmid)
             raise
 
+    def _locate_vm(self, node: str, vmid: int) -> str | None:
+        """Node currently hosting vmid, or None if it exists on no online node.
+
+        The caller's `node` usually comes from the deployment DB, which goes stale
+        if the VM was migrated. Cheap in the common case (one listing of the
+        expected node); only falls back to a full cluster scan (find_vm_node) when
+        the VM isn't where expected.
+        """
+        try:
+            if any(vm.vmid == vmid for vm in self.get_vms(node)):
+                return node
+        except Exception:
+            pass
+        try:
+            return self.find_vm_node(vmid)
+        except Exception:
+            return None
+
+    def _resolve_node(self, node: str, vmid: int) -> str:
+        """Actual node hosting vmid; falls back to `node` so the caller still gets
+        a meaningful error if the VM is genuinely gone."""
+        actual = self._locate_vm(node, vmid)
+        if actual and actual != node:
+            self._log("vm %s not on %s — found on %s (migrated); using it", vmid, node, actual)
+        return actual or node
+
     def start_vm(self, node: str, vmid: int, wait: bool = True) -> None:
+        node = self._resolve_node(node, vmid)
         self._log("start_vm     node=%s vmid=%s", node, vmid)
         upid = self._px.nodes(node).qemu(vmid).status.start.post()
         if wait and upid:
@@ -292,6 +319,7 @@ class ProxmoxClient:
 
     def stop_vm(self, node: str, vmid: int, wait: bool = True) -> None:
         """Force-stop a VM (immediate, equivalent to pulling the power)."""
+        node = self._resolve_node(node, vmid)
         self._log("stop_vm      node=%s vmid=%s", node, vmid)
         upid = self._px.nodes(node).qemu(vmid).status.stop.post()
         if wait and upid:
@@ -299,16 +327,24 @@ class ProxmoxClient:
 
     def shutdown_vm(self, node: str, vmid: int, wait: bool = True) -> None:
         """Graceful ACPI shutdown."""
+        node = self._resolve_node(node, vmid)
         self._log("shutdown_vm  node=%s vmid=%s", node, vmid)
         upid = self._px.nodes(node).qemu(vmid).status.shutdown.post()
         if wait and upid:
             self.wait_for_task(node, upid)
 
     def delete_vm(self, node: str, vmid: int, wait: bool = True) -> None:
-        self._log("delete_vm    node=%s vmid=%s", node, vmid)
-        upid = self._px.nodes(node).qemu(vmid).delete()
+        # Resolve the VM's real node. If it exists nowhere it's already gone —
+        # treat as success (return quietly) so callers remove the DB row instead
+        # of keeping it forever as a phantom that only points at a stale node.
+        actual = self._locate_vm(node, vmid)
+        if actual is None:
+            self._log("delete_vm    vmid=%s not found on any node — already gone", vmid)
+            return
+        self._log("delete_vm    node=%s vmid=%s", actual, vmid)
+        upid = self._px.nodes(actual).qemu(vmid).delete()
         if wait and upid:
-            self.wait_for_task(node, upid)
+            self.wait_for_task(actual, upid)
 
     # efidisk/tpmstate are included so UEFI guests don't leak their NVRAM volumes.
     _DISK_KEY_RE = re.compile(r'^(scsi|virtio|ide|sata|efidisk|tpmstate)\d+$')
@@ -319,6 +355,7 @@ class ProxmoxClient:
         Called before delete_vm so we can explicitly free volumes that qmdestroy may silently
         skip when RBD removal fails internally.
         """
+        node = self._resolve_node(node, vmid)
         try:
             config = self._px.nodes(node).qemu(vmid).config.get()
         except Exception:

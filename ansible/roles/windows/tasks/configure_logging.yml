@@ -1,14 +1,51 @@
 ---
-# Task: Enable PowerShell Script Block Logging and apply audit policy
+# Task: Enable PowerShell auditing.
+#   Script Block Logging -> EID 4104,  Module Logging -> EID 4103
+#
+# Three policy roots are covered because they are read by different hosts:
+#   Windows\PowerShell            -> Windows PowerShell 5.1 (64-bit)  channel:
+#                                    Microsoft-Windows-PowerShell/Operational
+#   Wow6432Node\...\Windows\PowerShell -> 32-bit Windows PowerShell
+#   PowerShellCore                -> PowerShell 7 (pwsh)              channel:
+#                                    PowerShellCore/Operational
+# The PowerShellCore root is essential in this lab: Atomic Red Team runs over the
+# SSH pwsh subsystem, so the attack activity is PowerShell 7, not 5.1. Setting
+# only the Windows\PowerShell key (as before) left pwsh unlogged.
+#
+# NOTE: PowerShell 7 events land in the separate PowerShellCore/Operational log,
+# so the Elastic Agent / Fleet Windows policy must also collect that channel.
+#
+# Advanced audit policy is handled separately (windows/configure_audit_policy).
 
-- name: Create Registry key for Script Block Logging
-  ansible.windows.win_shell: |
-    New-Item -Path "HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Force
+- name: Enable PowerShell Script Block Logging
+  ansible.windows.win_regedit:
+    path: "{{ item }}\\ScriptBlockLogging"
+    name: EnableScriptBlockLogging
+    data: 1
+    type: dword
+  loop:
+    - HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore
 
-- name: Enable Script Block Logging
-  ansible.windows.win_shell: |
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 1 -Force
+- name: Enable PowerShell Module Logging
+  ansible.windows.win_regedit:
+    path: "{{ item }}\\ModuleLogging"
+    name: EnableModuleLogging
+    data: 1
+    type: dword
+  loop:
+    - HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore
 
-- name: Apply audit policy
-  ansible.windows.win_shell: |
-    C:\win-setup\audit-policy.ps1
+- name: Log every module (ModuleNames\* = *)
+  ansible.windows.win_regedit:
+    path: "{{ item }}\\ModuleLogging\\ModuleNames"
+    name: "*"
+    data: "*"
+    type: string
+  loop:
+    - HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell
+    - HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore

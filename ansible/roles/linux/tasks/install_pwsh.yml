@@ -1,0 +1,35 @@
+---
+# Task: Install PowerShell Core (pwsh) on Debian/Ubuntu via the Microsoft apt
+# repo. Required on the Linux attacker to orchestrate Invoke-AtomicTest and to
+# open PowerShell-remoting-over-SSH sessions to Windows targets.
+
+- name: Install apt prerequisites for the Microsoft repo
+  ansible.builtin.apt:
+    name:
+      - wget
+      - apt-transport-https
+      - software-properties-common
+    state: present
+    update_cache: true
+  become: true
+
+- name: Register the Microsoft package repository
+  ansible.builtin.apt:
+    deb: "https://packages.microsoft.com/config/ubuntu/{{ ansible_distribution_version }}/packages-microsoft-prod.deb"
+  become: true
+
+- name: Install PowerShell
+  ansible.builtin.apt:
+    name: powershell
+    state: present
+    update_cache: true
+  become: true
+
+- name: Confirm pwsh is available
+  ansible.builtin.command: pwsh --version
+  register: _pwsh_version
+  changed_when: false
+
+- name: Show pwsh version
+  ansible.builtin.debug:
+    var: _pwsh_version.stdout
