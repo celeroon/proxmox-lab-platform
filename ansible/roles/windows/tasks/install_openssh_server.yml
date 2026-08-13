@@ -77,3 +77,25 @@
         $Ansible.Changed = $true
       }
       $Ansible.Result = @{ pwsh = $true; subsystem = $line }
+
+- name: Ensure sshd consults administrators_authorized_keys for admin key auth
+  # Some sshd_config variants ship the "Match Group administrators" block
+  # commented out, so an admin user's key in administrators_authorized_keys is
+  # never read and key auth falls through to a password prompt. Setting
+  # AuthorizedKeysFile globally makes sshd read that file for every user,
+  # independent of the (possibly commented) Match block.
+  ansible.windows.win_powershell:
+    script: |
+      $cfg  = 'C:\ProgramData\ssh\sshd_config'
+      $want = 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys .ssh/authorized_keys'
+      $c    = Get-Content $cfg
+      $cur  = ($c | Where-Object { $_ -match '^AuthorizedKeysFile\b' } | Select-Object -First 1)
+      if ($cur -eq $want) {
+        $Ansible.Changed = $false
+      } else {
+        if ($cur) { $c = $c -replace '(?m)^AuthorizedKeysFile\s+.*$', $want }
+        else      { $c += $want }
+        Set-Content -Path $cfg -Value $c
+        Restart-Service sshd
+        $Ansible.Changed = $true
+      }

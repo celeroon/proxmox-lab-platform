@@ -15,7 +15,10 @@
       pwsh -NoProfile -Command '
         $ErrorActionPreference = "Stop"
         Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-        Install-Module -Name powershell-yaml -Scope CurrentUser -Force
+        # invoke-atomicredteam from PSGallery lands on the module path so
+        # `Import-Module invoke-atomicredteam` works; Install-AtomicRedTeam only
+        # clones it under ~/AtomicRedTeam (not on PSModulePath) and fetches atomics.
+        Install-Module -Name invoke-atomicredteam,powershell-yaml -Scope CurrentUser -Force
         IEX (IWR "https://raw.githubusercontent.com/redcanaryco/invoke-atomicredteam/master/install-atomicredteam.ps1" -UseBasicParsing)
         Install-AtomicRedTeam -getAtomics -Force
       '

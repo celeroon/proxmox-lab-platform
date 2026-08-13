@@ -303,6 +303,17 @@ activity. No domain join.
 lab deploy start art-topology-a1 --user <user>
 ```
 
+**Detection rules.** Four flags in the `x-elastic-config` block of
+[scenario.yml](scenarios/art-topology-a1/scenario.yml) control rule import during the
+build: `upload_sigma_rules` / `enable_sigma_rules` (SigmaHQ Windows rules — downloaded,
+converted, imported) and `upload_custom_rules` / `enable_custom_rules` (your own rules).
+`upload_*` gates `enable_*` — if `upload_*_rules` is `false`, the matching `enable_*` is
+ignored. Put custom rules — Kibana Detection Engine **export** ndjson, one rule per
+line — in `data/rules/custom/` (git-ignored) **before** deploying. After the atomics
+run, a test report (PDF + ATT&CK Navigator layer) lands in `data/artifacts/art/reports/`
+(safe to delete; the lab SSH keys stay in `data/artifacts/art/`). Full
+details and rule format: [scenario README](scenarios/art-topology-a1/README.md).
+
 ---
 
 ## Disclaimer

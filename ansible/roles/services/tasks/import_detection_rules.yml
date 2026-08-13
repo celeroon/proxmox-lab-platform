@@ -1,0 +1,217 @@
+---
+# Import detection rules into Elastic during the build. Runs on elk-1 and talks to
+# the lab-IP Kibana ({{ kibana_ip }}), so it does not depend on the per-user mgmt IP.
+#
+# Two sources, each gated by its own upload_* flag. enable_* is honoured ONLY when
+# the matching upload_* is true, and controls whether rules land enabled or disabled
+# by rewriting "enabled": true -> false in the ndjson before import:
+#   custom — *.ndjson dropped in data/rules/custom/ on the controller
+#   sigma  — SigmaHQ rules converted with sigma-cli (target lucene, pipeline ecs_windows)
+#
+# An empty custom dir with upload_custom_rules=true is a WARNING, not a failure.
+# The Sigma path is best-effort (unsupported rules are skipped, never fatal).
+#
+# vars (from x-elastic-config): kibana_ip, elk_password,
+#   upload_custom_rules, enable_custom_rules, upload_sigma_rules, enable_sigma_rules
+#   sigma_rule_dirs (optional, default [rules/windows]) — add rules for other OSes later
+
+- name: Ensure the rule staging dirs exist on elk-1
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - /tmp/art-rules/custom
+    - /tmp/art-rules/sigma
+  when: (upload_custom_rules | default(false)) or (upload_sigma_rules | default(false))
+
+# ---------------- custom rules ----------------
+- name: Find custom rule files on the controller
+  delegate_to: localhost
+  become: false
+  ansible.builtin.find:
+    paths: "{{ lab_ansible_dir }}/../data/rules/custom"
+    patterns: "*.ndjson"
+  register: _custom_found
+  when: upload_custom_rules | default(false)
+
+- name: Warn when custom rules are requested but none are provided
+  ansible.builtin.debug:
+    msg: >-
+      upload_custom_rules is true but data/rules/custom/ has no .ndjson files —
+      skipping custom rule import.
+  when:
+    - upload_custom_rules | default(false)
+    - (_custom_found.matched | default(0)) == 0
+
+- name: Stage custom rule files onto elk-1
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "/tmp/art-rules/custom/{{ item.path | basename }}"
+    mode: "0644"
+  loop: "{{ _custom_found.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: upload_custom_rules | default(false)
+
+- name: Disable custom rules before import (enable_custom_rules is false)
+  ansible.builtin.replace:
+    path: "/tmp/art-rules/custom/{{ item.path | basename }}"
+    regexp: '"enabled"\s*:\s*true'
+    replace: '"enabled": false'
+  loop: "{{ _custom_found.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when:
+    - upload_custom_rules | default(false)
+    - not (enable_custom_rules | default(false))
+
+- name: Import each custom rule file into Kibana
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - -u
+      - "elastic:{{ elk_password }}"
+      - -X
+      - POST
+      - "https://{{ kibana_ip }}:5601/api/detection_engine/rules/_import?overwrite=true"
+      - -H
+      - "kbn-xsrf: true"
+      - -F
+      - "file=@/tmp/art-rules/custom/{{ item.path | basename }};type=application/ndjson"
+  loop: "{{ _custom_found.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  register: _custom_import
+  changed_when: true
+  no_log: true
+  when: upload_custom_rules | default(false)
+
+# ---------------- sigma rules ----------------
+# The debian12 image ships no ensurepip, so `python3 -m venv` builds a pip-less
+# venv and sigma-cli silently never installs — install python3-venv/pip first.
+- name: Install python3-venv + pip on elk (required for the sigma-cli venv)
+  ansible.builtin.apt:
+    name: [python3-venv, python3-pip]
+    state: present
+    update_cache: true
+  become: true
+  failed_when: false
+  when: upload_sigma_rules | default(false)
+
+- name: Install sigma-cli in a venv (best-effort)
+  ansible.builtin.pip:
+    name: sigma-cli
+    virtualenv: /opt/sigma-venv
+    virtualenv_command: python3 -m venv
+  become: true
+  register: _sigma_pip
+  failed_when: false
+  when: upload_sigma_rules | default(false)
+
+- name: Install the Elasticsearch backend for sigma-cli (best-effort)
+  ansible.builtin.command: /opt/sigma-venv/bin/sigma plugin install elasticsearch
+  become: true
+  register: _sigma_plugin
+  changed_when: "'Successfully' in (_sigma_plugin.stdout | default(''))"
+  failed_when: false
+  when: upload_sigma_rules | default(false)
+
+- name: Clone SigmaHQ rules (shallow)
+  ansible.builtin.git:
+    repo: https://github.com/SigmaHQ/sigma.git
+    dest: /tmp/art-rules/sigma-src
+    depth: 1
+    version: master
+    force: true
+  become: true
+  failed_when: false
+  when: upload_sigma_rules | default(false)
+
+- name: Convert Sigma rule sets to Elastic ndjson (unsupported rules skipped)
+  # --skip-unsupported is REQUIRED: without it sigma-cli aborts the whole batch on
+  # the first rule the lucene backend can't handle (e.g. field references) and
+  # writes nothing. With it, ~2400 windows rules convert and the rest are skipped.
+  ansible.builtin.command:
+    cmd: >-
+      /opt/sigma-venv/bin/sigma convert -t lucene -p ecs_windows -f siem_rule_ndjson
+      --skip-unsupported
+      -o /tmp/art-rules/sigma/{{ item | regex_replace('[^A-Za-z0-9]', '_') }}.ndjson
+      /tmp/art-rules/sigma-src/{{ item }}
+  become: true
+  loop: "{{ sigma_rule_dirs | default(['rules/windows']) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _sigma_convert
+  changed_when: true
+  failed_when: false
+  when: upload_sigma_rules | default(false)
+
+- name: Find converted Sigma ndjson files
+  ansible.builtin.find:
+    paths: /tmp/art-rules/sigma
+    patterns: "*.ndjson"
+  register: _sigma_ndjson
+  when: upload_sigma_rules | default(false)
+
+- name: Warn if Sigma conversion produced nothing
+  ansible.builtin.debug:
+    msg: "upload_sigma_rules is true but no rules converted (sigma-cli/backend/clone issue) — skipping sigma import."
+  when:
+    - upload_sigma_rules | default(false)
+    - (_sigma_ndjson.matched | default(0)) == 0
+
+- name: Disable Sigma rules before import (enable_sigma_rules is false)
+  ansible.builtin.replace:
+    path: "{{ item.path }}"
+    regexp: '"enabled"\s*:\s*true'
+    replace: '"enabled": false'
+  loop: "{{ _sigma_ndjson.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  become: true
+  when:
+    - upload_sigma_rules | default(false)
+    - not (enable_sigma_rules | default(false))
+
+- name: Import converted Sigma rules into Kibana
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - -u
+      - "elastic:{{ elk_password }}"
+      - -X
+      - POST
+      - "https://{{ kibana_ip }}:5601/api/detection_engine/rules/_import?overwrite=true"
+      - -H
+      - "kbn-xsrf: true"
+      - -F
+      - "file=@{{ item.path }};type=application/ndjson"
+  loop: "{{ _sigma_ndjson.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  register: _sigma_import
+  changed_when: true
+  no_log: true
+  when: upload_sigma_rules | default(false)
+
+# ---------------- summary ----------------
+- name: Count detection rules present after import
+  ansible.builtin.uri:
+    url: "https://{{ kibana_ip }}:5601/api/detection_engine/rules/_find?per_page=0"
+    method: GET
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      kbn-xsrf: "true"
+  register: _rules_total
+  no_log: true
+  when: (upload_custom_rules | default(false)) or (upload_sigma_rules | default(false))
+
+- name: Show detection rule count
+  ansible.builtin.debug:
+    msg: "Detection rules present after import: {{ _rules_total.json.total | default('n/a') }}"
+  when: (upload_custom_rules | default(false)) or (upload_sigma_rules | default(false))

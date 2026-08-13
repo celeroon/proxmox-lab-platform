@@ -1,0 +1,59 @@
+---
+# Controller-side finalizer for the ART scenario. After the atomics have run and
+# the ExecutionLog CSV was fetched to data/artifacts/art/reports/, wait for the
+# detection rules to fire (they run on their own schedule — Elastic's default is
+# ~5 min) and render the ART test report into data/artifacts/art/reports/. That
+# dir holds ONLY report/run files (safe to delete); the SSH keys live in art/.
+#
+# Runs ON THE CONTROLLER (delegate_to: localhost) because that is where the CSV,
+# Elasticsearch reachability (mgmt IP), Gotenberg, and the artifacts dir live.
+#
+# Gated by `art_report` (default false) so it only runs for scenarios that opt in.
+# vars:
+#   art_report                — true to generate the report (default false)
+#   art_report_wait_timeout   — max seconds to poll for detections (default 420)
+#   art_report_tz             — display timezone: UTC (default) / local / IANA name
+- name: Generate the ART test report on the controller (waits for detections)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      python3 {{ lab_ansible_dir }}/../scripts/art-report.py
+      --csv {{ lab_ansible_dir }}/../data/artifacts/art/reports/run-{{ art_runid }}.csv
+      --out {{ lab_ansible_dir }}/../data/artifacts/art/reports
+      --es https://{{ elk_1_ip }}:9200
+      --wait --wait-timeout {{ art_report_wait_timeout | default(420) }}
+      {% if art_report_tz is defined %}--tz {{ art_report_tz }}{% endif %}
+  when: art_report | default(false) and art_runid is defined
+  register: _art_report
+  changed_when: true
+
+# Optionally drop the PDF on the Windows user's Desktop too. The controller holds
+# the lab SSH key (authorized for the admin user over Windows OpenSSH), so it can
+# scp straight to win-user-1. vars: art_report_push_win (default false).
+# Non-fatal: a failed copy (e.g. no PDF because Gotenberg was down) must not abort
+# the deployment — the report itself already landed in data/artifacts/art/reports/.
+# The key stays in art/; only the PDF is read from art/reports/.
+- name: Copy the ART report PDF to the Windows user's Desktop
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      scp -i {{ lab_ansible_dir }}/../data/artifacts/art/art_ed25519
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15
+      {{ lab_ansible_dir }}/../data/artifacts/art/reports/report-{{ art_runid }}.pdf
+      {{ atomic_target_user | default('vagrant') }}@{{ win_user_1_ip }}:Desktop/report-{{ art_runid }}.pdf
+  when: art_report | default(false) and art_report_push_win | default(false) and art_runid is defined
+  register: _art_push
+  changed_when: _art_push.rc == 0
+  failed_when: false
+
+- name: Warn if the PDF copy to Windows failed
+  ansible.builtin.debug:
+    msg: "PDF copy to win-user-1 failed (non-fatal): {{ _art_push.stderr | default('') }}"
+  when: _art_push is defined and (_art_push.rc | default(0)) != 0
+
+- name: Show ART report output
+  ansible.builtin.debug:
+    var: _art_report.stdout_lines
+  when: _art_report.stdout_lines is defined

@@ -1,5 +1,7 @@
 ---
-# Create Windows agent policy with System, Windows, Elastic Defend, and Network Traffic integrations.
+# Create Windows agent policy with System, Windows, Elastic Defend, Network Traffic,
+# and a Custom Windows Event Logs (winlog) integration that collects the
+# PowerShellCore/Operational channel (PowerShell 7 script-block logging, 4104).
 # Idempotent: skips all steps if windows-policy already exists.
 #
 # Required vars:
@@ -27,7 +29,7 @@
     validate_certs: no
     status_code: 200
   register: windows_pkg_versions
-  loop: [system, windows, endpoint, network_traffic]
+  loop: [system, windows, endpoint, network_traffic, winlog]
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -37,6 +39,7 @@
     win_pkg_windows: "{{ windows_pkg_versions.results[1].json.item.version }}"
     win_pkg_endpoint: "{{ windows_pkg_versions.results[2].json.item.version }}"
     win_pkg_nettraffic: "{{ windows_pkg_versions.results[3].json.item.version }}"
+    win_pkg_winlog: "{{ windows_pkg_versions.results[4].json.item.version }}"
   when: windows_policy_check.status == 404
 
 - name: Create Windows agent policy
@@ -201,6 +204,62 @@
       package:
         name: network_traffic
         version: "{{ win_pkg_nettraffic }}"
+    validate_certs: no
+    status_code: 200
+  no_log: true
+  when: windows_policy_check.status == 404
+
+# Custom Windows Event Logs integration for the PowerShellCore/Operational channel.
+# The stock Windows/System integrations do NOT read this non-default channel, so
+# PowerShell 7 (pwsh) script-block events (4104) are otherwise never collected.
+# Mirrors the hand-added "winlog-1" policy: the channel var selects the log, and
+# the data_stream.dataset override lands events in logs-winlog.winlog-pwsh7-*.
+- name: Add Custom Windows Event Logs integration (PowerShellCore/Operational, pwsh7)
+  uri:
+    url: "https://{{ kibana_ip }}:5601/api/fleet/package_policies"
+    method: POST
+    user: elastic
+    password: "{{ elk_password }}"
+    force_basic_auth: yes
+    headers:
+      kbn-xsrf: kibana
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: winlog-1
+      namespace: pwsh7
+      description: "PowerShell 7 (PowerShellCore/Operational) script-block logging"
+      policy_id: windows-policy
+      policy_ids: [windows-policy]
+      package:
+        name: winlog
+        title: Custom Windows Event Logs
+        version: "{{ win_pkg_winlog }}"
+      inputs:
+        - type: winlog
+          policy_template: winlogs
+          enabled: true
+          streams:
+            - enabled: true
+              data_stream:
+                type: logs
+                dataset: winlog.winlogs
+              vars:
+                channel:
+                  type: text
+                  value: "PowerShellCore/Operational"
+                data_stream.dataset:
+                  type: text
+                  value: winlog.winlog
+                ignore_older:
+                  type: text
+                  value: "72h"
+                forwarded:
+                  type: bool
+                  value: false
+                preserve_original_event:
+                  type: bool
+                  value: false
     validate_certs: no
     status_code: 200
   no_log: true

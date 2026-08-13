@@ -12,3 +12,4 @@
 - import_tasks: nftables.yml
 - import_tasks: novnc.yml
 - import_tasks: web.yml
+- import_tasks: gotenberg.yml

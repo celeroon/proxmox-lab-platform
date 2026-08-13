@@ -17,6 +17,14 @@ x-elastic-config: &elastic-config
   elk_cert_pass: "labcertpass"
   kibana_ip: *ip-elk-1
   fleet_ip: *ip-elk-1
+  # Detection-rule provisioning — imported on elk-1 during build (via the lab-IP Kibana).
+  # upload_* gates enable_*: if upload_*_rules is false, enable_*_rules is ignored.
+  # enable_* works by rewriting "enabled": true -> false in the ndjson before import.
+  # Custom rules: drop .ndjson files in data/rules/custom/ first (see scenario README).
+  upload_sigma_rules: true
+  enable_sigma_rules: false
+  upload_custom_rules: true
+  enable_custom_rules: true
 
 networks:
   - name: vyos-neth
@@ -302,6 +310,7 @@ vms:
           vars:
             mirror_windows_agent: true
         - task: services/fleet_windows_policy
+        - task: services/import_detection_rules
         # win-user-1 is handed the CA as a file from the controller; the bootstrap
         # node's cert server only runs for multi-node clusters.
         - task: services/export_ca_artifact
@@ -347,8 +356,8 @@ vms:
         - task: windows/install_chocolatey
           vars:
             chocolatey_software_list:
-              - {name: googlechrome, timeout: 1800}
-              - {name: firefox}
+              - {name: googlechrome, timeout: 1800, ignore_checksums: true}
+              - {name: firefox, ignore_checksums: true}
               - {name: 7zip}
               - {name: python3}
               - {name: putty.install}
@@ -367,45 +376,47 @@ vms:
         - task: windows/clear_event_logs
         - task: windows/install_elastic_agent
 
-  # - name: art-1
-  #   depends_on: [win-user-1]
-  #   template: joaobrlt/ubuntu-desktop-24.04
-  #   clone_mode: full
-  #   cpus: 4
-  #   memory: 8192
-  #   qemu_agent: true
-  #   interfaces:
-  #     - name: eth1
-  #       type: vnet
-  #       network: ovs-art
-  #   ansible:
-  #     connection:
-  #       type: ssh
-  #       user: vagrant
-  #       password: vagrant
-  #     gather_facts: true
-  #     become: true
-  #     vars:
-  #       atomic_target_host: "{{ win_user_1_ip }}"
-  #       atomic_target_user: vagrant
-  #       atomic_tests:
-  #         - {technique: T1082, tests: "1"}   # System Information Discovery
-  #         - {technique: T1033, tests: "1"}   # System Owner/User Discovery
-  #         - {technique: T1016, tests: "1"}   # System Network Config Discovery
-  #         # Examples needing prereqs / cleanup (uncomment to enable):
-  #         # - {technique: T1059.001, tests: "1", get_prereqs: true, cleanup: true}
-  #         # - {technique: T1105, tests: "1", get_prereqs: true, cleanup: false}  # keep the downloaded file
-  #         # - {technique: T1003} # no `tests:` = run all
-  #     tasks:
-  #       - task: linux/set_hostname
-  #         vars:
-  #           hostname: art-1
-  #       - task: linux/configure_network_interfaces
-  #       - task: linux/install_pwsh
-  #       - task: linux/install_atomic_redteam
-  #       - task: linux/deploy_ssh_key
-  #       # Cheat-sheet on the desktop for running tests by hand after login.
-  #       - task: linux/deploy_atomic_hints
-  #       # Run the atomic_tests batch on win-user-1 over SSH. They execute on
-  #       # Windows, so Sysmon/4688/4104 capture them and the agent ships them.
-  #       - task: linux/run_atomic_test
+  - name: art-1
+    depends_on: [win-user-1]
+    template: joaobrlt/ubuntu-desktop-24.04
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-art
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars:
+        atomic_target_host: "{{ win_user_1_ip }}"
+        atomic_target_user: vagrant
+        art_report: true
+        art_report_wait_timeout: 420
+        art_report_tz: local
+        art_report_push_win: true
+        atomic_tests:
+          - {technique: T1082, tests: "1", target: "{{ win_user_1_ip }}"}   # System Information Discovery
+          - {technique: T1033, tests: "1", target: "{{ win_user_1_ip }}"}   # System Owner/User Discovery
+          - {technique: T1016, tests: "1", target: "{{ win_user_1_ip }}"}   # System Network Config Discovery
+          # - {technique: T1059.001, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: true}
+          # - {technique: T1105, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: false}  # keep the download
+          # - {technique: T1003, target: "{{ win_user_1_ip }}"} # no `tests:` = run all
+          # - {technique: T1016, tests: "1", target: "{{ win_user_2_ip }}"}
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: art-1
+        - task: linux/configure_network_interfaces
+        - task: linux/install_pwsh
+        - task: linux/install_atomic_redteam
+        - task: linux/deploy_ssh_key
+        - task: linux/deploy_atomic_hints
+        - task: linux/run_atomic_test
+        - task: linux/generate_art_report
