@@ -7,6 +7,11 @@ setup.log
 # per-deployment artifacts fetched from running VMs (regenerated each deploy)
 data/artifacts/
 
+# user-supplied custom detection rules — never pushed (keep the dir, ignore the rules).
+# Sigma rules are NOT here: they are auto-cloned from SigmaHQ on elk-1 at build time.
+data/rules/custom/*
+!data/rules/custom/.gitkeep
+
 # python
 __pycache__/
 *.py[cod]
@@ -42,3 +47,5 @@ Thumbs.db
 .claude/
 
 windows-vagrant/
+
+*.ndjson

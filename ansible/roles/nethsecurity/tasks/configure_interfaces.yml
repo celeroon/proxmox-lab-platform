@@ -49,6 +49,15 @@
     label: "{{ item.name }}"
   when: item.proto == 'static' and item.netmask is defined
 
+- name: Set interface MTU
+  ansible.builtin.command:
+    cmd: "uci set network.{{ item.name }}.mtu={{ item.mtu }}"
+  loop: "{{ interfaces }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when: item.mtu is defined
+
 - name: Commit network config
   ansible.builtin.command:
     cmd: uci commit network

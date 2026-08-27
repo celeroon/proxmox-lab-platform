@@ -1,0 +1,37 @@
+---
+# Task: Install the Invoke-AtomicRedTeam runner and download the atomics on the
+# Linux attacker. This host is the orchestrator: it holds the module + atomics
+# and drives execution against remote targets over PowerShell-remoting sessions.
+# For remote (-Session) execution the atomics only need to live here; the runner
+# copies what each test needs to the target's temp dir at run time.
+#
+# Runs as the connecting (non-root) user so the module installs to that user's
+# scope and the atomics land under ~/AtomicRedTeam.
+
+- name: Install Invoke-AtomicRedTeam and download the atomics
+  become: false
+  ansible.builtin.shell:
+    cmd: |
+      pwsh -NoProfile -Command '
+        $ErrorActionPreference = "Stop"
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        # invoke-atomicredteam from PSGallery lands on the module path so
+        # `Import-Module invoke-atomicredteam` works; Install-AtomicRedTeam only
+        # clones it under ~/AtomicRedTeam (not on PSModulePath) and fetches atomics.
+        Install-Module -Name invoke-atomicredteam,powershell-yaml -Scope CurrentUser -Force
+        IEX (IWR "https://raw.githubusercontent.com/redcanaryco/invoke-atomicredteam/master/install-atomicredteam.ps1" -UseBasicParsing)
+        Install-AtomicRedTeam -getAtomics -Force
+      '
+  args:
+    creates: "/home/{{ ansible_user | default('vagrant') }}/AtomicRedTeam/atomics"
+
+- name: Verify the atomics folder is present
+  become: false
+  ansible.builtin.stat:
+    path: "/home/{{ ansible_user | default('vagrant') }}/AtomicRedTeam/atomics"
+  register: _atomics_dir
+
+- name: Fail if the atomics were not downloaded
+  ansible.builtin.fail:
+    msg: "AtomicRedTeam atomics folder is missing — invoke-atomicredteam install did not complete"
+  when: not _atomics_dir.stat.exists

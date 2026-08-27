@@ -1,0 +1,422 @@
+version: 1
+name: ART Topology A1 (Windows endpoint)
+description: >-
+  Atomic Red Team endpoint lab (topology A1): VyOS -> NethSecurity -> OVS core ->
+  single-node Elastic (ELK/Kibana/Fleet), with a Windows 11 workstation enrolled
+  into Fleet via the Windows policy. The endpoint has a baseline of red-team tooling
+  installed via Chocolatey (browsers, PuTTY, Sysinternals, Python, 7-Zip, Nmap,
+  Notepad++) so the common Windows atomics can run out of the box. First in an
+  a/b/c/d series of increasingly advanced ART topologies. No domain join.
+vm_prefix: ""
+
+x-elastic-config: &elastic-config
+  elastic_nodes:
+    - {name: elk-1, ip: &ip-elk-1 "172.16.10.10", roles: []}
+  elk_version: "9.4.4"
+  elk_password: "labpassword"
+  elk_cert_pass: "labcertpass"
+  kibana_ip: *ip-elk-1
+  fleet_ip: *ip-elk-1
+  # Detection-rule provisioning — imported on elk-1 during build (via the lab-IP Kibana).
+  # upload_* gates enable_*: if upload_*_rules is false, enable_*_rules is ignored.
+  # enable_* works by rewriting "enabled": true -> false in the ndjson before import.
+  # Custom rules: drop .ndjson files in data/rules/custom/ first (see scenario README).
+  upload_sigma_rules: true
+  enable_sigma_rules: false
+  upload_custom_rules: true
+  enable_custom_rules: true
+
+networks:
+  - name: vyos-neth
+    type: vnet
+  - name: neth-core
+    type: vnet
+  - name: ovs-win
+    type: vnet
+  - name: ovs-art
+    type: vnet
+  - name: ovs-elk
+    type: vnet
+
+vms:
+  - name: vyos-1
+    template: vyos/current
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-neth
+    ansible:
+      connection:
+        type: network_cli
+        network_os: vyos
+        user: vyos
+        password: vyos
+      gather_facts: false
+      become: false
+      tasks:
+        - task: vyos/set_hostname
+          vars:
+            hostname: vyos-1
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - name: eth1
+                description: "*** To FGT (HQ) ***"
+                address: 192.0.2.1/29
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - rule: 100
+                description: "TEST-NET-1 Outbound NAT"
+                source: 192.0.2.0/24
+                outbound_interface: eth0
+                translation: masquerade
+        - task: vyos/configure_routing
+          vars:
+            routing:
+              default_route: "10.{USER_ID}.0.1"
+
+  - name: neth-1
+    depends_on: [vyos-1]
+    template: nethsecurity-8.7.2
+    clone_mode: full
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: vyos-neth
+      - name: eth2
+        type: vnet
+        network: neth-core
+    ansible:
+      connection:
+        type: ssh
+        user: root
+        password: Nethesis,1234
+      gather_facts: false
+      become: false
+      tasks:
+        - task: nethsecurity/set_hostname
+          vars:
+            hostname: neth-1
+        - task: nethsecurity/rename_firewall_zone
+          vars:
+            old_zone: ns_lan
+            new_zone: ns_mgmt
+            zone_name: mgmt
+            network: mgmt
+            input: ACCEPT
+            output: ACCEPT
+            forward: ACCEPT
+        - task: nethsecurity/remove_mgmt_default_route
+        - task: nethsecurity/configure_interfaces
+          vars:
+            interfaces:
+              - name: wan
+                device: eth1
+                proto: static
+                ipaddr: 192.0.2.6/29
+                # VXLAN vnets are MTU 1450; match it so MSS clamping (below)
+                # advertises a fitting MSS and large downloads don't blackhole.
+                mtu: 1450
+        - task: nethsecurity/configure_default_route
+          vars:
+            interface: wan
+            gateway: 192.0.2.1
+        - task: nethsecurity/configure_firewall_zones
+          vars:
+            zones:
+              - name: wan
+                network: wan
+                input: REJECT
+                output: ACCEPT
+                forward: REJECT
+                masq: true
+                mtu_fix: true
+        - task: nethsecurity/configure_vlan_devices
+          vars:
+            vlans:
+              - name: ns_vlan10
+                ifname: eth2
+                vid: 10
+              - name: ns_vlan20
+                ifname: eth2
+                vid: 20
+        - task: nethsecurity/configure_interfaces
+          vars:
+            interfaces:
+              - name: vlan10
+                device: eth2.10
+                proto: static
+                ipaddr: 172.16.10.254
+                netmask: 255.255.255.0
+                mtu: 1450
+              - name: vlan20
+                device: eth2.20
+                proto: static
+                ipaddr: 172.16.20.254
+                netmask: 255.255.255.0
+                mtu: 1450
+              - name: eth2
+                device: eth2
+                proto: none
+        - task: nethsecurity/configure_firewall_zones
+          vars:
+            zones:
+              - name: lan
+                network: vlan10 vlan20 eth2
+                input: ACCEPT
+                output: ACCEPT
+                forward: ACCEPT
+                mtu_fix: true
+        - task: nethsecurity/configure_zone_forwarding
+          vars:
+            forwardings:
+              - src: lan
+                dest: wan
+        - task: nethsecurity/configure_nat
+          vars:
+            nat_rules:
+              - id: ns_nat_servers
+                name: SERVERS->Internet
+                src_ip: 172.16.10.0/24
+                device: eth1
+              - id: ns_nat_users
+                name: USERS->Internet
+                src_ip: 172.16.20.0/24
+                device: eth1
+        - task: nethsecurity/configure_firewall_rules
+          vars:
+            firewall_rules:
+              - id: ns_rule_servers_internet
+                name: SERVERS->INTERNET
+                src_ip: 172.16.10.0/24
+                target: ACCEPT
+              - id: ns_rule_users_internet
+                name: USERS->INTERNET
+                src_ip: 172.16.20.0/24
+                target: ACCEPT
+        - task: nethsecurity/configure_dhcp
+          vars:
+            dhcp_servers:
+              - interface: vlan20
+                start: "100"
+                limit: "101"
+                leasetime: 12h
+                gateway: 172.16.20.254
+                dns: 8.8.8.8
+
+  - name: ovs-core-1
+    depends_on: [neth-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: neth-core
+      - name: eth2
+        type: vnet
+        network: ovs-elk
+      - name: eth3
+        type: vnet
+        network: ovs-win
+      - name: eth4
+        type: vnet
+        network: ovs-art
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_default_gateway
+        - task: ovs/install_ovs
+        - task: ovs/configure_interfaces
+          vars:
+            bridge_name: br0
+            management_interface:
+              name: eth0
+              address: "{{ vm_mgmt_ip }}"
+              netmask: "{{ vm_mgmt_netmask }}"
+            bridge_ports:
+              - name: eth1
+                type: trunk
+                trunks: [10, 20]
+              - name: eth2
+                type: access
+                tag: 10
+              - name: eth3
+                type: access
+                tag: 20
+              - name: eth4
+                type: access
+                tag: 20
+
+  - name: elk-1
+    depends_on: [ovs-core-1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 16
+    memory: 65536
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-elk
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars: *elastic-config
+      tasks:
+        - task: linux/set_default_gateway
+        - task: linux/set_hostname
+          vars:
+            hostname: elk-1
+        - task: linux/configure_network_interfaces
+          vars:
+            lab_ip: *ip-elk-1
+            lab_netmask: "255.255.255.0"
+            lab_gateway: "172.16.10.254"
+            lab_dns: "8.8.8.8"
+        - task: linux/install_system_packages
+        - task: services/elasticsearch_bootstrap
+        - task: services/elasticsearch
+          vars:
+            lab_ip: *ip-elk-1
+            node_roles: ~
+            # elastic_heap: "8g"
+        - task: services/kibana
+          vars:
+            lab_ip: *ip-elk-1
+        - task: services/fleet_server
+          vars:
+            lab_ip: *ip-elk-1
+        - task: services/elastic_agent_mirror
+          vars:
+            mirror_windows_agent: true
+        - task: services/fleet_windows_policy
+        - task: services/import_detection_rules
+        # win-user-1 is handed the CA as a file from the controller; the bootstrap
+        # node's cert server only runs for multi-node clusters.
+        - task: services/export_ca_artifact
+
+  - name: win-user-1
+    depends_on: [elk-1]
+    # template: gusztavvargadr/windows-11-22h2-enterprise
+    template: windows-11
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    # The box image is GPT with an EFI System Partition, so it cannot boot the
+    # SeaBIOS default. q35 + TPM 2.0 match what Windows 11 expects to find.
+    bios: ovmf
+    efidisk: true
+    tpm: true
+    machine: q35
+    ostype: win11
+    cpu_type: host
+    # Without this the guest gets QEMU's Bochs VGA, falls back to the Microsoft
+    # Basic Display Adapter and is stuck at the firmware's resolution.
+    vga: virtio
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-win
+    ansible:
+      connection:
+        type: winrm
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: false
+      vars: *elastic-config
+      tasks:
+        - task: windows/set_hostname
+          vars:
+            hostname: win-user-1
+        - task: windows/configure_lab_route
+        - task: windows/configure_tcp_timestamps
+        - task: windows/configure_time
+        - task: windows/install_chocolatey
+          vars:
+            chocolatey_software_list:
+              - {name: googlechrome, timeout: 1800, ignore_checksums: true}
+              - {name: firefox, ignore_checksums: true}
+              - {name: 7zip}
+              - {name: python3}
+              - {name: putty.install}
+              - {name: sysinternals}
+              - {name: notepadplusplus}
+              # - {name: powershell-core} # powershell-core omitted: the windows-11 template already ships
+        - task: windows/install_openssh_server
+        - task: windows/authorize_ssh_key
+        - task: windows/setup_directory_files
+          vars:
+            fleet_policy_id: windows-policy
+        - task: windows/setup_certificate
+        - task: windows/configure_logging
+        - task: windows/configure_audit_policy
+        - task: windows/install_sysmon
+        - task: windows/clear_event_logs
+        - task: windows/install_elastic_agent
+
+  - name: art-1
+    depends_on: [win-user-1]
+    template: joaobrlt/ubuntu-desktop-24.04
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - name: eth1
+        type: vnet
+        network: ovs-art
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      vars:
+        atomic_target_host: "{{ win_user_1_ip }}"
+        atomic_target_user: vagrant
+        art_report: true
+        art_report_wait_timeout: 420
+        art_report_tz: local
+        art_report_push_win: true
+        atomic_tests:
+          - {technique: T1082, tests: "1", target: "{{ win_user_1_ip }}"}   # System Information Discovery
+          - {technique: T1033, tests: "1", target: "{{ win_user_1_ip }}"}   # System Owner/User Discovery
+          - {technique: T1016, tests: "1", target: "{{ win_user_1_ip }}"}   # System Network Config Discovery
+          # - {technique: T1059.001, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: true}
+          # - {technique: T1105, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: false}  # keep the download
+          # - {technique: T1003, target: "{{ win_user_1_ip }}"} # no `tests:` = run all
+          # - {technique: T1016, tests: "1", target: "{{ win_user_2_ip }}"}
+      tasks:
+        - task: linux/set_hostname
+          vars:
+            hostname: art-1
+        - task: linux/configure_network_interfaces
+        - task: linux/install_pwsh
+        - task: linux/install_atomic_redteam
+        - task: linux/deploy_ssh_key
+        - task: linux/deploy_atomic_hints
+        - task: linux/run_atomic_test
+        - task: linux/generate_art_report

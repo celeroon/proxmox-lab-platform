@@ -1,0 +1,55 @@
+---
+# Task: Authorize the lab SSH public key for PowerShell-remoting-over-SSH into
+# this Windows host.
+#
+# The keypair is generated once on the CONTROLLER and shared with the Linux
+# attacker via the artifacts dir (same controller-mediated pattern as the ELK CA
+# in services/export_ca_artifact). The public key is installed into
+# administrators_authorized_keys with the strict ACLs Windows OpenSSH requires
+# for administrator accounts (owned by / accessible to Administrators + SYSTEM
+# only) — a per-user ~/.ssh/authorized_keys is ignored for admins.
+#
+# vars:
+#   art_ssh_key_path — controller path for the private key (public key is <path>.pub)
+
+- name: Ensure the controller artifacts dir for the lab SSH key exists
+  delegate_to: localhost
+  become: false
+  ansible.builtin.file:
+    path: "{{ (art_ssh_key_path | default(lab_ansible_dir + '/../data/artifacts/art/art_ed25519')) | dirname }}"
+    state: directory
+
+- name: Generate the lab SSH keypair on the controller (once)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      ssh-keygen -t ed25519 -N "" -C "art-lab"
+      -f {{ art_ssh_key_path | default(lab_ansible_dir + '/../data/artifacts/art/art_ed25519') }}
+    creates: "{{ art_ssh_key_path | default(lab_ansible_dir + '/../data/artifacts/art/art_ed25519') }}"
+
+- name: Read the generated public key from the controller
+  delegate_to: localhost
+  become: false
+  ansible.builtin.slurp:
+    src: "{{ art_ssh_key_path | default(lab_ansible_dir + '/../data/artifacts/art/art_ed25519') }}.pub"
+  register: _art_pubkey
+
+- name: Authorize the key for administrators over SSH
+  ansible.windows.win_powershell:
+    parameters:
+      PubKey: "{{ _art_pubkey.content | b64decode | trim }}"
+    script: |
+      param([string]$PubKey)
+      $akf = 'C:\ProgramData\ssh\administrators_authorized_keys'
+      $existing = if (Test-Path $akf) { Get-Content $akf -ErrorAction SilentlyContinue } else { @() }
+      if ($existing -contains $PubKey) {
+        $Ansible.Changed = $false
+      } else {
+        Add-Content -Path $akf -Value $PubKey -Encoding ascii
+        # Windows OpenSSH ignores the admin authorized_keys file unless it is
+        # owned by and only accessible to the Administrators group and SYSTEM.
+        icacls $akf /inheritance:r | Out-Null
+        icacls $akf /grant 'Administrators:F' 'SYSTEM:F' | Out-Null
+        $Ansible.Changed = $true
+      }

@@ -1054,10 +1054,14 @@ def _provision_vm(
         env["ANSIBLE_RETRY_FILES_ENABLED"] = "False"
         env["ANSIBLE_COLLECTIONS_PATH"] = str(_ANSIBLE_DIR / "collections")
         env["ANSIBLE_ROLES_PATH"] = str(_ROLES_DIR)
+        # Unbuffered stdout so ansible task/item results stream to the op log live
+        # (e.g. per-package during a chocolatey loop) instead of arriving in one
+        # chunk when the play ends.
+        env["PYTHONUNBUFFERED"] = "1"
 
         cmd = [ansible_bin, str(playbook_path), "-i", inv_path]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        for line in proc.stdout:
+        for line in iter(proc.stdout.readline, ""):
             log_fn(line.rstrip())
         proc.wait()
         return proc.returncode == 0
@@ -1162,6 +1166,8 @@ def _provision_replica_group(
         env["ANSIBLE_RETRY_FILES_ENABLED"] = "False"
         env["ANSIBLE_COLLECTIONS_PATH"] = str(_ANSIBLE_DIR / "collections")
         env["ANSIBLE_ROLES_PATH"] = str(_ROLES_DIR)
+        # Unbuffered stdout so task/item results stream to the op log live.
+        env["PYTHONUNBUFFERED"] = "1"
 
         log_fn(f"[{base_name}] running ansible-playbook for {len(group_specs)} replicas")
         cmd = [ansible_bin, str(playbook_path), "-i", inv_path]
@@ -1171,7 +1177,7 @@ def _provision_replica_group(
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
-        for line in proc.stdout:
+        for line in iter(proc.stdout.readline, ""):
             log_fn(line.rstrip())
         proc.wait()
         return proc.returncode == 0

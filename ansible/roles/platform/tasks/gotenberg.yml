@@ -1,0 +1,31 @@
+---
+# Install Docker and run Gotenberg as a persistent, localhost-only PDF service on
+# the controller (127.0.0.1:3000). scripts/art-report.py POSTs the ART report
+# HTML to Gotenberg's Chromium route to render report-<runid>.pdf. Idempotent.
+- name: Install Docker engine (docker.io)
+  ansible.builtin.apt:
+    name: docker.io
+    state: present
+    update_cache: yes
+  tags: [gotenberg]
+
+- name: Ensure the docker service is enabled and running
+  ansible.builtin.systemd:
+    name: docker
+    enabled: yes
+    state: started
+  tags: [gotenberg]
+
+- name: Check whether the gotenberg container is already running
+  ansible.builtin.shell: docker ps --filter "name=^gotenberg$" --filter "status=running" -q
+  register: gotenberg_ps
+  changed_when: false
+  tags: [gotenberg]
+
+- name: Run the gotenberg container (bound to localhost:3000 only)
+  ansible.builtin.shell: |
+    docker rm -f gotenberg 2>/dev/null || true
+    docker run -d --name gotenberg --restart unless-stopped \
+      -p 127.0.0.1:3000:3000 gotenberg/gotenberg:8
+  when: gotenberg_ps.stdout == ""
+  tags: [gotenberg]

@@ -1,0 +1,46 @@
+================================================================================
+ Atomic Red Team — quick reference (art-1)
+================================================================================
+ Target Windows host : {{ atomic_target_host }}   (user: {{ atomic_target_user | default('vagrant') }})
+ SSH private key      : ~/.ssh/id_ed25519
+ Atomics folder       : ~/AtomicRedTeam/atomics
+ Runner              : invoke-atomicredteam (pwsh module, already installed)
+
+ The scenario already ran a first batch automatically. Below is how to run more
+ tests by hand after logging into this VM.
+--------------------------------------------------------------------------------
+
+# 1) Start pwsh and open ONE reusable session to the Windows target:
+pwsh
+$sess = New-PSSession -HostName {{ atomic_target_host }} -UserName {{ atomic_target_user | default('vagrant') }} -KeyFilePath $HOME/.ssh/id_ed25519 -SSHTransport
+
+# 2) Inspect a technique before running it:
+Invoke-AtomicTest T1082 -ShowDetailsBrief
+Invoke-AtomicTest T1082 -ShowDetails
+
+# 3) Prereqs (many tests need tools/files first):
+Invoke-AtomicTest T1059.001 -Session $sess -CheckPrereqs
+Invoke-AtomicTest T1059.001 -Session $sess -GetPrereqs
+
+# 4) Run specific test number(s):
+Invoke-AtomicTest T1059.001 -TestNumbers 1 -Session $sess -PathToAtomicsFolder $HOME/AtomicRedTeam/atomics
+
+# 5) Clean up afterwards (skip for tests whose artifact you want to keep):
+Invoke-AtomicTest T1059.001 -TestNumbers 1 -Session $sess -Cleanup
+
+# Run EVERY test for a technique (prereqs -> run -> cleanup):
+Invoke-AtomicTest T1003 -Session $sess -GetPrereqs
+Invoke-AtomicTest T1003 -Session $sess
+Invoke-AtomicTest T1003 -Session $sess -Cleanup
+
+# When finished:
+Remove-PSSession $sess
+
+--------------------------------------------------------------------------------
+ Notes
+ - Tests execute ON the Windows target, so detections show up in Kibana from
+   win-user-1 (Sysmon / Security 4688 / PowerShell 4104), not from this VM.
+ - Traffic to the target goes over the management network by default, so you can
+   filter it out of SIEM searches by source host if needed.
+ - Full technique list: https://github.com/redcanaryco/atomic-red-team/tree/master/atomics
+================================================================================

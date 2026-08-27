@@ -1,0 +1,18 @@
+---
+# Task: Clear every Windows event log channel for a clean baseline before the
+# Elastic Agent starts shipping. wevtutil covers the modern "Applications and
+# Services Logs" channels (Microsoft-Windows-Sysmon/Operational,
+# Microsoft-Windows-PowerShell/Operational, ...) that the legacy Clear-EventLog
+# cmdlet does not touch. Channels that cannot be cleared (analytic/debug or
+# in-use) are skipped rather than failing the play.
+
+- name: Clear all event log channels
+  ansible.windows.win_powershell:
+    script: |
+      $cleared = 0
+      foreach ($log in (& wevtutil.exe el)) {
+        & wevtutil.exe cl "$log" 2>$null
+        if ($LASTEXITCODE -eq 0) { $cleared++ }
+      }
+      $Ansible.Result = @{ channels_cleared = $cleared }
+      $Ansible.Changed = $true
