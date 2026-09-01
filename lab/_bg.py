@@ -113,6 +113,39 @@ def _deploy_destroy(op_id: int, deployment_name: str, username: str, target: str
 
 
 
+def _snapshot_create(op_id: int, deployment_name: str, username: str, vm: str = "") -> None:
+    from lab.deploy import DeployEngine
+    DeployEngine().snapshot_create(
+        deployment_name, username, vm=vm or None, log_fn=lambda msg: _log(op_id, msg),
+    )
+
+
+def _snapshot_rollback(op_id: int, deployment_name: str, username: str, vm: str = "", all_flag: str = "0") -> None:
+    from lab.deploy import DeployEngine
+    DeployEngine().snapshot_rollback(
+        deployment_name, username, vm=vm or None, all_vms=all_flag == "1",
+        log_fn=lambda msg: _log(op_id, msg),
+    )
+
+
+def _snapshot_delete(op_id: int, deployment_name: str, username: str, vm: str = "") -> None:
+    from lab.deploy import DeployEngine
+    DeployEngine().snapshot_delete(
+        deployment_name, username, vm=vm or None, log_fn=lambda msg: _log(op_id, msg),
+    )
+
+
+def _detonate(op_id: int, deployment_name: str, username: str,
+              tactic: str = "", revert: str = "", settle: str = "90",
+              per_technique: str = "0") -> None:
+    from lab.deploy import DeployEngine
+    DeployEngine().detonate(
+        deployment_name, username, tactic=tactic, revert=revert,
+        settle=int(settle or 90), per_technique=(per_technique == "1"),
+        log_fn=lambda msg: _log(op_id, msg),
+    )
+
+
 def _ct_template_fetch(op_id: int, name: str) -> None:
     from lab.config import get_settings
     from lab.proxmox import ProxmoxClient
@@ -146,6 +179,10 @@ _TASKS: dict[str, Callable[..., None]] = {
     "deploy_stop": _deploy_stop,
     "deploy_resume": _deploy_resume,
     "deploy_destroy": _deploy_destroy,
+    "snapshot_create": _snapshot_create,
+    "snapshot_rollback": _snapshot_rollback,
+    "snapshot_delete": _snapshot_delete,
+    "detonate": _detonate,
     "_noop": _noop,
 }
 

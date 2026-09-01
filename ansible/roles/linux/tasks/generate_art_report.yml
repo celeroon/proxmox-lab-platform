@@ -24,34 +24,71 @@
       --es https://{{ elk_1_ip }}:9200
       --wait --wait-timeout {{ art_report_wait_timeout | default(420) }}
       {% if art_report_tz is defined %}--tz {{ art_report_tz }}{% endif %}
-  when: art_report | default(false) and art_runid is defined
+      {% if art_tactic is defined and art_tactic %}--tactic {{ art_tactic }}{% endif %}
+  when: art_report | default(false) and art_runid is defined and (_art_csv.stat.exists | default(false))
   register: _art_report
   changed_when: true
 
-# Optionally drop the PDF on the Windows user's Desktop too. The controller holds
-# the lab SSH key (authorized for the admin user over Windows OpenSSH), so it can
-# scp straight to win-user-1. vars: art_report_push_win (default false).
-# Non-fatal: a failed copy (e.g. no PDF because Gotenberg was down) must not abort
-# the deployment — the report itself already landed in data/artifacts/art/reports/.
-# The key stays in art/; only the PDF is read from art/reports/.
-- name: Copy the ART report PDF to the Windows user's Desktop
-  delegate_to: localhost
+# Also drop the rendered report onto art-1 (the VM that ran the tests), pushed from
+# the controller where it was generated. Best-effort (a missing PDF must not fail).
+- name: Ensure the report dir exists on art-1
   become: false
-  ansible.builtin.command:
-    cmd: >-
-      scp -i {{ lab_ansible_dir }}/../data/artifacts/art/art_ed25519
-      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15
-      {{ lab_ansible_dir }}/../data/artifacts/art/reports/report-{{ art_runid }}.pdf
-      {{ atomic_target_user | default('vagrant') }}@{{ win_user_1_ip }}:Desktop/report-{{ art_runid }}.pdf
-  when: art_report | default(false) and art_report_push_win | default(false) and art_runid is defined
-  register: _art_push
-  changed_when: _art_push.rc == 0
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user | default('vagrant') }}/art-reports"
+    state: directory
+  when: art_report | default(false) and art_runid is defined
+
+- name: Copy the generated report onto art-1
+  become: false
+  ansible.builtin.copy:
+    src: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item }}"
+    dest: "/home/{{ ansible_user | default('vagrant') }}/art-reports/{{ item }}"
+    mode: "0644"
+  loop:
+    - "report-{{ art_runid }}.pdf"
+    - "report-{{ art_runid }}.html"
+    - "navigator-{{ art_runid }}.json"
+    - "summary-{{ art_runid }}.json"
+  loop_control:
+    label: "{{ item }}"
+  when: art_report | default(false) and art_runid is defined and (_art_csv.stat.exists | default(false))
   failed_when: false
 
-- name: Warn if the PDF copy to Windows failed
-  ansible.builtin.debug:
-    msg: "PDF copy to win-user-1 failed (non-fatal): {{ _art_push.stderr | default('') }}"
-  when: _art_push is defined and (_art_push.rc | default(0)) != 0
+# Mirror the report to a shared, user-readable location (organised per deployment
+# user) so colleagues can fetch it without repo access. Needs /opt/lab/reports
+# pre-created + writable by the runner; best-effort so it silently skips if absent.
+- name: Ensure the per-user report dir exists (/opt mirror)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.file:
+    path: "/opt/lab/reports/{{ art_report_user }}"
+    state: directory
+    mode: "0755"
+  when:
+    - art_report | default(false)
+    - art_report_user | default('') | length > 0
+    - _art_csv.stat.exists | default(false)
+  failed_when: false
+
+- name: Mirror the report to /opt/lab/reports/<user> (best-effort)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.copy:
+    src: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item }}"
+    dest: "/opt/lab/reports/{{ art_report_user }}/{{ item }}"
+    mode: "0644"
+  loop:
+    - "report-{{ art_runid }}.pdf"
+    - "report-{{ art_runid }}.html"
+    - "navigator-{{ art_runid }}.json"
+    - "summary-{{ art_runid }}.json"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - art_report | default(false)
+    - art_report_user | default('') | length > 0
+    - _art_csv.stat.exists | default(false)
+  failed_when: false
 
 - name: Show ART report output
   ansible.builtin.debug:

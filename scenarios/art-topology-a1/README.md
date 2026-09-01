@@ -10,6 +10,52 @@ the `art-1` node. That directory holds **only** report/run artifacts, so it is s
 clear manually (`rm data/artifacts/art/reports/*`); the lab SSH keys live one level up in
 `data/artifacts/art/` and are never touched.
 
+## Detonation range (snapshot reset)
+
+Deploy and detonation are **separate**. `lab deploy` builds the topology and provisions
+everything **except** the atomics (the `run_atomic_test` / `generate_art_report` tasks are
+marked `phase: detonate`, so deploy skips them). You then take a clean baseline and fire
+tests repeatably against a pristine Windows box — no redeploy.
+
+**Per-VM snapshot controls** (scenario `defaults:` + per-VM overrides):
+- `snapshot: disk | live` — this VM gets a `clean-baseline` snapshot so it *can* be rolled
+  back. `disk` = fresh boot on rollback (the default here, via `defaults: {snapshot: disk}`);
+  `live` = RAM/vmstate (instant resume, but wakes with a stale guest clock).
+- `rollback: true` — this VM is **auto-reverted** at the start of every `lab detonate`.
+  Only `win-user-1` has it.
+
+```bash
+# 1. build the range (no atomics fire)
+lab deploy start scenarios/art-topology-a1/scenario.yml
+
+# 2. baseline snapshots (take once the Windows agent has checked in to Fleet)
+lab snapshot create   art-topology-a1
+lab snapshot list     art-topology-a1
+lab snapshot delete   art-topology-a1                      # remove baselines
+lab snapshot rollback art-topology-a1 --vm win-user-1      # manual revert, one VM
+lab snapshot rollback art-topology-a1 --all                # whole-lab reset (baselined VMs)
+
+# 3. detonate — rolls the rollback VMs back to baseline, runs, reports
+lab detonate art-topology-a1 --tactic discovery            # one report for the tactic
+lab detonate art-topology-a1                               # omit --tactic = all tests
+lab detonate art-topology-a1 --tactic initial-access --per-technique   # a report per technique
+```
+
+**`lab detonate` flags:**
+
+| Flag | Effect |
+|------|--------|
+| `--tactic a[,b]` | run only tests tagged with these ATT&CK tactic(s); default = all |
+| `--per-technique` | one report per **base** technique (T1078.001/.003 → one `T1078`), run back-to-back after a single rollback |
+| `--revert vm[,vm]` | roll back only these victim VMs (default: all `rollback: true` VMs) |
+| `--settle N` | seconds to wait after rollback for agent check-in / clock resync (default 90) |
+
+Each atomic test carries a `tactic:` field and runs in file (kill-chain) order. A live
+rollback wakes with a stale clock, so `--settle` lets the agent re-check-in and NTP resync
+before firing (the report correlates on timestamps). Reports land in
+`data/artifacts/art/reports/` as `report-<runid>[-<TECHNIQUE>].pdf` and are also copied to
+`/home/vagrant/art-reports/` on `art-1`.
+
 ## Detection rules
 
 Rules are imported into Elastic during the build (on `elk-1`, via localhost Kibana).

@@ -11,3 +11,36 @@
     state: started
     daemon_reload: true
   tags: networkd
+
+# NetworkManager (present on the base image) otherwise grabs each per-user mgmt*
+# NIC and tries to DHCP it, overriding networkd's static 10.N.0.1/16 — which
+# silently breaks lab-VM reachability (dnsmasq can't serve on an address-less
+# interface). Exclude mgmt* from NM so networkd keeps sole ownership. Preventive:
+# applied here at setup so mgmt NICs created later by `lab user create` are never
+# hijacked.
+- name: Check whether NetworkManager is present
+  ansible.builtin.stat:
+    path: /etc/NetworkManager
+  register: _nm_dir
+  tags: networkd
+
+- name: Keep NetworkManager from managing the mgmt* interfaces (owned by networkd)
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/99-unmanage-mgmt.conf
+    content: |
+      # mgmt* interfaces are configured by systemd-networkd (10-mgmt-N.network).
+      # Without this, NetworkManager grabs them and tries DHCP, overriding the
+      # static 10.N.0.1/16 and breaking lab-VM reachability.
+      [keyfile]
+      unmanaged-devices=interface-name:mgmt*
+    mode: "0644"
+  when: _nm_dir.stat.exists
+  register: _nm_unmanage
+  tags: networkd
+
+- name: Reload NetworkManager so the mgmt* exclusion takes effect
+  ansible.builtin.systemd:
+    name: NetworkManager
+    state: reloaded
+  when: _nm_unmanage is changed
+  tags: networkd

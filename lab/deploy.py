@@ -29,6 +29,11 @@ _ANSIBLE_DIR = _PROJECT_ROOT / "ansible"
 
 
 _ROLES_DIR = _ANSIBLE_DIR / "roles"
+_SCENARIOS_DIR = _PROJECT_ROOT / "scenarios"
+
+# The single, fixed name for a VM's clean-baseline snapshot (the reset pivot for the
+# detonation range). Users never type it; per-VM naming means no cross-lab collision.
+BASELINE_SNAPSHOT = "clean-baseline"
 
 # Proxmox/Ceph serialize CT/VM delete (RBD removal) behind a single cluster-wide
 # 'storage-ceph-pool' cfs-lock. High delete concurrency just causes most threads
@@ -916,6 +921,8 @@ def _generate_vm_playbook(
     output_dir: Path,
     vm_ip: str | None = None,
     other_vms: list[tuple[str, str]] = (),
+    run_phase: str = "provision",
+    extra_vars: dict | None = None,
 ) -> Path:
     """Generate a per-VM Ansible playbook from the scenario's ansible block.
 
@@ -923,12 +930,22 @@ def _generate_vm_playbook(
     include_tasks block pointing at the absolute path of the role task file.
     {USER_ID} in vars is substituted with user_id; {{ vm_mgmt_ip }} with vm_ip.
     other_vms injects {name_underscored}_ip play vars for every other deployed VM.
+
+    run_phase splits the task list by the optional per-task `phase:` marker:
+    "provision" (deploy) keeps tasks WITHOUT `phase: detonate`; "detonate"
+    (`lab detonate`) keeps ONLY those with it. extra_vars are merged last into
+    play vars (e.g. the `art_tactic` filter for a detonation run).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     playbook_path = output_dir / f"playbook_{vm_name}.yml"
 
     tasks = []
     for entry in ansible_section.get("tasks") or []:
+        is_detonate = entry.get("phase") == "detonate"
+        if run_phase == "provision" and is_detonate:
+            continue
+        if run_phase == "detonate" and not is_detonate:
+            continue
         task_ref = entry["task"]  # e.g. "vyos/set_hostname"
         role, task_name = task_ref.split("/", 1)
         task_file = _ROLES_DIR / role / "tasks" / f"{task_name}.yml"
@@ -953,6 +970,8 @@ def _generate_vm_playbook(
     for name, ip in other_vms:
         play_vars[f"{name.replace('-', '_')}_ip"] = ip
     play_vars.update(ansible_section.get("vars", {}))
+    if extra_vars:
+        play_vars.update(extra_vars)
 
     play = {
         "name": f"Provision {vm_name}",
@@ -1023,11 +1042,16 @@ def _provision_vm(
     user_id: int,
     log_fn: Callable[[str], None] = print,
     other_vms: list[tuple[str, str]] = (),
+    run_phase: str = "provision",
+    extra_vars: dict | None = None,
 ) -> bool:
     """Generate a per-VM playbook and run ansible-playbook against it.
 
     Returns True on success, False on failure. Provisioning failure is logged
     but not fatal — the deployment stays up. Skips if vm_spec.ansible is empty.
+
+    run_phase / extra_vars are passed through to _generate_vm_playbook: deploy
+    runs the "provision" phase, `lab detonate` the "detonate" phase.
     """
     if not vm_spec.ansible:
         log_fn(f"{vm_name}: no ansible config — skipping")
@@ -1043,7 +1067,7 @@ def _provision_vm(
             f.write(inventory)
         os.chmod(inv_path, 0o600)
 
-        playbook_path = _generate_vm_playbook(vm_name, vm_spec.ansible, user_id, Path(tmpdir), vm_ip=mgmt_ip, other_vms=other_vms)
+        playbook_path = _generate_vm_playbook(vm_name, vm_spec.ansible, user_id, Path(tmpdir), vm_ip=mgmt_ip, other_vms=other_vms, run_phase=run_phase, extra_vars=extra_vars)
 
         subprocess.run(["ssh-keygen", "-R", mgmt_ip], capture_output=True)
 
@@ -1125,6 +1149,10 @@ def _provision_replica_group(
     # so they take precedence over play vars (same as standalone VM path).
     tasks = []
     for entry in ansible_section.get("tasks") or []:
+        # Replica groups only ever run the provision phase; detonate-phase tasks
+        # (if any) are handled by `lab detonate`, never during deploy.
+        if entry.get("phase") == "detonate":
+            continue
         task_ref = entry["task"]
         role, task_name = task_ref.split("/", 1)
         task_file = _ROLES_DIR / role / "tasks" / f"{task_name}.yml"
@@ -1195,6 +1223,76 @@ def _get_user(username: str) -> dict:
     if not row:
         raise RuntimeError(f"user '{username}' not found — create the user first")
     return row
+
+
+def _load_deployment_ops(deployment_name: str, username: str):
+    """Shared setup for the snapshot / art-run operations.
+
+    Returns (user_id, deployment_id, spec, rows) where rows maps VM name → its DB
+    row (vmid/node/management_ip/type/status). The scenario is RE-PARSED from disk
+    (scenarios/<deployment_name>/scenario.yml) so edits to atomic_tests/tactics are
+    picked up between runs.
+    """
+    user = _get_user(username)
+    user_db_id: int = user["id"]
+    user_id: int = user["user_id"]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM deployments WHERE user_id=%s AND name=%s AND status != 'destroyed'"
+                " ORDER BY created_at DESC LIMIT 1",
+                (user_db_id, deployment_name),
+            )
+            dep_row = cur.fetchone()
+    if not dep_row:
+        raise RuntimeError(f"deployment '{deployment_name}' not found for user '{username}'")
+    deployment_id: int = dep_row["id"]
+
+    scenario_file = _SCENARIOS_DIR / deployment_name / "scenario.yml"
+    if not scenario_file.exists():
+        raise RuntimeError(f"scenario file not found: {scenario_file}")
+    spec = parse_scenario(scenario_file)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, vmid, node, management_ip, type, status FROM vms WHERE deployment_id=%s",
+                (deployment_id,),
+            )
+            rows = {r["name"]: dict(r) for r in cur.fetchall()}
+
+    return user_id, deployment_id, spec, rows
+
+
+def _snapshot_targets(spec: ScenarioSpec, rows: dict, only_vm: str | None = None) -> list:
+    """(VMSpec, row) pairs for VMs that declare `snapshot:` and exist in the deployment.
+    only_vm narrows to a single VM name (raises if it isn't a snapshot VM)."""
+    targets = []
+    for vm in spec.vms:
+        if not vm.snapshot:
+            continue
+        if only_vm and vm.name != only_vm:
+            continue
+        row = rows.get(vm.name)
+        if not row or row.get("vmid") is None:
+            continue
+        targets.append((vm, row))
+    if only_vm and not targets:
+        raise RuntimeError(
+            f"VM '{only_vm}' does not declare `snapshot:` in this scenario (or isn't deployed)"
+        )
+    return targets
+
+
+def _dependency_order(spec: ScenarioSpec, names: set[str]) -> list[str]:
+    """Names ordered by dependency waves (routers → core → elk → victim → …)."""
+    ordered: list[str] = []
+    for wave in execution_plan(spec):
+        ordered.extend(n for n in wave if n in names)
+    # Any names not in the plan (shouldn't happen) tacked on at the end.
+    ordered.extend(n for n in names if n not in ordered)
+    return ordered
 
 
 def _get_existing_deployment(user_db_id: int, deployment_name: str) -> dict | None:
@@ -3100,4 +3198,198 @@ class DeployEngine:
                 f"— deployment marked active, fix those VMs manually"
             )
         log_fn(f"deployment '{deployment_name}' resumed — status: active")
+
+    # ── snapshot / detonation-range ops ─────────────────────────────────────
+
+    def _prep_range(self, deployment_name: str, username: str, log_fn):
+        s = get_settings()
+        proxmox = ProxmoxClient(s)
+        proxmox.set_log(log_fn)
+        user_id, deployment_id, spec, rows = _load_deployment_ops(deployment_name, username)
+        return proxmox, user_id, deployment_id, spec, rows
+
+    def snapshot_create(self, deployment_name, username, vm=None, log_fn=None):
+        """Take (or refresh) the clean-baseline snapshot on each snapshot-declared VM."""
+        log_fn = log_fn or print
+        proxmox, _, _, spec, rows = self._prep_range(deployment_name, username, log_fn)
+        targets = _snapshot_targets(spec, rows, only_vm=vm)
+        if not targets:
+            log_fn("no VMs declare `snapshot:` in this scenario — nothing to snapshot")
+            return
+        for vmspec, row in targets:
+            node, vmid = row["node"], row["vmid"]
+            live = vmspec.snapshot == "live"
+            if proxmox.has_snapshot(node, vmid, BASELINE_SNAPSHOT):
+                log_fn(f"[{vmspec.name}] refreshing baseline — deleting old '{BASELINE_SNAPSHOT}'")
+                proxmox.delete_snapshot(node, vmid, BASELINE_SNAPSHOT)
+            log_fn(f"[{vmspec.name}] taking {'live (RAM)' if live else 'disk'} baseline "
+                   f"'{BASELINE_SNAPSHOT}' (VMID={vmid})")
+            proxmox.create_snapshot(node, vmid, BASELINE_SNAPSHOT, vmstate=live,
+                                    description="lab clean baseline (detonation range)")
+        log_fn(f"snapshot create complete ({len(targets)} VM(s))")
+
+    def snapshot_delete(self, deployment_name, username, vm=None, log_fn=None):
+        """Remove the clean-baseline snapshot from snapshot-declared VMs."""
+        log_fn = log_fn or print
+        proxmox, _, _, spec, rows = self._prep_range(deployment_name, username, log_fn)
+        targets = _snapshot_targets(spec, rows, only_vm=vm)
+        removed = 0
+        for vmspec, row in targets:
+            node, vmid = row["node"], row["vmid"]
+            if proxmox.has_snapshot(node, vmid, BASELINE_SNAPSHOT):
+                log_fn(f"[{vmspec.name}] deleting baseline '{BASELINE_SNAPSHOT}'")
+                proxmox.delete_snapshot(node, vmid, BASELINE_SNAPSHOT)
+                removed += 1
+            else:
+                log_fn(f"[{vmspec.name}] no baseline to delete")
+        log_fn(f"snapshot delete complete ({removed} removed)")
+
+    def snapshot_list(self, deployment_name, username, log_fn=None):
+        """Print which snapshot-declared VMs currently hold a baseline. Runs inline."""
+        log_fn = log_fn or print
+        proxmox, _, _, spec, rows = self._prep_range(deployment_name, username, log_fn)
+        targets = _snapshot_targets(spec, rows, only_vm=None)
+        if not targets:
+            log_fn("no VMs declare `snapshot:` in this scenario")
+            return
+        for vmspec, row in targets:
+            node, vmid = row["node"], row["vmid"]
+            has = proxmox.has_snapshot(node, vmid, BASELINE_SNAPSHOT)
+            flags = vmspec.snapshot + (", auto-rollback" if vmspec.rollback else "")
+            state = f"baseline '{BASELINE_SNAPSHOT}' present" if has else "no baseline yet"
+            log_fn(f"  {vmspec.name:<16} VMID={vmid}  [{flags}]  {state}")
+
+    def snapshot_rollback(self, deployment_name, username, vm=None, all_vms=False, log_fn=None):
+        """Manually revert baselined VM(s): --vm one, or --all (ignores the rollback flag)."""
+        log_fn = log_fn or print
+        if not all_vms and not vm:
+            raise RuntimeError("specify --vm <name> or --all")
+        proxmox, _, _, spec, rows = self._prep_range(deployment_name, username, log_fn)
+        targets = _snapshot_targets(spec, rows, only_vm=None if all_vms else vm)
+        if not targets:
+            log_fn("no matching snapshot-declared VMs")
+            return
+        self._rollback_targets(proxmox, spec, targets, log_fn)
+        log_fn("snapshot rollback complete")
+
+    def _rollback_targets(self, proxmox, spec, targets, log_fn):
+        """Roll each (VMSpec, row) back to the baseline in dependency order, then make
+        sure each is running (a disk-only rollback leaves the VM stopped)."""
+        by_name = {vs.name: (vs, row) for vs, row in targets}
+        for name in _dependency_order(spec, set(by_name)):
+            vmspec, row = by_name[name]
+            node, vmid = row["node"], row["vmid"]
+            if not proxmox.has_snapshot(node, vmid, BASELINE_SNAPSHOT):
+                raise RuntimeError(
+                    f"[{name}] has no '{BASELINE_SNAPSHOT}' snapshot — "
+                    "run `lab snapshot create` first"
+                )
+            log_fn(f"[{name}] rolling back to '{BASELINE_SNAPSHOT}'")
+            proxmox.rollback_snapshot(node, vmid, BASELINE_SNAPSHOT)
+            try:
+                running = proxmox.get_vm_status(node, vmid).status == "running"
+            except Exception:
+                running = False
+            if not running:
+                log_fn(f"[{name}] starting after disk rollback")
+                try:
+                    proxmox.start_vm(node, vmid, wait=True)
+                except Exception as exc:
+                    if not _is_already_running_error(exc):
+                        raise
+
+    def detonate(self, deployment_name, username, tactic="", revert="", settle=90,
+                 per_technique=False, log_fn=None):
+        """Detonation run: roll back the rollback-flagged victim(s) → wait ready →
+        run the `phase: detonate` tasks (filtered by tactic) → report.
+
+        per_technique: roll back once, then run + report each BASE technique separately
+        (T1078.001/.003 → one 'T1078' report), back-to-back with no reset between."""
+        log_fn = log_fn or print
+        proxmox, user_id, deployment_id, spec, rows = self._prep_range(deployment_name, username, log_fn)
+
+        # 1. Rollback set = rollback:true VMs, optionally narrowed by --revert.
+        rb: list = []
+        for vs in spec.vms:
+            if not vs.rollback:
+                continue
+            row = rows.get(vs.name)
+            if row and row.get("vmid") is not None:
+                rb.append((vs, row))
+        if revert:
+            wanted = {n.strip() for n in revert.split(",") if n.strip()}
+            rb = [(vs, row) for vs, row in rb if vs.name in wanted]
+
+        if rb:
+            log_fn(f"rolling back {len(rb)} victim(s) to '{BASELINE_SNAPSHOT}'")
+            self._rollback_targets(proxmox, spec, rb, log_fn)
+            # 2. Readiness gate: art-1 drives the victim over SSH, so wait for port 22,
+            #    then settle so the Fleet agent re-checks-in and the clock resyncs (a
+            #    live/RAM resume wakes with a stale clock — see memory notes).
+            for vmspec, row in rb:
+                log_fn(f"[{vmspec.name}] waiting for SSH (port 22) after rollback")
+                try:
+                    _wait_for_ssh(row["management_ip"], row["vmid"], timeout=600,
+                                  deployment_id=deployment_id)
+                except Exception as exc:
+                    log_fn(f"[{vmspec.name}] SSH wait failed (continuing): {exc}")
+            if settle > 0:
+                log_fn(f"settling {settle}s for agent check-in + clock resync")
+                time.sleep(settle)
+        else:
+            log_fn("no rollback-flagged victims — detonating against current state")
+
+        # 3. Detonate VMs = those with any `phase: detonate` task.
+        detonate_specs = [
+            vs for vs in spec.vms
+            if any((t or {}).get("phase") == "detonate" for t in (vs.ansible.get("tasks") or []))
+        ]
+        if not detonate_specs:
+            raise RuntimeError("no tasks marked `phase: detonate` in this scenario — nothing to run")
+
+        # 4. name_ip play vars (e.g. win_user_1_ip) for every deployed VM.
+        other_vms = [(name, r["management_ip"]) for name, r in rows.items() if r.get("management_ip")]
+
+        # 5. Run the detonate phase on each detonate VM.
+        tsel = {t.strip() for t in tactic.split(",") if t.strip()}
+        overall_ok = True
+        for vs in detonate_specs:
+            row = rows.get(vs.name)
+            if not row or not row.get("management_ip"):
+                log_fn(f"[{vs.name}] not deployed / no IP — skipping")
+                continue
+
+            if per_technique:
+                # One run + report per BASE technique (T1078.003 -> T1078), in file order.
+                bases: list = []
+                for t in (vs.ansible.get("vars") or {}).get("atomic_tests") or []:
+                    if tsel and (t.get("tactic") not in tsel):
+                        continue
+                    base = str(t.get("technique", "")).split(".")[0]
+                    if base and base not in bases:
+                        bases.append(base)
+                if not bases:
+                    log_fn(f"[{vs.name}] no techniques match tactic '{tactic or 'all'}' — skipping")
+                    continue
+                log_fn(f"[{vs.name}] per-technique: {len(bases)} report(s) → {', '.join(bases)}")
+                for base in bases:
+                    log_fn(f"[{vs.name}] detonating {base} (tactic: {tactic or 'all'})")
+                    extra = {"art_technique": base, "art_report_user": username}
+                    if tactic:
+                        extra["art_tactic"] = tactic
+                    ok = _provision_vm(vs.name, row["management_ip"], vs, user_id, log_fn,
+                                       other_vms=other_vms, run_phase="detonate", extra_vars=extra)
+                    overall_ok = overall_ok and ok
+            else:
+                extra = {"art_report_user": username}
+                if tactic:
+                    extra["art_tactic"] = tactic
+                log_fn(f"[{vs.name}] running detonate phase"
+                       + (f" (tactic: {tactic})" if tactic else " (all tactics)"))
+                ok = _provision_vm(vs.name, row["management_ip"], vs, user_id, log_fn,
+                                   other_vms=other_vms, run_phase="detonate", extra_vars=extra)
+                overall_ok = overall_ok and ok
+        if not overall_ok:
+            raise RuntimeError("one or more detonate tasks failed — see log above")
+        log_fn(f"detonate complete for deployment '{deployment_name}'")
 

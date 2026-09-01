@@ -10,9 +10,12 @@
  tests by hand after logging into this VM.
 --------------------------------------------------------------------------------
 
-# 1) Start pwsh and open ONE reusable session to the Windows target:
+# 1) Start pwsh and open ONE reusable session to the Windows target.
+#    NOTE: the IP below is from when this VM was provisioned; if win-user-1 was
+#    redeployed it changes — confirm with `lab deploy show <deployment>`.
 pwsh
-$sess = New-PSSession -HostName {{ atomic_target_host }} -UserName {{ atomic_target_user | default('vagrant') }} -KeyFilePath $HOME/.ssh/id_ed25519 -SSHTransport
+Import-Module invoke-atomicredteam -Force
+$sess = New-PSSession -HostName {{ atomic_target_host }} -UserName {{ atomic_target_user | default('vagrant') }} -KeyFilePath $HOME/.ssh/id_ed25519 -SSHTransport -Options @{ StrictHostKeyChecking = "accept-new" }
 
 # 2) Inspect a technique before running it:
 Invoke-AtomicTest T1082 -ShowDetailsBrief

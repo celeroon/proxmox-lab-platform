@@ -45,6 +45,12 @@ class VMSpec:
     # which presents QEMU's Bochs VGA — a guest with no driver for it falls back
     # to a basic adapter locked at whatever resolution the firmware handed over.
     vga: str | None = None
+    # Snapshot-reset (detonation range) controls. snapshot declares that this VM gets
+    # a baseline snapshot so it CAN be rolled back: "live" = RAM/vmstate (instant
+    # resume), "disk" = disk-only (fresh boot). rollback marks it for AUTO-revert at
+    # the start of `lab detonate`. rollback requires snapshot. See docs (memory).
+    snapshot: str | None = None   # None | "live" | "disk"
+    rollback: bool = False
 
 
 @dataclass
@@ -209,6 +215,22 @@ def parse_scenario(path: Path) -> ScenarioSpec:
                 "OVMF has nowhere to persist boot entries without it"
             )
 
+        snapshot = v.get("snapshot", defaults.get("snapshot", None))
+        if snapshot is not None and snapshot not in ("live", "disk"):
+            raise ValueError(
+                f"VM '{base_name}': snapshot must be 'live' or 'disk', got {snapshot!r}"
+            )
+        rollback = v.get("rollback", defaults.get("rollback", False))
+        if not isinstance(rollback, bool):
+            raise ValueError(
+                f"VM '{base_name}': rollback must be a boolean, got {rollback!r}"
+            )
+        if rollback and snapshot is None:
+            raise ValueError(
+                f"VM '{base_name}': rollback: true requires 'snapshot: live|disk' — "
+                "there is no baseline to revert to"
+            )
+
         group = v.get("group", "")
         if group and group not in groups:
             raise ValueError(
@@ -259,6 +281,8 @@ def parse_scenario(path: Path) -> ScenarioSpec:
             efidisk=efidisk,
             tpm=tpm,
             vga=vga,
+            snapshot=snapshot,
+            rollback=rollback,
         )
 
         if count == 1:

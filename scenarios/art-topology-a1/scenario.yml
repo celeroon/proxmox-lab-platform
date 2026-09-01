@@ -9,6 +9,10 @@ description: >-
   a/b/c/d series of increasingly advanced ART topologies. No domain join.
 vm_prefix: ""
 
+# Default disk baseline for every VM; win-user-1 overrides to live below.
+defaults:
+  snapshot: disk
+
 x-elastic-config: &elastic-config
   elastic_nodes:
     - {name: elk-1, ip: &ip-elk-1 "172.16.10.10", roles: []}
@@ -323,6 +327,9 @@ vms:
     cpus: 4
     memory: 8192
     qemu_agent: true
+    # Disk baseline (fresh boot on rollback); only VM auto-reverted by `lab detonate`.
+    snapshot: disk
+    rollback: true
     # The box image is GPT with an EFI System Partition, so it cannot boot the
     # SeaBIOS default. q35 + TPM 2.0 match what Windows 11 expects to find.
     bios: ovmf
@@ -371,9 +378,9 @@ vms:
             fleet_policy_id: windows-policy
         - task: windows/setup_certificate
         - task: windows/configure_logging
+        - task: windows/clear_event_logs
         - task: windows/configure_audit_policy
         - task: windows/install_sysmon
-        - task: windows/clear_event_logs
         - task: windows/install_elastic_agent
 
   - name: art-1
@@ -400,15 +407,145 @@ vms:
         art_report: true
         art_report_wait_timeout: 420
         art_report_tz: local
-        art_report_push_win: true
+        # Tests run in this order (kill-chain order); `lab detonate --tactic <slug>`
+        # filters on the `tactic:` field. Untagged tests only run with no filter.
+        # No cleanup: the rollback to clean-baseline resets the victim each run.
+        # get_prereqs where the atomic downloads its dependencies. Some need admin /
+        # internet / Office and may fail on this box — the report shows that.
         atomic_tests:
-          - {technique: T1082, tests: "1", target: "{{ win_user_1_ip }}"}   # System Information Discovery
-          - {technique: T1033, tests: "1", target: "{{ win_user_1_ip }}"}   # System Owner/User Discovery
-          - {technique: T1016, tests: "1", target: "{{ win_user_1_ip }}"}   # System Network Config Discovery
-          # - {technique: T1059.001, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: true}
-          # - {technique: T1105, tests: "1", target: "{{ win_user_1_ip }}", get_prereqs: true, cleanup: false}  # keep the download
-          # - {technique: T1003, target: "{{ win_user_1_ip }}"} # no `tests:` = run all
-          # - {technique: T1016, tests: "1", target: "{{ win_user_2_ip }}"}
+          # discovery (disabled) — re-enable and run with: lab detonate --tactic discovery
+          # - {technique: T1082, tests: "1", tactic: discovery, target: "{{ win_user_1_ip }}"}
+          # - {technique: T1033, tests: "1", tactic: discovery, target: "{{ win_user_1_ip }}"}
+          # - {technique: T1016, tests: "1", tactic: discovery, target: "{{ win_user_1_ip }}"}
+          # initial-access (8 techniques / 13 tests)
+          - {technique: T1078.001, tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # Enable Guest + RDP
+          - {technique: T1078.001, tests: "2", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # Activate Guest account
+          - {technique: T1078.003, tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # Create local admin
+          - {technique: T1078.003, tests: "6", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # WinPwn loot (kittie)
+          - {technique: T1078.003, tests: "7", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # WinPwn loot (SafetyKatz)
+          - {technique: T1078.003, tests: "13", tactic: initial-access, target: "{{ win_user_1_ip }}", get_prereqs: true} # PsExec to SYSTEM
+          - {technique: T1091,     tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # USB malware spread sim
+          - {technique: T1133,     tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Chrome VPN ext via registry
+          - {technique: T1195,     tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Octopus Scanner supply chain
+          - {technique: T1566.001, tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # Download macro attachment
+          - {technique: T1566.001, tests: "2", tactic: initial-access, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Word spawns cmd (needs Office)
+          - {technique: T1566.002, tests: "1", tactic: initial-access, target: "{{ win_user_1_ip }}"}                     # Paste and run
+          - {technique: T1659,     tests: "2", tactic: initial-access, target: "{{ win_user_1_ip }}", get_prereqs: true}  # MITM proxy injection
+          - {technique: T1047, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Reconnaissance Users
+          - {technique: T1047, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Reconnaissance Processes
+          - {technique: T1047, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Reconnaissance Software
+          - {technique: T1047, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}"}  # WMI Reconnaissance List Remote Ser
+          - {technique: T1047, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}"}  # WMI Execute Local Process
+          - {technique: T1047, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}"}  # WMI Execute Remote Process
+          - {technique: T1047, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}"}  # Create a Process using WMI Query a
+          - {technique: T1047, tests: "8", tactic: execution, target: "{{ win_user_1_ip }}"}  # Create a Process using obfuscated 
+          - {technique: T1047, tests: "9", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Execute rundll32
+          - {technique: T1047, tests: "10", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Application uninstall using WMIC
+          - {technique: T1053.002, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # At.exe Scheduled task
+          - {technique: T1053.005, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled Task Startup Script
+          - {technique: T1053.005, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled task Local
+          - {technique: T1053.005, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled task Remote
+          - {technique: T1053.005, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}"}  # Powershell Cmdlet Scheduled Task
+          - {technique: T1053.005, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Task Scheduler via VBA
+          - {technique: T1053.005, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Invoke-CimMethod Scheduled Tas
+          - {technique: T1053.005, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled Task Executing Base64 En
+          - {technique: T1053.005, tests: "8", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Import XML Schedule Task with Hidd
+          - {technique: T1053.005, tests: "9", tactic: execution, target: "{{ win_user_1_ip }}"}  # PowerShell Modify A Scheduled Task
+          - {technique: T1053.005, tests: "10", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Scheduled Task ("Ghost Task") via 
+          - {technique: T1053.005, tests: "11", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled Task Persistence via Com
+          - {technique: T1053.005, tests: "12", tactic: execution, target: "{{ win_user_1_ip }}"}  # Scheduled Task Persistence via Eve
+          - {technique: T1059, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # AutoIt Script Execution
+          - {technique: T1059.001, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Mimikatz
+          - {technique: T1059.001, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}"}  # Mimikatz - Cradlecraft PsSendKeys
+          - {technique: T1059.001, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}"}  # Invoke-AppPathBypass
+          - {technique: T1059.001, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}"}  # Powershell MsXml COM object - with
+          - {technique: T1059.001, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}"}  # Powershell XML requests
+          - {technique: T1059.001, tests: "8", tactic: execution, target: "{{ win_user_1_ip }}"}  # Powershell invoke mshta.exe downlo
+          - {technique: T1059.001, tests: "9", tactic: execution, target: "{{ win_user_1_ip }}"}  # Powershell Invoke-DownloadCradle
+          - {technique: T1059.001, tests: "10", tactic: execution, target: "{{ win_user_1_ip }}"}  # PowerShell Fileless Script Executi
+          - {technique: T1059.001, tests: "11", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # NTFS Alternate Data Stream Access
+          - {technique: T1059.001, tests: "12", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # PowerShell Session Creation and Us
+          - {technique: T1059.001, tests: "13", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # ATHPowerShellCommandLineParameter 
+          - {technique: T1059.001, tests: "14", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # ATHPowerShellCommandLineParameter 
+          - {technique: T1059.001, tests: "15", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # ATHPowerShellCommandLineParameter 
+          - {technique: T1059.001, tests: "16", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # ATHPowerShellCommandLineParameter 
+          - {technique: T1059.001, tests: "17", tactic: execution, target: "{{ win_user_1_ip }}"}  # PowerShell Command Execution
+          - {technique: T1059.001, tests: "18", tactic: execution, target: "{{ win_user_1_ip }}"}  # PowerShell Invoke Known Malicious 
+          - {technique: T1059.001, tests: "19", tactic: execution, target: "{{ win_user_1_ip }}"}  # PowerUp Invoke-AllChecks
+          - {technique: T1059.001, tests: "20", tactic: execution, target: "{{ win_user_1_ip }}"}  # Abuse Nslookup with DNS Records
+          - {technique: T1059.001, tests: "22", tactic: execution, target: "{{ win_user_1_ip }}"}  # SOAPHound - Build Cache
+          - {technique: T1059.003, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Create and Execute Batch Script
+          - {technique: T1059.003, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # Writes text to a file and displays
+          - {technique: T1059.003, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # Suspicious Execution via Windows C
+          - {technique: T1059.003, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Simulate BlackByte Ransomware Prin
+          - {technique: T1059.003, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Command Prompt read contents from 
+          - {technique: T1059.003, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}"}  # Command prompt writing script to f
+          - {technique: T1059.005, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Visual Basic script execution to g
+          - {technique: T1059.005, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Encoded VBS code execution
+          - {technique: T1059.005, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Extract Memory via VBA
+          - {technique: T1059.007, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # JScript execution to gather local 
+          - {technique: T1059.007, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # JScript execution to gather local 
+          - {technique: T1059.010, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # AutoHotKey script execution
+          - {technique: T1072, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Radmin Viewer Utility
+          - {technique: T1072, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # PDQ Deploy RAT
+          - {technique: T1072, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Deploy 7-Zip Using Chocolatey
+          - {technique: T1106, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Execution through API - CreateProc
+          - {technique: T1106, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # WinPwn - Get SYSTEM shell - Pop Sy
+          - {technique: T1106, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # WinPwn - Get SYSTEM shell - Bind S
+          - {technique: T1106, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}"}  # WinPwn - Get SYSTEM shell - Pop Sy
+          - {technique: T1106, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}"}  # Run Shellcode via Syscall in Go
+          - {technique: T1127, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Lolbin Jsc.exe compile javascript 
+          - {technique: T1127, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Lolbin Jsc.exe compile javascript 
+          - {technique: T1127.001, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # MSBuild Bypass Using Inline Tasks 
+          - {technique: T1127.001, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # MSBuild Bypass Using Inline Tasks 
+          - {technique: T1129, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # ESXi - Install a custom VIB on an 
+          - {technique: T1197, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Bitsadmin Download (cmd)
+          - {technique: T1197, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # Bitsadmin Download (PowerShell)
+          - {technique: T1197, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # Persist, Download, & Execute
+          - {technique: T1197, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}"}  # Bits download using desktopimgdown
+          - {technique: T1204.002, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # OSTap Style Macro Execution
+          - {technique: T1204.002, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # OSTap Payload Download
+          - {technique: T1204.002, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Maldoc choice flags command execut
+          - {technique: T1204.002, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # OSTAP JS version
+          - {technique: T1204.002, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Office launching .bat file from Ap
+          - {technique: T1204.002, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Excel 4 Macro
+          - {technique: T1204.002, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Headless Chrome code execution via
+          - {technique: T1204.002, tests: "8", tactic: execution, target: "{{ win_user_1_ip }}"}  # Potentially Unwanted Applications 
+          - {technique: T1204.002, tests: "9", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Office Generic Payload Download
+          - {technique: T1204.002, tests: "10", tactic: execution, target: "{{ win_user_1_ip }}"}  # LNK Payload Download
+          - {technique: T1204.002, tests: "11", tactic: execution, target: "{{ win_user_1_ip }}"}  # Mirror Blast Emulation
+          - {technique: T1204.002, tests: "12", tactic: execution, target: "{{ win_user_1_ip }}"}  # ClickFix Campaign - Abuse RunMRU t
+          - {technique: T1204.002, tests: "13", tactic: execution, target: "{{ win_user_1_ip }}"}  # Simulate Click-Fix via Downloaded 
+          - {technique: T1204.004, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Malicious Copy and Paste through R
+          - {technique: T1559, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Cobalt Strike Artifact Kit pipe
+          - {technique: T1559, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Cobalt Strike Lateral Movement (ps
+          - {technique: T1559, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Cobalt Strike SSH (postex_ssh) pip
+          - {technique: T1559, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Cobalt Strike post-exploitation pi
+          - {technique: T1559, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Cobalt Strike post-exploitation pi
+          - {technique: T1559.002, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Execute Commands
+          - {technique: T1559.002, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # Execute PowerShell script via Word
+          - {technique: T1559.002, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # DDEAUTO
+          - {technique: T1569.002, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Execute a Command as a Service
+          - {technique: T1569.002, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Use PsExec to execute a command on
+          - {technique: T1569.002, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # BlackCat pre-encryption cmds with 
+          - {technique: T1569.002, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Use RemCom to execute a command on
+          - {technique: T1569.002, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}"}  # Snake Malware Service Create
+          - {technique: T1569.002, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}"}  # Modifying ACL of Service Control M
+          - {technique: T1569.002, tests: "8", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Pipe Creation - PsExec Tool Execut
+          - {technique: T1574.001, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # DLL Search Order Hijacking - amsi.
+          - {technique: T1574.001, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}"}  # Phantom Dll Hijacking - WinAppXRT.
+          - {technique: T1574.001, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}"}  # Phantom Dll Hijacking - ualapi.dll
+          - {technique: T1574.001, tests: "4", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # DLL Side-Loading using the Notepad
+          - {technique: T1574.001, tests: "5", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # DLL Side-Loading using the dotnet 
+          - {technique: T1574.001, tests: "6", tactic: execution, target: "{{ win_user_1_ip }}"}  # DLL Search Order Hijacking,DLL Sid
+          - {technique: T1574.001, tests: "7", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # DLL Search Order Hijacking - ntpri
+          - {technique: T1574.008, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # powerShell Persistence via hijacki
+          - {technique: T1574.009, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Execution of program.exe as servic
+          - {technique: T1574.011, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}"}  # Service Registry Permissions Weakn
+          - {technique: T1574.011, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Service ImagePath Change with reg.
+          - {technique: T1574.012, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # User scope COR_PROFILER
+          - {technique: T1574.012, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # System Scope COR_PROFILER
+          - {technique: T1574.012, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Registry-free process scope COR_PR
       tasks:
         - task: linux/set_hostname
           vars:
@@ -418,5 +555,8 @@ vms:
         - task: linux/install_atomic_redteam
         - task: linux/deploy_ssh_key
         - task: linux/deploy_atomic_hints
+        # phase: detonate → skipped by `lab deploy`, run only by `lab detonate`.
         - task: linux/run_atomic_test
+          phase: detonate
         - task: linux/generate_art_report
+          phase: detonate

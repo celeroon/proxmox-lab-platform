@@ -28,6 +28,7 @@ ct_app       = typer.Typer(no_args_is_help=True, help="Manage LXC container temp
 deploy_app   = typer.Typer(no_args_is_help=True, help="Deploy, stop, and destroy scenario deployments.")
 user_app     = typer.Typer(no_args_is_help=True, help="Manage platform users.")
 ops_app         = typer.Typer(no_args_is_help=True, help="View background operation history and logs.")
+snapshot_app = typer.Typer(no_args_is_help=True, help="Manage clean-baseline snapshots for the detonation range.")
 
 app.add_typer(template_app,    name="template", hidden=not _caller_is_admin)
 template_app.add_typer(source_app, name="source", hidden=not _caller_is_admin)
@@ -35,6 +36,7 @@ template_app.add_typer(ct_app,     name="ct", hidden=not _caller_is_admin)
 app.add_typer(deploy_app,      name="deploy")
 app.add_typer(user_app,        name="user", hidden=not _caller_is_admin)
 app.add_typer(ops_app,         name="ops", hidden=not _caller_is_admin)
+app.add_typer(snapshot_app,    name="snapshot", hidden=not _caller_is_admin)
 
 
 # ── status helpers ────────────────────────────────────────────────────────────
@@ -1185,6 +1187,96 @@ def deploy_destroy(
     op_id = create_operation("deploy_destroy", command, current_username(), deployment)
     spawn_background(op_id, "deploy_destroy", deployment, effective_user, target or "", "1" if no_cascade else "0")
     typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
+
+
+# ── snapshot (detonation-range reset) ──────────────────────────────────────────
+
+def _spawn_range_op(task: str, deployment: str, user_flag: str, extra: list[str]) -> None:
+    """Shared launcher for the snapshot/art background ops (admin-gated)."""
+    if not is_admin():
+        typer.echo("error: this command requires admin (root or sudo group)", err=True)
+        raise typer.Exit(1)
+    s = get_settings()
+    require_proxmox(s)
+    effective_user = _resolve_deploy_user(user_flag)
+    command = " ".join(sys.argv)
+    op_id = create_operation(task, command, current_username(), deployment)
+    spawn_background(op_id, task, deployment, effective_user, *extra)
+    typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
+
+
+@snapshot_app.command("create", hidden=not _caller_is_admin)
+def snapshot_create(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    vm: str = typer.Option("", "--vm", help="Only this VM (default: all snapshot-declared VMs)."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Take/refresh the clean-baseline snapshot on snapshot-declared VMs (admin only)."""
+    _spawn_range_op("snapshot_create", deployment, user, extra=[vm])
+
+
+@snapshot_app.command("rollback", hidden=not _caller_is_admin)
+def snapshot_rollback(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    vm: str = typer.Option("", "--vm", help="Roll back only this VM."),
+    all_vms: bool = typer.Option(False, "--all", help="Roll back every baselined VM (whole-lab reset)."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Manually revert baselined VM(s) to the clean baseline (admin only)."""
+    if not all_vms and not vm:
+        typer.echo("error: specify --vm <name> or --all", err=True)
+        raise typer.Exit(1)
+    _spawn_range_op("snapshot_rollback", deployment, user, extra=[vm, "1" if all_vms else "0"])
+
+
+@snapshot_app.command("delete", hidden=not _caller_is_admin)
+def snapshot_delete(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    vm: str = typer.Option("", "--vm", help="Only this VM (default: all snapshot-declared VMs)."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Delete the clean-baseline snapshot from snapshot-declared VMs (admin only)."""
+    _spawn_range_op("snapshot_delete", deployment, user, extra=[vm])
+
+
+@snapshot_app.command("list", hidden=not _caller_is_admin)
+def snapshot_list(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Show which VMs hold a clean-baseline snapshot (admin only). Runs inline."""
+    if not is_admin():
+        typer.echo("error: lab snapshot list requires admin (root or sudo group)", err=True)
+        raise typer.Exit(1)
+    s = get_settings()
+    require_proxmox(s)
+    effective_user = _resolve_deploy_user(user)
+    from lab.deploy import DeployEngine
+    try:
+        DeployEngine().snapshot_list(deployment, effective_user, log_fn=typer.echo)
+    except RuntimeError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+
+
+# ── detonate (run tests against a deployed range) ───────────────────────────────
+
+@app.command("detonate", hidden=not _caller_is_admin)
+def detonate(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    tactic: str = typer.Option("", "--tactic", help="Comma-separated ATT&CK tactics to run (default: all)."),
+    revert: str = typer.Option("", "--revert", help="Only roll back these victim VMs (default: all rollback-flagged)."),
+    settle: int = typer.Option(90, "--settle", help="Seconds to wait after rollback for agent check-in + clock resync."),
+    per_technique: bool = typer.Option(False, "--per-technique", help="One report per base technique (T1078.001/.003 → one 'T1078' report), back-to-back."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Roll back victim(s) → run the phase:detonate tasks (tactic-filtered) → report (admin only).
+
+    Generic detonation entry point — runs whatever the scenario marks `phase: detonate`
+    (Atomic Red Team today; other frameworks later).
+    """
+    _spawn_range_op("detonate", deployment, user,
+                    extra=[tactic, revert, str(settle), "1" if per_technique else "0"])
 
 
 # ── user ──────────────────────────────────────────────────────────────────────

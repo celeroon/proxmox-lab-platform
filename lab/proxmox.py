@@ -333,6 +333,47 @@ class ProxmoxClient:
         if wait and upid:
             self.wait_for_task(node, upid)
 
+    # ── snapshots ─────────────────────────────────────────────────────────────
+
+    def create_snapshot(self, node: str, vmid: int, name: str,
+                        vmstate: bool = False, description: str = "", wait: bool = True) -> None:
+        """Take a snapshot. vmstate=True includes RAM (live snapshot → instant resume
+        on rollback); False is disk-only (fresh boot on rollback)."""
+        node = self._resolve_node(node, vmid)
+        self._log("create_snapshot node=%s vmid=%s name=%s vmstate=%s", node, vmid, name, vmstate)
+        kwargs: dict = {"snapname": name, "vmstate": 1 if vmstate else 0}
+        if description:
+            kwargs["description"] = description
+        upid = self._px.nodes(node).qemu(vmid).snapshot.post(**kwargs)
+        if wait and upid:
+            self.wait_for_task(node, upid)
+
+    def rollback_snapshot(self, node: str, vmid: int, name: str, wait: bool = True) -> None:
+        """Revert to a snapshot. A vmstate snapshot resumes running; a disk-only one
+        leaves the VM stopped (start it afterwards)."""
+        node = self._resolve_node(node, vmid)
+        self._log("rollback_snapshot node=%s vmid=%s name=%s", node, vmid, name)
+        upid = self._px.nodes(node).qemu(vmid).snapshot(name).rollback.post()
+        if wait and upid:
+            self.wait_for_task(node, upid)
+
+    def delete_snapshot(self, node: str, vmid: int, name: str, wait: bool = True) -> None:
+        node = self._resolve_node(node, vmid)
+        self._log("delete_snapshot node=%s vmid=%s name=%s", node, vmid, name)
+        upid = self._px.nodes(node).qemu(vmid).snapshot(name).delete()
+        if wait and upid:
+            self.wait_for_task(node, upid)
+
+    def list_snapshots(self, node: str, vmid: int) -> list[dict]:
+        """Return real snapshots for a VM. Proxmox always appends a synthetic
+        'current' pseudo-snapshot (the live state) — dropped here."""
+        node = self._resolve_node(node, vmid)
+        snaps = self._px.nodes(node).qemu(vmid).snapshot.get()
+        return [s for s in snaps if s.get("name") != "current"]
+
+    def has_snapshot(self, node: str, vmid: int, name: str) -> bool:
+        return any(s.get("name") == name for s in self.list_snapshots(node, vmid))
+
     def delete_vm(self, node: str, vmid: int, wait: bool = True) -> None:
         # Resolve the VM's real node. If it exists nowhere it's already gone —
         # treat as success (return quietly) so callers remove the DB row instead
