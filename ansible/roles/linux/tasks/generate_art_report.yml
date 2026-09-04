@@ -9,10 +9,19 @@
 # Elasticsearch reachability (mgmt IP), Gotenberg, and the artifacts dir live.
 #
 # Gated by `art_report` (default false) so it only runs for scenarios that opt in.
+#
+# Besides the flat working copies, each report is also filed into an organised
+# batch tree (in all three homes: data/artifacts, /opt, art-1):
+#   <batch>/<tactic>/<technique>/    all artifacts (html/json/csv/log[/pdf])
+#   <batch>/reports/<tactic>/<technique>/report-*.pdf    pdf-only mirror
+# where <batch> = art_batch (yy-mm-dd-hh-mm, shared across one `lab detonate`).
+# Aggregate runs (no art_technique) land at the batch root, not a tactic subdir.
 # vars:
 #   art_report                — true to generate the report (default false)
 #   art_report_wait_timeout   — max seconds to poll for detections (default 420)
 #   art_report_tz             — display timezone: UTC (default) / local / IANA name
+#   art_batch                 — batch dir name (yy-mm-dd-hh-mm), set by `lab detonate`
+#   art_report_tactic         — tactic slug for this report's folder (per-technique)
 - name: Generate the ART test report on the controller (waits for detections)
   delegate_to: localhost
   become: false
@@ -89,6 +98,104 @@
     - art_report_user | default('') | length > 0
     - _art_csv.stat.exists | default(false)
   failed_when: false
+
+# --- Organised batch tree ------------------------------------------------------
+# File the same artifacts into <batch>/<tactic>/<technique>/ (+ a pdf-only mirror
+# under <batch>/reports/…) in each report home. Best-effort throughout: a missing
+# file or an unwritable /opt must never fail the detonation.
+- name: Publish the report into the organised batch tree
+  when:
+    - art_report | default(false)
+    - art_batch is defined
+    - art_runid is defined
+    - _art_csv.stat.exists | default(false)
+  block:
+    - name: Compute the batch-tree subpath for this report
+      ansible.builtin.set_fact:
+        _art_sub: "{{ ((art_report_tactic | default('untagged')) ~ '/' ~ art_technique) if (art_technique | default('')) | length > 0 else '' }}"
+
+    - name: Resolve the batch-tree dirs (artifacts + pdf-only mirror)
+      ansible.builtin.set_fact:
+        _art_reldir: "{{ art_batch }}{{ ('/' ~ _art_sub) if _art_sub | length > 0 else '' }}"
+        _art_pdfdir: "{{ art_batch }}/reports{{ ('/' ~ _art_sub) if _art_sub | length > 0 else '' }}"
+
+    - name: Map each artifact to its batch-tree subdir (pdf -> reports)
+      ansible.builtin.set_fact:
+        _art_map:
+          - { f: "run-{{ art_runid }}.csv", d: "{{ _art_reldir }}" }
+          - { f: "run-{{ art_runid }}.log", d: "{{ _art_reldir }}" }
+          - { f: "report-{{ art_runid }}.html", d: "{{ _art_reldir }}" }
+          - { f: "navigator-{{ art_runid }}.json", d: "{{ _art_reldir }}" }
+          - { f: "summary-{{ art_runid }}.json", d: "{{ _art_reldir }}" }
+          - { f: "report-{{ art_runid }}.pdf", d: "{{ _art_pdfdir }}" }
+
+    # -- controller: data/artifacts working home --
+    - name: Create the batch-tree dirs in data/artifacts
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ _art_reldir }}", "{{ _art_pdfdir }}"]
+      failed_when: false
+
+    - name: Copy the report into the data/artifacts batch tree
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        src: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item.f }}"
+        dest: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item.d }}/{{ item.f }}"
+        mode: "0644"
+      loop: "{{ _art_map }}"
+      loop_control:
+        label: "{{ item.d }}/{{ item.f }}"
+      failed_when: false
+
+    # -- controller: /opt shared mirror (per deployment user) --
+    - name: Create the batch-tree dirs under /opt (best-effort mirror)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "/opt/lab/reports/{{ art_report_user }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ _art_reldir }}", "{{ _art_pdfdir }}"]
+      when: art_report_user | default('') | length > 0
+      failed_when: false
+
+    - name: Copy the report into the /opt batch tree (best-effort mirror)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        src: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item.f }}"
+        dest: "/opt/lab/reports/{{ art_report_user }}/{{ item.d }}/{{ item.f }}"
+        mode: "0644"
+      loop: "{{ _art_map }}"
+      loop_control:
+        label: "{{ item.d }}/{{ item.f }}"
+      when: art_report_user | default('') | length > 0
+      failed_when: false
+
+    # -- art-1: the VM that ran the tests --
+    - name: Create the batch-tree dirs on art-1
+      become: false
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user | default('vagrant') }}/art-reports/{{ item }}"
+        state: directory
+      loop: ["{{ _art_reldir }}", "{{ _art_pdfdir }}"]
+      failed_when: false
+
+    - name: Copy the report into the art-1 batch tree
+      become: false
+      ansible.builtin.copy:
+        src: "{{ lab_ansible_dir }}/../data/artifacts/art/reports/{{ item.f }}"
+        dest: "/home/{{ ansible_user | default('vagrant') }}/art-reports/{{ item.d }}/{{ item.f }}"
+        mode: "0644"
+      loop: "{{ _art_map }}"
+      loop_control:
+        label: "{{ item.d }}/{{ item.f }}"
+      failed_when: false
 
 - name: Show ART report output
   ansible.builtin.debug:

@@ -1018,12 +1018,21 @@ def _build_inventory(vm_name: str, mgmt_ip: str, conn: dict) -> str:
         scheme = conn.get("winrm_scheme", "http")
         port = conn.get("winrm_port", 5985)
         transport = conn.get("winrm_transport", "basic")
+        # pywinrm defaults (20s op / 30s read) are too tight: a slow choco install
+        # (e.g. googlechrome pulling its MSI) can make a single WSMan Receive take
+        # >30s under load -> read timeout -> the host is marked UNREACHABLE, which
+        # ansible does NOT apply until/retries to. Give it real headroom; read must
+        # stay > operation. Overridable per scenario via winrm_operation/read_timeout.
+        op_timeout = conn.get("winrm_operation_timeout", 120)
+        read_timeout = conn.get("winrm_read_timeout", 150)
         host_vars += (
             f" ansible_connection=winrm"
             f" ansible_winrm_scheme={scheme}"
             f" ansible_port={port}"
             f" ansible_winrm_transport={transport}"
             f" ansible_winrm_server_cert_validation=ignore"
+            f" ansible_winrm_operation_timeout_sec={op_timeout}"
+            f" ansible_winrm_read_timeout_sec={read_timeout}"
         )
     elif conn_type in ("network_cli", "httpapi"):
         network_os = conn.get("network_os", "")
@@ -3352,6 +3361,10 @@ class DeployEngine:
 
         # 5. Run the detonate phase on each detonate VM.
         tsel = {t.strip() for t in tactic.split(",") if t.strip()}
+        # One batch dir (yy-mm-dd-hh-mm) shared by every report from this invocation;
+        # the finalizer files each report under <batch>/<tactic>/<technique>/ (+ a
+        # pdf-only mirror in <batch>/reports/…). See generate_art_report.yml.
+        batch = time.strftime("%y-%m-%d-%H-%M")
         overall_ok = True
         for vs in detonate_specs:
             row = rows.get(vs.name)
@@ -3361,27 +3374,35 @@ class DeployEngine:
 
             if per_technique:
                 # One run + report per BASE technique (T1078.003 -> T1078), in file order.
+                # tac_of maps each base to its scenario tactic, for report foldering (so
+                # `--per-technique` with no --tactic still nests under the right tactic).
                 bases: list = []
+                tac_of: dict = {}
                 for t in (vs.ansible.get("vars") or {}).get("atomic_tests") or []:
                     if tsel and (t.get("tactic") not in tsel):
                         continue
                     base = str(t.get("technique", "")).split(".")[0]
                     if base and base not in bases:
                         bases.append(base)
+                        tac_of[base] = str(t.get("tactic", "") or "")
                 if not bases:
                     log_fn(f"[{vs.name}] no techniques match tactic '{tactic or 'all'}' — skipping")
                     continue
                 log_fn(f"[{vs.name}] per-technique: {len(bases)} report(s) → {', '.join(bases)}")
                 for base in bases:
                     log_fn(f"[{vs.name}] detonating {base} (tactic: {tactic or 'all'})")
-                    extra = {"art_technique": base, "art_report_user": username}
+                    rep_tactic = tac_of.get(base) or (tactic if tactic and "," not in tactic else "") or "untagged"
+                    extra = {"art_technique": base, "art_report_user": username,
+                             "art_batch": batch, "art_report_tactic": rep_tactic}
                     if tactic:
                         extra["art_tactic"] = tactic
                     ok = _provision_vm(vs.name, row["management_ip"], vs, user_id, log_fn,
                                        other_vms=other_vms, run_phase="detonate", extra_vars=extra)
                     overall_ok = overall_ok and ok
             else:
-                extra = {"art_report_user": username}
+                # Aggregate run: one report spanning many techniques -> batch root (no
+                # tactic/technique subfolders), so no art_technique/art_report_tactic.
+                extra = {"art_report_user": username, "art_batch": batch}
                 if tactic:
                     extra["art_tactic"] = tactic
                 log_fn(f"[{vs.name}] running detonate phase"

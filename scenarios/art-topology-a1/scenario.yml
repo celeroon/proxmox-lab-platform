@@ -546,6 +546,243 @@ vms:
           - {technique: T1574.012, tests: "1", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # User scope COR_PROFILER
           - {technique: T1574.012, tests: "2", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # System Scope COR_PROFILER
           - {technique: T1574.012, tests: "3", tactic: execution, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Registry-free process scope COR_PR
+          # persistence (49 techniques / 235 tests) — full catalog; techniques that
+          # also appear above (execution/initial-access) are re-added, tagged persistence.
+          - {technique: T1037.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Logon Scripts
+          - {technique: T1053.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # At.exe Scheduled task
+          - {technique: T1053.005, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled Task Startup Script
+          - {technique: T1053.005, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled task Local
+          - {technique: T1053.005, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled task Remote
+          - {technique: T1053.005, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Powershell Cmdlet Scheduled Task
+          - {technique: T1053.005, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Task Scheduler via VBA
+          - {technique: T1053.005, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # WMI Invoke-CimMethod Scheduled Task
+          - {technique: T1053.005, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled Task Executing Base64 Encoded Commands From Registry
+          - {technique: T1053.005, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Import XML Schedule Task with Hidden Attribute
+          - {technique: T1053.005, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # PowerShell Modify A Scheduled Task
+          - {technique: T1053.005, tests: "10", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Scheduled Task ("Ghost Task") via Registry Key Manipulation
+          - {technique: T1053.005, tests: "11", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled Task Persistence via CompMgmt.msc
+          - {technique: T1053.005, tests: "12", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scheduled Task Persistence via Eventviewer.msc
+          - {technique: T1078.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enable Guest account with RDP capability and admin privileges
+          - {technique: T1078.001, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Guest Account
+          - {technique: T1078.003, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create local account with admin privileges
+          - {technique: T1078.003, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # WinPwn - Loot local Credentials - powerhell kittie
+          - {technique: T1078.003, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # WinPwn - Loot local Credentials - Safetykatz
+          - {technique: T1078.003, tests: "13", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Use PsExec to elevate to NT Authority\SYSTEM account
+          - {technique: T1098, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Admin Account Manipulate
+          - {technique: T1112, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Registry of Current User Profile - cmd
+          - {technique: T1112, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Registry of Local Machine - cmd
+          - {technique: T1112, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify registry to store logon credentials
+          - {technique: T1112, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Use Powershell to Modify registry to store logon credentials
+          - {technique: T1112, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add domain to Trusted sites Zone
+          - {technique: T1112, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Javascript in registry
+          - {technique: T1112, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Change Powershell Execution Policy to Bypass
+          - {technique: T1112, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}"}  # BlackByte Ransomware Registry Changes - CMD
+          - {technique: T1112, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # BlackByte Ransomware Registry Changes - Powershell
+          - {technique: T1112, tests: "10", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Registry Tool
+          - {technique: T1112, tests: "11", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows CMD application
+          - {technique: T1112, tests: "12", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Task Manager application
+          - {technique: T1112, tests: "13", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Notification Center
+          - {technique: T1112, tests: "14", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Shutdown Button
+          - {technique: T1112, tests: "15", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows LogOff Button
+          - {technique: T1112, tests: "16", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Change Password Feature
+          - {technique: T1112, tests: "17", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Lock Workstation Feature
+          - {technique: T1112, tests: "18", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoDesktop Group Policy Feature
+          - {technique: T1112, tests: "19", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoRun Group Policy Feature
+          - {technique: T1112, tests: "20", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoFind Group Policy Feature
+          - {technique: T1112, tests: "21", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoControlPanel Group Policy Feature
+          - {technique: T1112, tests: "22", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoFileMenu Group Policy Feature
+          - {technique: T1112, tests: "23", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoClose Group Policy Feature
+          - {technique: T1112, tests: "24", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoSetTaskbar Group Policy Feature
+          - {technique: T1112, tests: "25", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoTrayContextMenu Group Policy Feature
+          - {technique: T1112, tests: "26", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activate Windows NoPropertiesMyDocuments Group Policy Feature
+          - {technique: T1112, tests: "27", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Hide Windows Clock Group Policy Feature
+          - {technique: T1112, tests: "28", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows HideSCAHealth Group Policy Feature
+          - {technique: T1112, tests: "29", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows HideSCANetwork Group Policy Feature
+          - {technique: T1112, tests: "30", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows HideSCAPower Group Policy Feature
+          - {technique: T1112, tests: "31", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows HideSCAVolume Group Policy Feature
+          - {technique: T1112, tests: "32", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows Modify Show Compress Color And Info Tip Registry
+          - {technique: T1112, tests: "33", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows Powershell Logging Disabled
+          - {technique: T1112, tests: "34", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows Add Registry Value to Load Service in Safe Mode without Network
+          - {technique: T1112, tests: "35", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows Add Registry Value to Load Service in Safe Mode with Network
+          - {technique: T1112, tests: "36", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Toast Notifications
+          - {technique: T1112, tests: "37", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Security Center Notifications
+          - {technique: T1112, tests: "38", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Suppress Win Defender Notifications
+          - {technique: T1112, tests: "39", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Allow RDP Remote Assistance Feature
+          - {technique: T1112, tests: "40", tactic: persistence, target: "{{ win_user_1_ip }}"}  # NetWire RAT Registry Key Creation
+          - {technique: T1112, tests: "41", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Ursnif Malware Registry Key Creation
+          - {technique: T1112, tests: "42", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Terminal Server Client Connection History Cleared
+          - {technique: T1112, tests: "43", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Error Reporting Settings
+          - {technique: T1112, tests: "44", tactic: persistence, target: "{{ win_user_1_ip }}"}  # DisallowRun Execution Of Certain Applications
+          - {technique: T1112, tests: "45", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enabling Restricted Admin Mode via Command_Prompt
+          - {technique: T1112, tests: "46", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Mimic Ransomware - Enable Multiple User Sessions
+          - {technique: T1112, tests: "47", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Mimic Ransomware - Allow Multiple RDP Sessions per User
+          - {technique: T1112, tests: "48", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Event Viewer Registry Modification - Redirection URL
+          - {technique: T1112, tests: "49", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Event Viewer Registry Modification - Redirection Program
+          - {technique: T1112, tests: "50", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enabling Remote Desktop Protocol via Remote Registry
+          - {technique: T1112, tests: "51", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Win Defender Notification
+          - {technique: T1112, tests: "52", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows OS Auto Update
+          - {technique: T1112, tests: "53", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Auto Reboot for current logon user
+          - {technique: T1112, tests: "54", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Windows Auto Update Option to Notify before download
+          - {technique: T1112, tests: "55", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Do Not Connect To Win Update
+          - {technique: T1112, tests: "56", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Tamper Win Defender Protection
+          - {technique: T1112, tests: "57", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Snake Malware Registry Blob
+          - {technique: T1112, tests: "58", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Allow Simultaneous Download Registry
+          - {technique: T1112, tests: "59", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Internet Zone Protocol Defaults in Current User Registry - cmd
+          - {technique: T1112, tests: "60", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Internet Zone Protocol Defaults in Current User Registry - PowerShell
+          - {technique: T1112, tests: "61", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activities To Disable Secondary Authentication Detected By Modified Registry Value.
+          - {technique: T1112, tests: "62", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Activities To Disable Microsoft [FIDO Aka Fast IDentity Online] Authentication Detected By Modified Registry Value.
+          - {technique: T1112, tests: "63", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Scarab Ransomware Defense Evasion Activities
+          - {technique: T1112, tests: "64", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Remote Desktop Anti-Alias Setting Through Registry
+          - {technique: T1112, tests: "65", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Remote Desktop Security Settings Through Registry
+          - {technique: T1112, tests: "66", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disabling ShowUI Settings of Windows Error Reporting (WER)
+          - {technique: T1112, tests: "67", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enable Proxy Settings
+          - {technique: T1112, tests: "68", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Set-Up Proxy Server
+          - {technique: T1112, tests: "69", tactic: persistence, target: "{{ win_user_1_ip }}"}  # RDP Authentication Level Override
+          - {technique: T1112, tests: "70", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enable RDP via Registry (fDenyTSConnections)
+          - {technique: T1112, tests: "71", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Prefetch Through Registry
+          - {technique: T1112, tests: "72", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Setting Shadow key in Registry for RDP Shadowing
+          - {technique: T1112, tests: "73", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Flush Shimcache
+          - {technique: T1112, tests: "74", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Disable Windows Remote Desktop Protocol
+          - {technique: T1112, tests: "75", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Enforce Smart Card Authentication Through Registry
+          - {technique: T1112, tests: "76", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Requires the BitLocker PIN for Pre-boot authentication
+          - {technique: T1112, tests: "77", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify EnableBDEWithNoTPM Registry entry
+          - {technique: T1112, tests: "78", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UseTPM Registry entry
+          - {technique: T1112, tests: "79", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UseTPMPIN Registry entry
+          - {technique: T1112, tests: "80", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UseTPMKey Registry entry
+          - {technique: T1112, tests: "81", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UseTPMKeyPIN Registry entry
+          - {technique: T1112, tests: "82", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify EnableNonTPM Registry entry
+          - {technique: T1112, tests: "83", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UsePartialEncryptionKey Registry entry
+          - {technique: T1112, tests: "84", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify UsePIN Registry entry
+          - {technique: T1112, tests: "85", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Abusing Windows TelemetryController Registry Key for Persistence
+          - {technique: T1112, tests: "86", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify RDP-Tcp Initial Program Registry Entry
+          - {technique: T1112, tests: "87", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Abusing MyComputer Disk Cleanup Path for Persistence
+          - {technique: T1112, tests: "88", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Abusing MyComputer Disk Fragmentation Path for Persistence
+          - {technique: T1112, tests: "89", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Abusing MyComputer Disk Backup Path for Persistence
+          - {technique: T1112, tests: "90", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Adding custom paths for application execution
+          - {technique: T1133, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Running Chrome VPN Extensions via the Registry 2 vpn extension
+          - {technique: T1136.001, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new user in a command prompt
+          - {technique: T1136.001, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new user in PowerShell
+          - {technique: T1136.001, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new Windows admin user
+          - {technique: T1136.001, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new Windows admin user via .NET
+          - {technique: T1136.002, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new Domain Account using PowerShell
+          - {technique: T1137, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Office Application Startup - Outlook as a C2
+          - {technique: T1137.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Injecting a Macro into the Word Normal.dotm Template for Persistence via PowerShell
+          - {technique: T1137.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Office Application Startup Test Persistence (HKCU)
+          - {technique: T1137.004, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Install Outlook Home Page Persistence
+          - {technique: T1137.005, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Outlook Rule - Subject Trigger with DeletePermanently Action via COM Object
+          - {technique: T1137.005, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Outlook Rule - Sender Address Trigger with DeletePermanently Action via COM Object
+          - {technique: T1137.005, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Outlook Rule - Auto-Forward Emails to External Address via COM Object
+          - {technique: T1137.005, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Outlook Rules - Enumerate Existing Rules via PowerShell COM Object
+          - {technique: T1137.005, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Outlook Rule - Create Rule with Obfuscated Blank Name (MAPI Evasion)
+          - {technique: T1137.006, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Code Executed Via Excel Add-in File (XLL)
+          - {technique: T1137.006, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistent Code Execution Via Excel Add-in File (XLL)
+          - {technique: T1137.006, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistent Code Execution Via Word Add-in File (WLL)
+          - {technique: T1137.006, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistent Code Execution Via Excel VBA Add-in File (XLAM)
+          - {technique: T1137.006, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistent Code Execution Via PowerPoint VBA Add-in File (PPAM)
+          - {technique: T1176, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Chrome/Chromium (Developer Mode)
+          - {technique: T1176, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Firefox
+          - {technique: T1176, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Edge Chromium Addon - VPN
+          - {technique: T1176, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Google Chrome Load Unpacked Extension With Command Line
+          - {technique: T1197, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Bitsadmin Download (cmd)
+          - {technique: T1197, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Bitsadmin Download (PowerShell)
+          - {technique: T1197, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Persist, Download, & Execute
+          - {technique: T1197, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Bits download using desktopimgdownldr.exe (cmd)
+          - {technique: T1505.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install MS Exchange Transport Agent Persistence
+          - {technique: T1505.003, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Web Shell Written to Disk
+          - {technique: T1505.004, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install IIS Module using AppCmd.exe
+          - {technique: T1505.004, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install IIS Module using PowerShell Cmdlet New-WebGlobalModule
+          - {technique: T1505.005, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Simulate Patching termsrv.dll
+          - {technique: T1505.005, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Terminal Services DLL Path
+          - {technique: T1542.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # UEFI Persistence via Wpbbin.exe File Creation
+          - {technique: T1543.003, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Fax service to run PowerShell
+          - {technique: T1543.003, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Service Installation CMD
+          - {technique: T1543.003, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Service Installation PowerShell
+          - {technique: T1543.003, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # TinyTurla backdoor service w64time
+          - {technique: T1543.003, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Remote Service Installation CMD
+          - {technique: T1543.003, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify Service to Run Arbitrary Binary (Powershell)
+          - {technique: T1546, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistence with Custom AutodialDLL
+          - {technique: T1546, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Persistence using CommandProcessor AutoRun key (With Elevation)
+          - {technique: T1546, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKCU - Persistence using CommandProcessor AutoRun key (Without Elevation)
+          - {technique: T1546, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # WMI Invoke-CimMethod Start Process
+          - {technique: T1546, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Adding custom debugger for Windows Error Reporting
+          - {technique: T1546, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Load custom DLL on mstsc execution
+          - {technique: T1546, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Persistence using automatic execution of custom DLL during RDP session
+          - {technique: T1546, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Persistence via ErrorHandler.cmd script execution
+          - {technique: T1546, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Persistence using STARTUP-PATH in MS-WORD
+          - {technique: T1546.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Change Default File Association
+          - {technique: T1546.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Set Arbitrary Binary as Screensaver
+          - {technique: T1546.003, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Persistence via WMI Event Subscription - CommandLineEventConsumer
+          - {technique: T1546.003, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Persistence via WMI Event Subscription - ActiveScriptEventConsumer
+          - {technique: T1546.003, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Windows MOFComp.exe Load MOF File
+          - {technique: T1546.007, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Netsh Helper DLL Registration
+          - {technique: T1546.008, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Attaches Command Prompt as a Debugger to a List of Target Processes
+          - {technique: T1546.008, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace binary of sticky keys
+          - {technique: T1546.008, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create Symbolic Link From osk.exe to cmd.exe
+          - {technique: T1546.008, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Atbroker.exe (AT) Executes Arbitrary Command via Registry Key
+          - {technique: T1546.008, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Auto-start application on user logon
+          - {technique: T1546.008, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace utilman.exe (Ease of Access Binary) with cmd.exe
+          - {technique: T1546.008, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace Magnify.exe (Magnifier binary) with cmd.exe
+          - {technique: T1546.008, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace Narrator.exe (Narrator binary) with cmd.exe
+          - {technique: T1546.008, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace DisplaySwitch.exe (Display Switcher binary) with cmd.exe
+          - {technique: T1546.008, tests: "10", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Replace AtBroker.exe (App Switcher binary) with cmd.exe
+          - {technique: T1546.009, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Create registry persistence via AppCert DLL
+          - {technique: T1546.010, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install AppInit Shim
+          - {technique: T1546.011, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Application Shim Installation
+          - {technique: T1546.011, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # New shim database files created in the default shim database directory
+          - {technique: T1546.011, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Registry key creation and/or modification events for SDB
+          - {technique: T1546.012, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # IFEO Add Debugger
+          - {technique: T1546.012, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # IFEO Global Flags
+          - {technique: T1546.012, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # GlobalFlags in Image File Execution Options
+          - {technique: T1546.013, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Append malicious start-process cmdlet
+          - {technique: T1546.015, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # COM Hijacking - InprocServer32
+          - {technique: T1546.015, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Powershell Execute COM Object
+          - {technique: T1546.015, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # COM Hijacking with RunDLL32 (Local Server Switch)
+          - {technique: T1546.015, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # COM hijacking via TreatAs
+          - {technique: T1546.018, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Python Startup Hook - atomic_hook.pth (Windows)
+          - {technique: T1546.018, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Python Startup Hook - usercustomize.py (Windows)
+          - {technique: T1547, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add a driver
+          - {technique: T1547, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Driver Installation Using pnputil.exe
+          - {technique: T1547, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Leverage Virtual Channels to execute custom DLL during successful RDP session
+          - {technique: T1547.001, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Reg Key Run
+          - {technique: T1547.001, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Reg Key RunOnce
+          - {technique: T1547.001, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # PowerShell Registry RunOnce
+          - {technique: T1547.001, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Suspicious vbs file run from startup Folder
+          - {technique: T1547.001, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Suspicious jse file run from startup Folder
+          - {technique: T1547.001, tests: "6", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Suspicious bat file run from startup Folder
+          - {technique: T1547.001, tests: "7", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add Executable Shortcut Link to User Startup Folder
+          - {technique: T1547.001, tests: "8", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add persistance via Recycle bin
+          - {technique: T1547.001, tests: "9", tactic: persistence, target: "{{ win_user_1_ip }}"}  # SystemBC Malware-as-a-Service Registry
+          - {technique: T1547.001, tests: "10", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Change Startup Folder - HKLM Modify User Shell Folders Common Startup Value
+          - {technique: T1547.001, tests: "11", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Change Startup Folder - HKCU Modify User Shell Folders Startup Value
+          - {technique: T1547.001, tests: "12", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKCU - Policy Settings Explorer Run Key
+          - {technique: T1547.001, tests: "13", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Policy Settings Explorer Run Key
+          - {technique: T1547.001, tests: "14", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Append Command to Winlogon Userinit KEY Value
+          - {technique: T1547.001, tests: "15", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Modify default System Shell - Winlogon Shell KEY Value
+          - {technique: T1547.001, tests: "16", tactic: persistence, target: "{{ win_user_1_ip }}"}  # secedit used to create a Run key in the HKLM Hive
+          - {technique: T1547.001, tests: "17", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify BootExecute Value
+          - {technique: T1547.001, tests: "18", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Allowing custom application to execute during new RDP logon session
+          - {technique: T1547.001, tests: "19", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Creating Boot Verification Program Key for application execution during successful boot
+          - {technique: T1547.001, tests: "20", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add persistence via Windows Context Menu
+          - {technique: T1547.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Authentication Package
+          - {technique: T1547.003, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create a new time provider
+          - {technique: T1547.003, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Edit an existing time provider
+          - {technique: T1547.004, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Winlogon Shell Key Persistence - PowerShell
+          - {technique: T1547.004, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Winlogon Userinit Key Persistence - PowerShell
+          - {technique: T1547.004, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Winlogon Notify Key Logon Persistence - PowerShell
+          - {technique: T1547.004, tests: "4", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Winlogon HKLM Shell Key Persistence - PowerShell
+          - {technique: T1547.004, tests: "5", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Winlogon HKLM Userinit Key Persistence - PowerShell
+          - {technique: T1547.005, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify HKLM:\System\CurrentControlSet\Control\Lsa Security Support Provider configuration in registry
+          - {technique: T1547.005, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Modify HKLM:\System\CurrentControlSet\Control\Lsa\OSConfig Security Support Provider configuration in registry
+          - {technique: T1547.008, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Modify Registry to load Arbitrary DLL into LSASS - LsaDbExtPt
+          - {technique: T1547.009, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Shortcut Modification
+          - {technique: T1547.009, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Create shortcut to cmd in startup folders
+          - {technique: T1547.010, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Add Port Monitor persistence in Registry
+          - {technique: T1547.012, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # Print Processors
+          - {technique: T1547.014, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Add atomic_test key to launch executable as part of user setup
+          - {technique: T1547.014, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - Add malicious StubPath value to existing Active Setup Entry
+          - {technique: T1547.014, tests: "3", tactic: persistence, target: "{{ win_user_1_ip }}"}  # HKLM - re-execute 'Internet Explorer Core Fonts' StubPath payload by decreasing version number
+          - {technique: T1556.002, tests: "1", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install and Register Password Filter DLL
+          - {technique: T1556.002, tests: "2", tactic: persistence, target: "{{ win_user_1_ip }}", get_prereqs: true}  # Install Additional Authentication Packages
       tasks:
         - task: linux/set_hostname
           vars:

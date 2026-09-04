@@ -5,7 +5,7 @@
 # Two sources, each gated by its own upload_* flag. enable_* is honoured ONLY when
 # the matching upload_* is true, and controls whether rules land enabled or disabled
 # by rewriting "enabled": true -> false in the ndjson before import:
-#   custom — *.ndjson dropped in data/rules/custom/ on the controller
+#   custom — *.ndjson (or *.json, auto-converted) in data/rules/custom/ on the controller
 #   sigma  — SigmaHQ rules converted with sigma-cli (target lucene, pipeline ecs_windows)
 #
 # An empty custom dir with upload_custom_rules=true is a WARNING, not a failure.
@@ -25,42 +25,115 @@
   when: (upload_custom_rules | default(false)) or (upload_sigma_rules | default(false))
 
 # ---------------- custom rules ----------------
-- name: Find custom rule files on the controller
+# Two accepted shapes in data/rules/custom/:
+#   *.ndjson — imported as-is (Kibana's _import wants one rule per line)
+#   *.json   — a single rule object OR an array of them (e.g. a pretty-printed
+#              Kibana export); converted to NDJSON on the controller first.
+- name: Find custom .ndjson rule files on the controller
   delegate_to: localhost
   become: false
   ansible.builtin.find:
     paths: "{{ lab_ansible_dir }}/../data/rules/custom"
     patterns: "*.ndjson"
-  register: _custom_found
+  register: _custom_ndjson
+  when: upload_custom_rules | default(false)
+
+- name: Find custom .json rule files on the controller
+  delegate_to: localhost
+  become: false
+  ansible.builtin.find:
+    paths: "{{ lab_ansible_dir }}/../data/rules/custom"
+    patterns: "*.json"
+  register: _custom_json
+  when: upload_custom_rules | default(false)
+
+# Reset the scratch dir each run so stale conversions never get re-imported.
+- name: Reset the JSON->NDJSON conversion dir on the controller
+  delegate_to: localhost
+  become: false
+  ansible.builtin.file:
+    path: "{{ lab_ansible_dir }}/../data/artifacts/rules-json2ndjson"
+    state: "{{ item }}"
+    mode: "0755"
+  loop: [absent, directory]
+  when:
+    - upload_custom_rules | default(false)
+    - (_custom_json.matched | default(0)) > 0
+
+# json.load handles both an array and a lone object; each rule becomes one line.
+# Named <original>.ndjson (keeping the .json) so it never collides with a real
+# .ndjson of the same stem. Best-effort: a malformed file is skipped, not fatal.
+- name: Convert each .json rule file to NDJSON (array or single object)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - >-
+        import json,sys;
+        r=json.load(open(sys.argv[1]));
+        r=r if isinstance(r,list) else [r];
+        open(sys.argv[2],'w').write(''.join(json.dumps(x)+chr(10) for x in r))
+      - "{{ item.path }}"
+      - "{{ lab_ansible_dir }}/../data/artifacts/rules-json2ndjson/{{ item.path | basename }}.ndjson"
+  loop: "{{ _custom_json.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  register: _custom_convert
+  changed_when: true
+  failed_when: false
+  when:
+    - upload_custom_rules | default(false)
+    - (_custom_json.matched | default(0)) > 0
+
+- name: Collect the converted NDJSON files
+  delegate_to: localhost
+  become: false
+  ansible.builtin.find:
+    paths: "{{ lab_ansible_dir }}/../data/artifacts/rules-json2ndjson"
+    patterns: "*.ndjson"
+  register: _custom_converted
+  when:
+    - upload_custom_rules | default(false)
+    - (_custom_json.matched | default(0)) > 0
+
+# Unify native + converted into one list of controller paths for the shared
+# stage/disable/import loops below.
+- name: Build the combined custom-rule file list
+  ansible.builtin.set_fact:
+    _custom_files: >-
+      {{ (_custom_ndjson.files | default([]) | map(attribute='path') | list)
+         + (_custom_converted.files | default([]) | map(attribute='path') | list) }}
   when: upload_custom_rules | default(false)
 
 - name: Warn when custom rules are requested but none are provided
   ansible.builtin.debug:
     msg: >-
-      upload_custom_rules is true but data/rules/custom/ has no .ndjson files —
-      skipping custom rule import.
+      upload_custom_rules is true but data/rules/custom/ has no .ndjson or .json
+      files — skipping custom rule import.
   when:
     - upload_custom_rules | default(false)
-    - (_custom_found.matched | default(0)) == 0
+    - (_custom_files | default([]) | length) == 0
 
 - name: Stage custom rule files onto elk-1
   ansible.builtin.copy:
-    src: "{{ item.path }}"
-    dest: "/tmp/art-rules/custom/{{ item.path | basename }}"
+    src: "{{ item }}"
+    dest: "/tmp/art-rules/custom/{{ item | basename }}"
     mode: "0644"
-  loop: "{{ _custom_found.files | default([]) }}"
+  loop: "{{ _custom_files | default([]) }}"
   loop_control:
-    label: "{{ item.path | basename }}"
+    label: "{{ item | basename }}"
   when: upload_custom_rules | default(false)
 
 - name: Disable custom rules before import (enable_custom_rules is false)
   ansible.builtin.replace:
-    path: "/tmp/art-rules/custom/{{ item.path | basename }}"
+    path: "/tmp/art-rules/custom/{{ item | basename }}"
     regexp: '"enabled"\s*:\s*true'
     replace: '"enabled": false'
-  loop: "{{ _custom_found.files | default([]) }}"
+  loop: "{{ _custom_files | default([]) }}"
   loop_control:
-    label: "{{ item.path | basename }}"
+    label: "{{ item | basename }}"
   when:
     - upload_custom_rules | default(false)
     - not (enable_custom_rules | default(false))
@@ -78,10 +151,10 @@
       - -H
       - "kbn-xsrf: true"
       - -F
-      - "file=@/tmp/art-rules/custom/{{ item.path | basename }};type=application/ndjson"
-  loop: "{{ _custom_found.files | default([]) }}"
+      - "file=@/tmp/art-rules/custom/{{ item | basename }};type=application/ndjson"
+  loop: "{{ _custom_files | default([]) }}"
   loop_control:
-    label: "{{ item.path | basename }}"
+    label: "{{ item | basename }}"
   register: _custom_import
   changed_when: true
   no_log: true

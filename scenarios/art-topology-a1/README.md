@@ -52,9 +52,28 @@ lab detonate art-topology-a1 --tactic initial-access --per-technique   # a repor
 
 Each atomic test carries a `tactic:` field and runs in file (kill-chain) order. A live
 rollback wakes with a stale clock, so `--settle` lets the agent re-check-in and NTP resync
-before firing (the report correlates on timestamps). Reports land in
-`data/artifacts/art/reports/` as `report-<runid>[-<TECHNIQUE>].pdf` and are also copied to
-`/home/vagrant/art-reports/` on `art-1`.
+before firing (the report correlates on timestamps).
+
+**Where reports land.** The flat working copies stay in `data/artifacts/art/reports/` as
+`report-<runid>[-<TECHNIQUE>].{pdf,html}` + `navigator/summary/run-*` and are mirrored to
+`/opt/lab/reports/<user>/` and `/home/vagrant/art-reports/` on `art-1`. In addition, every
+detonation is filed into an **organised batch tree** (in all three homes), so repeated runs
+don't pile up in one flat directory:
+
+```
+<yy-mm-dd-hh-mm>/                       # one dir per `lab detonate` invocation
+├── reports/                           # pdf-only quick index (mirrors the tree below)
+│   └── <tactic>/<technique>/report-<runid>.pdf
+└── <tactic>/<technique>/              # full artifacts for that technique
+    ├── report-<runid>.html
+    ├── navigator-<runid>.json
+    ├── summary-<runid>.json
+    └── run-<runid>.csv / .log
+```
+
+`--per-technique` gives the clean `<tactic>/<technique>/` nesting (one report each). An
+aggregate run (bare `lab detonate`, or `--tactic X` alone) writes its single multi-technique
+report to the **batch root** (`<yy-mm-dd-hh-mm>/…`, and `…/reports/report-*.pdf`).
 
 ## Detection rules
 
@@ -77,13 +96,17 @@ ndjson before import.
 Drop one or more Kibana **Detection Engine** rule files here (git-ignored, never pushed):
 
 ```
-data/rules/custom/*.ndjson      # one rule per line; a single file or several
+data/rules/custom/*.ndjson      # export format: one JSON rule per line
+data/rules/custom/*.json        # a single rule object, or an array [ {...}, {...} ]
 ```
 
-Format = the Security → Rules **export** format (one JSON rule per line). Use
+`.ndjson` is the Security → Rules **export** format (one rule per line) — use
 [`art-custom-rules.ndjson`](../../art-custom-rules.ndjson) (repo root) as a template.
-Minimum viable rule fields: `rule_id`, `name`, `description`, `severity`, `risk_score`,
-`type` (`query`), `language` (`kuery`/`lucene`), `index` (`["logs-*"]`), `query`.
+`.json` is a convenience: a lone rule object or a (possibly pretty-printed) array of them
+is **auto-converted to NDJSON** on the controller before import, so you can paste a rule
+straight out of Kibana without flattening it yourself. Minimum viable rule fields:
+`rule_id`, `name`, `description`, `severity`, `risk_score`, `type` (`query`), `language`
+(`kuery`/`lucene`), `index` (`["logs-*"]`), `query`.
 
 > Note: `created_at` / `updated_at`, if present, must be `…Z` with milliseconds
 > (e.g. `2026-08-05T16:48:24.196Z`) or the import is rejected.

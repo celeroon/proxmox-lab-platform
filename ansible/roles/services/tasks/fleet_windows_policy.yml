@@ -4,6 +4,10 @@
 # PowerShellCore/Operational channel (PowerShell 7 script-block logging, 4104).
 # Idempotent: skips all steps if windows-policy already exists.
 #
+# A freshly-provisioned Kibana/Fleet is slow to respond, so every call here uses a
+# 120s timeout and retries (until not failed); the POSTs also accept 409 so a retry
+# after a timed-out-but-succeeded create doesn't fail the deploy.
+#
 # Required vars:
 #   elk_password - elastic superuser password
 
@@ -15,8 +19,12 @@
     password: "{{ elk_password }}"
     force_basic_auth: yes
     validate_certs: no
+    timeout: 120
     status_code: [200, 404]
   register: windows_policy_check
+  until: windows_policy_check is not failed
+  retries: 5
+  delay: 10
   no_log: true
 
 - name: Get installed package versions
@@ -27,8 +35,12 @@
     password: "{{ elk_password }}"
     force_basic_auth: yes
     validate_certs: no
+    timeout: 120
     status_code: 200
   register: windows_pkg_versions
+  until: windows_pkg_versions is not failed
+  retries: 5
+  delay: 10
   loop: [system, windows, endpoint, network_traffic, winlog]
   no_log: true
   when: windows_policy_check.status == 404
@@ -59,7 +71,12 @@
       namespace: default
       monitoring_enabled: [logs, metrics]
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -82,7 +99,12 @@
         name: system
         version: "{{ win_pkg_system }}"
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -105,7 +127,12 @@
         name: windows
         version: "{{ win_pkg_windows }}"
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -116,7 +143,6 @@
     user: elastic
     password: "{{ elk_password }}"
     force_basic_auth: yes
-    timeout: 120
     headers:
       kbn-xsrf: kibana
       Content-Type: application/json
@@ -182,7 +208,12 @@
           streams: []
       vars: {}
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -205,7 +236,12 @@
         name: network_traffic
         version: "{{ win_pkg_nettraffic }}"
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
 
@@ -261,6 +297,11 @@
                   type: bool
                   value: false
     validate_certs: no
-    status_code: 200
+    timeout: 120
+    status_code: [200, 409]
+  register: _fleet_post
+  until: _fleet_post is not failed
+  retries: 5
+  delay: 10
   no_log: true
   when: windows_policy_check.status == 404
