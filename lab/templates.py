@@ -307,6 +307,7 @@ class TemplateManager:
         qcow2_path: Path,
         log_fn: Callable[[str], None],
         description: str = "",
+        disk: str = "scsi0",
     ) -> None:
         """Blank VM → import disk → convert to template. Cleans up VM and disk on failure."""
         storage_path = f"{_NFS_STORAGE}:{vmid}/{qcow2_path.name}"
@@ -316,8 +317,8 @@ class TemplateManager:
             self._client.create_blank_vm(node, vmid, name, description=description)
             vm_created = True
 
-            log_fn("importing disk")
-            upid = self._client.import_disk(node, vmid, storage_path, _NFS_STORAGE)
+            log_fn(f"importing disk ({disk})")
+            upid = self._client.import_disk(node, vmid, storage_path, _NFS_STORAGE, disk=disk)
             if upid:
                 self._client.wait_for_task(node, upid)
 
@@ -435,10 +436,14 @@ class TemplateManager:
         log_fn(f"template ready: {box}")
         return vmid
 
-    def import_qcow2(self, name: str, source: Path, log_fn: Callable[[str], None] = print) -> int:
+    def import_qcow2(self, name: str, source: Path, log_fn: Callable[[str], None] = print,
+                     disk: str = "scsi0") -> int:
         """Import a local QCOW2/VMDK/raw disk as a Proxmox template.
 
         source must be a path accessible on the management VM.
+        disk is the bus the disk is attached on (default scsi0 = virtio-SCSI); pass
+        e.g. "virtio0" or "ide0" for guests whose firmware can't use virtio-SCSI
+        (Cisco IOSvL2 needs virtio-blk/IDE to see flash).
         Returns the VMID of the created template.
         """
         if self.get_vmid(name) is not None:
@@ -457,7 +462,7 @@ class TemplateManager:
         log_fn(f"copying disk to NFS storage ({source.stat().st_size // 1024 // 1024} MB)")
         shutil.copy2(source, qcow2_path)
 
-        self._run_import(node, vmid, name, qcow2_path, log_fn, description=name)
+        self._run_import(node, vmid, name, qcow2_path, log_fn, description=name, disk=disk)
         log_fn(f"template ready: {name}")
         return vmid
 

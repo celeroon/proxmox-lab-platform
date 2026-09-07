@@ -94,6 +94,19 @@ The build runs on the Proxmox node's real hardware — **no nesting on the manag
 
 These images intentionally **disable Windows Defender and UAC** (rgl's provisioning), which lets adversary-simulation tooling such as [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) run without payloads being quarantined — so use them **only inside the closed lab**.
 
+#### Cisco IOSvL2
+
+Builds a Cisco **IOSvL2** switch template from Cisco's shipped disk image via Packer ([celeroon/cisco-iosvl2-vagrant-libvirt](https://github.com/celeroon/cisco-iosvl2-vagrant-libvirt)). Cisco ships IOSvL2 as a `.tgz` containing a single `virtioa.qcow2` — extract it first (`tar xf viosl2-*.tgz`) and pass the qcow2 with `--source`:
+
+```bash
+lab template build cisco-iosvl2 --source ./virtioa.qcow2
+```
+
+It boots the disk under Packer, configures it over the serial console (`vagrant`/`vagrant` privilege-15 user, SSH, `GigabitEthernet0/0` as a DHCP management port in the `Mgmt-intf` VRF), and imports the result as template **`cisco-iosvl2`**. Nothing is downloaded — the image comes from `--source`.
+
+- The disk is imported on **virtio-blk** (not virtio-SCSI): IOSvL2 can only reach its flash (`flash0:`, where startup-config/nvram live) on virtio-blk or IDE, so this is set automatically.
+- IOSvL2 is Ethernet-only and needs **Intel E1000** NICs and a **serial console** — a scenario using `template: cisco-iosvl2` must set those on the VM (e1000 NIC model + a `serial0` socket). Interfaces map one-per-NIC: first NIC = `Gi0/0` (management), the rest = `Gi0/1…` switchports.
+
 ---
 
 ## Scenarios

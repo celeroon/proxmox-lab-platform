@@ -45,6 +45,10 @@ class VMSpec:
     # which presents QEMU's Bochs VGA — a guest with no driver for it falls back
     # to a basic adapter locked at whatever resolution the firmware handed over.
     vga: str | None = None
+    # Per-VM NIC model applied to ALL of this VM's interfaces, e.g. "e1000". None =
+    # virtio (the platform default). Optional; set only for guests that need it
+    # (Cisco IOSvL2 has no virtio-net driver and must use e1000).
+    nic_model: str | None = None
     # Snapshot-reset (detonation range) controls. snapshot declares that this VM gets
     # a baseline snapshot so it CAN be rolled back: "live" = RAM/vmstate (instant
     # resume), "disk" = disk-only (fresh boot). rollback marks it for AUTO-revert at
@@ -202,6 +206,12 @@ def parse_scenario(path: Path) -> ScenarioSpec:
                 f"VM '{base_name}': vga must be a string, got {vga!r}"
             )
 
+        nic_model = v.get("nic_model", defaults.get("nic_model", None))
+        if nic_model is not None and not isinstance(nic_model, str):
+            raise ValueError(
+                f"VM '{base_name}': nic_model must be a string, got {nic_model!r}"
+            )
+
         efidisk = v.get("efidisk", defaults.get("efidisk", False))
         tpm = v.get("tpm", defaults.get("tpm", False))
         for field, val in (("efidisk", efidisk), ("tpm", tpm)):
@@ -281,6 +291,7 @@ def parse_scenario(path: Path) -> ScenarioSpec:
             efidisk=efidisk,
             tpm=tpm,
             vga=vga,
+            nic_model=nic_model,
             snapshot=snapshot,
             rollback=rollback,
         )

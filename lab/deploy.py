@@ -409,16 +409,19 @@ def _create_vm(
     log_fn(f"cloning template {template_vmid} → VMID {vmid_val} ({vm_spec.name}) on {node}")
     proxmox.create_vm(node, vmid_val, template_vmid, vm_spec.name, vm_spec.cpus, vm_spec.memory, storage, full=full, qemu_agent=vm_spec.qemu_agent, cpu_type=vm_spec.cpu_type,
                       bios=vm_spec.bios, machine=vm_spec.machine, ostype=vm_spec.ostype,
-                      efidisk=vm_spec.efidisk, tpm=vm_spec.tpm, vga=vm_spec.vga)
+                      efidisk=vm_spec.efidisk, tpm=vm_spec.tpm, vga=vm_spec.vga,
+                      serial=vm_spec.console == "serial")
 
-    log_fn(f"  net0: MAC={mgmt_mac_addr} bridge={mgmt_vnet} IP={mgmt_ip_addr}")
-    proxmox.add_nic(node, vmid_val, "net0", mgmt_vnet, mgmt_mac_addr)
+    # Optional per-VM NIC model (e.g. e1000 for IOSvL2); default virtio.
+    nic_model = vm_spec.nic_model or "virtio"
+    log_fn(f"  net0: MAC={mgmt_mac_addr} bridge={mgmt_vnet} IP={mgmt_ip_addr} model={nic_model}")
+    proxmox.add_nic(node, vmid_val, "net0", mgmt_vnet, mgmt_mac_addr, model=nic_model)
     if not skip_dnsmasq:
         dnsmasq.add_dhcp_host(user_id, mgmt_mac_addr, mgmt_ip_addr)
 
     for slot, iface_name, network, vnet_name, iface_mac, _ in nics[1:]:
-        log_fn(f"  {slot}: network={network} vnet={vnet_name} MAC={iface_mac}")
-        proxmox.add_nic(node, vmid_val, slot, vnet_name, iface_mac)
+        log_fn(f"  {slot}: network={network} vnet={vnet_name} MAC={iface_mac} model={nic_model}")
+        proxmox.add_nic(node, vmid_val, slot, vnet_name, iface_mac, model=nic_model)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1040,6 +1043,14 @@ def _build_inventory(vm_name: str, mgmt_ip: str, conn: dict) -> str:
             f" ansible_network_os={network_os}"
             f" ansible_connection={conn_type}"
         )
+        # Cisco IOS/IOSvL2 speak only legacy SSH crypto (SHA1 KEX/MAC, ssh-rsa host
+        # keys, CBC ciphers) that modern paramiko can't negotiate. Use libssh
+        # (ansible-pylibssh) pointed at our legacy-crypto ssh config so it can.
+        if network_os in ("ios", "iosxr"):
+            host_vars += (
+                f" ansible_network_cli_ssh_type=libssh"
+                f" ansible_libssh_config_file={_ANSIBLE_DIR}/files/cisco-legacy-ssh.config"
+            )
 
     return f"[all]\n{vm_name} {host_vars}\n"
 

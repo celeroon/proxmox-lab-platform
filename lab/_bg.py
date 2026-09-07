@@ -52,6 +52,7 @@ def _template_build(
     url: str = "",
     skip_update: str = "0",
     skip_optimize: str = "0",
+    source: str = "",
 ) -> None:
     from lab.build import BuildManager
     from lab.config import get_settings
@@ -64,6 +65,7 @@ def _template_build(
         log_fn=lambda msg: _log(op_id, msg),
         skip_update=skip_update == "1",
         skip_optimize=skip_optimize == "1",
+        source=source,
     )
 
 

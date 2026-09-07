@@ -198,6 +198,7 @@ class ProxmoxClient:
         efidisk: bool = False,
         tpm: bool = False,
         vga: str | None = None,
+        serial: bool = False,
     ) -> None:
         """Clone a template into a new VM. Waits for the clone task before configuring.
 
@@ -264,6 +265,10 @@ class ProxmoxClient:
                 config_kwargs["ostype"] = ostype
             if vga is not None:
                 config_kwargs["vga"] = vga
+            # Serial console device (a host-side unix socket). Needed by guests whose
+            # console is serial-only (Cisco IOSvL2); pair with vga: serial0 to view it.
+            if serial:
+                config_kwargs["serial0"] = "socket"
             # ":1" asks Proxmox to allocate the volume itself; the size it picks for these
             # is fixed by type (1M efivars, 4M TPM), so the 1 is a placeholder not a GB count.
             # pre-enrolled-keys=0 leaves Secure Boot without Microsoft's keys — a Vagrant
@@ -439,10 +444,14 @@ class ProxmoxClient:
                 return f"net{i}"
         raise RuntimeError(f"VM {vmid} has no free NIC slots (all net0–net31 in use)")
 
-    def add_nic(self, node: str, vmid: int, iface: str, vnet: str, mac: str = "") -> None:
-        """Add a network interface to a VM. Specifying mac makes the NIC deterministic."""
-        self._log("add_nic      node=%s vmid=%s slot=%s vnet=%s mac=%s", node, vmid, iface, vnet, mac)
-        value = f"virtio={mac},bridge={vnet}" if mac else f"virtio,bridge={vnet}"
+    def add_nic(self, node: str, vmid: int, iface: str, vnet: str, mac: str = "", model: str = "virtio") -> None:
+        """Add a network interface to a VM. Specifying mac makes the NIC deterministic.
+
+        model is the emulated NIC (default virtio); pass e.g. "e1000" for guests
+        without a virtio-net driver (Cisco IOSvL2).
+        """
+        self._log("add_nic      node=%s vmid=%s slot=%s vnet=%s mac=%s model=%s", node, vmid, iface, vnet, mac, model)
+        value = f"{model}={mac},bridge={vnet}" if mac else f"{model},bridge={vnet}"
         self._px.nodes(node).qemu(vmid).config.put(**{iface: value})
 
     def get_vm_nic(self, node: str, vmid: int, slot: str) -> str | None:

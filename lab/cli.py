@@ -530,7 +530,10 @@ def ssh(
 
     conn_info = _vm_connection_from_scenario(row["scenario"] or {}, name)
     conn_type = conn_info.get("type", "ssh")
-    if conn_type != "ssh":
+    network_os = conn_info.get("network_os", "")
+    # network_cli devices (routers/switches like vyos or Cisco IOSvL2) are reachable
+    # over SSH too — only the non-SSH transports (winrm, httpapi) have no SSH shell.
+    if conn_type not in ("ssh", "network_cli"):
         typer.echo(
             f"error: '{name}' uses connection type '{conn_type}', not ssh — "
             f"try 'lab console {row['deployment_name']}' instead",
@@ -545,6 +548,17 @@ def ssh(
     typer.echo(f"connecting to {ssh_user}@{ip} (VMID {row['vmid']})")
 
     ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    # Cisco IOS/IOSvL2 only offer legacy SSH crypto (SHA1 KEX/MAC, ssh-rsa host keys,
+    # CBC ciphers). Enable them as fallbacks so `lab ssh` negotiates without relying
+    # on the operator's ~/.ssh/config.
+    if network_os in ("ios", "iosxr"):
+        ssh_opts += [
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+            "-o", "MACs=+hmac-sha1",
+            "-o", "Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc",
+        ]
     if password:
         try:
             os.execvp("sshpass", ["sshpass", "-p", password, "ssh", *ssh_opts, f"{ssh_user}@{ip}"])
@@ -739,17 +753,27 @@ def template_build(
     skip_update: bool = typer.Option(False, "--skip-update", help="Windows only: skip Windows Update during the build (default: updates run)."),
     skip_optimize: bool = typer.Option(False, "--skip-optimize", help="Windows only: skip the SDelete free-space zero-fill (default: it runs)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Windows only: print the detected node/storage/bridge/VLAN + patched config and exit, building nothing."),
+    source: str = typer.Option("", "--source", help="cisco-iosvl2: path to the extracted virtioa.qcow2 disk image to build from."),
 ):
     """Build a Proxmox template via Packer (background).
 
     nethsecurity is built via libvirt and imported; windows is built directly on a
-    Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only).
+    Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only);
+    cisco-iosvl2 boots the disk image given by --source and imports the result.
     """
     if not is_admin():
         typer.echo("error: lab template build requires admin", err=True)
         raise typer.Exit(1)
     s = get_settings()
     require_proxmox(s)
+
+    # Fail fast on a bad --source before spawning a background op.
+    if source:
+        src = Path(source).expanduser()
+        if not src.exists():
+            typer.echo(f"error: source image not found: {source}", err=True)
+            raise typer.Exit(1)
+        source = str(src.resolve())
 
     # --dry-run runs synchronously so the preview prints right here (no background op).
     if dry_run:
@@ -758,6 +782,7 @@ def template_build(
             BuildManager(ProxmoxClient(s), s).build(
                 build_name, version, log_fn=typer.echo,
                 skip_update=skip_update, skip_optimize=skip_optimize, dry_run=True,
+                source=source,
             )
         except (RuntimeError, ValueError, FileNotFoundError) as exc:
             typer.echo(f"error: {exc}", err=True)
@@ -769,7 +794,7 @@ def template_build(
     op_id = create_operation("template_build", command, current_username(), target)
     spawn_background(
         op_id, "template_build", build_name, version, url,
-        "1" if skip_update else "0", "1" if skip_optimize else "0",
+        "1" if skip_update else "0", "1" if skip_optimize else "0", source,
     )
     typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
 

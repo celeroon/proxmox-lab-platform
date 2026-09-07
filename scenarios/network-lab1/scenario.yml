@@ -1,0 +1,59 @@
+version: 1
+name: Cisco IOSvL2 (switch + host)
+description: >-
+  One Cisco IOSvL2 switch with a Debian host on Gi0/1, for hand-testing L2 topologies.
+  Deploy is intentionally minimal (hostnames + a host IP); configure the switch itself
+  by hand over the serial console or `lab ssh`. Keep both VMs on the same Proxmox node.
+vm_prefix: ""
+
+networks:
+  - name: sw-access
+    type: vnet
+
+vms:
+  - name: sw1
+    template: cisco-iosvl2
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    nic_model: e1000
+    interfaces:
+      - name: eth1          # net1 -> Gi0/1 toward host-a
+        type: vnet
+        network: sw-access
+    ansible:
+      connection:
+        type: network_cli
+        network_os: ios
+        user: vagrant
+        password: vagrant
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: sw1}
+
+  - name: host-a
+    depends_on: [sw1]
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - name: eth1          # net1 -> eth1, wired to sw1 Gi0/1
+        type: vnet
+        network: sw-access
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+          vars: {hostname: host-a}

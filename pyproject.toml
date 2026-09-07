@@ -20,6 +20,7 @@ dependencies = [
     "ansible-runner",
     "ansible",
     "paramiko",
+    "ansible-pylibssh",   # libssh for network_cli — negotiates Cisco IOS legacy SSH crypto
     "pywinrm",
     "rich",
 ]

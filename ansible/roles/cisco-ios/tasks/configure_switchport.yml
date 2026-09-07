@@ -1,0 +1,35 @@
+---
+# Configure an access or trunk switchport.
+# Vars: interface (req); mode "access"|"trunk" (req); access_vlan (access mode);
+#       trunk_vlans (opt, e.g. "10,20"); trunk_encapsulation (default dot1q).
+
+- name: Configure {{ interface }} as an access port
+  cisco.ios.ios_config:
+    lines:
+      - switchport mode access
+      - switchport access vlan {{ access_vlan }}
+      - no shutdown
+    parents: interface {{ interface }}
+  when: mode == "access"
+
+# Encapsulation must be committed BEFORE mode, or IOS rejects `switchport mode trunk`
+# while encap is still "negotiate" — hence two separate ios_config calls.
+- name: Set trunk encapsulation + allowed VLANs on {{ interface }}
+  cisco.ios.ios_config:
+    lines: >-
+      {{ (['switchport trunk encapsulation ' ~ (trunk_encapsulation | default('dot1q'))]
+          if (trunk_encapsulation | default('dot1q')) | length > 0 else [])
+         + (['switchport trunk allowed vlan ' ~ trunk_vlans]
+            if (trunk_vlans | default('')) | length > 0 else []) }}
+    parents: interface {{ interface }}
+  when:
+    - mode == "trunk"
+    - (trunk_encapsulation | default('dot1q')) | length > 0 or (trunk_vlans | default('')) | length > 0
+
+- name: Set {{ interface }} to trunk mode
+  cisco.ios.ios_config:
+    lines:
+      - switchport mode trunk
+      - no shutdown
+    parents: interface {{ interface }}
+  when: mode == "trunk"

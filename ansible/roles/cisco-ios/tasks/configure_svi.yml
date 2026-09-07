@@ -1,0 +1,11 @@
+---
+# Configure an SVI (interface Vlan<id>). Vars: vlan_id, ip_address, mask (req);
+# mac_address (opt). Set a unique mac_address when several switches have an SVI in the
+# same VLAN — cloned IOSvL2 images share one SVI base MAC and would collide.
+
+- name: Configure SVI Vlan{{ vlan_id }}
+  cisco.ios.ios_config:
+    lines: >-
+      {{ (['mac-address ' ~ mac_address] if (mac_address | default('')) | length > 0 else [])
+         + ['ip address ' ~ ip_address ~ ' ' ~ mask, 'no shutdown'] }}
+    parents: interface Vlan{{ vlan_id }}

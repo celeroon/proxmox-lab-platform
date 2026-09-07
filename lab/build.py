@@ -27,6 +27,19 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         "requires_source": False,
         "builder": "proxmox",
     },
+    # Cisco IOSvL2 switch: clones the packer repo, boots the extracted virtioa.qcow2,
+    # configures it over serial, and produces a version-less cisco-iosvl2.qcow2 which
+    # is then imported. The disk image is supplied by the caller (--source); nothing
+    # is downloaded. source_arg=True means the script's only argument is that path.
+    "cisco-iosvl2": {
+        "script": "build-cisco-iosvl2.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "output_dir": "/var/lib/lab-platform/build-work/cisco-iosvl2-out",
+        "output_file": "cisco-iosvl2.qcow2",
+        # IOSvL2 can't see a virtio-SCSI disk as flash0: — import on virtio-blk.
+        "disk_bus": "virtio0",
+    },
 }
 
 
@@ -35,6 +48,18 @@ class BuildManager:
         self._proxmox = proxmox
         self._s = s
         self._sources = BuildSourceManager(s.build_sources_dir)
+
+    @staticmethod
+    def _stream(cmd: list[str], log_fn: Callable[[str], None], env: dict | None = None) -> None:
+        """Run cmd, streaming combined stdout/stderr to log_fn; raise on non-zero exit."""
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env
+        )
+        for line in proc.stdout:
+            log_fn(line.rstrip())
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"{Path(cmd[0]).name} failed (exit {proc.returncode})")
 
     def build(
         self,
@@ -45,6 +70,7 @@ class BuildManager:
         skip_update: bool = False,
         skip_optimize: bool = False,
         dry_run: bool = False,
+        source: str = "",
     ) -> int:
         if build_name not in SUPPORTED_BUILDS:
             supported = ", ".join(SUPPORTED_BUILDS)
@@ -61,6 +87,29 @@ class BuildManager:
             )
         if dry_run:
             raise ValueError(f"--dry-run is not supported for '{build_name}'")
+
+        # Image-source builds (cisco-iosvl2): the script takes a local disk-image path
+        # and writes a fixed-name qcow2 into output_dir (via OUT_DIR), which we import.
+        if spec.get("source_arg"):
+            if not source:
+                raise ValueError(f"'{build_name}' requires --source <path to disk image>")
+            src = Path(source).expanduser().resolve()
+            if not src.exists():
+                raise FileNotFoundError(f"source image not found: {src}")
+            out_dir = Path(spec["output_dir"])
+            env = dict(os.environ)
+            env["OUT_DIR"] = str(out_dir)
+            log_fn(f"source: {src}")
+            log_fn(f"running {script.name}")
+            self._stream([str(script), str(src)], log_fn, env=env)
+            output = out_dir / spec["output_file"]
+            if not output.exists():
+                raise RuntimeError(f"build completed but {output} was not produced")
+            log_fn(f"output: {output}")
+            tpl_name = f"{build_name}-{version}" if version else build_name
+            return TemplateManager(self._proxmox, self._s).import_qcow2(
+                tpl_name, output, log_fn=log_fn, disk=spec.get("disk_bus", "scsi0")
+            )
 
         cmd = [str(script), version]
         if spec["requires_source"]:

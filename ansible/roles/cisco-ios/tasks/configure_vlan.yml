@@ -1,0 +1,14 @@
+---
+# Create an L2 VLAN. Vars: vlan_id (required), vlan_name (optional).
+
+- name: Create VLAN {{ vlan_id }}
+  cisco.ios.ios_config:
+    lines:
+      - vlan {{ vlan_id }}
+
+- name: Name VLAN {{ vlan_id }}
+  cisco.ios.ios_config:
+    lines:
+      - name {{ vlan_name }}
+    parents: vlan {{ vlan_id }}
+  when: vlan_name is defined and vlan_name | length > 0
