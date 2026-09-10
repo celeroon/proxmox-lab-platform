@@ -42,6 +42,7 @@ Thumbs.db
 
 # internal session logs and notes
 *.pid
+*.explog
 
 # claude session files
 .claude/
@@ -51,3 +52,8 @@ windows-vagrant/
 *.ndjson
 
 atomic-workstation-tests.md
+
+# temporary local clone of the external packer repo
+cisco-catalyst-8kv-vagrant-libvirt/
+
+test-topology-*/

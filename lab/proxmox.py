@@ -199,8 +199,13 @@ class ProxmoxClient:
         tpm: bool = False,
         vga: str | None = None,
         serial: bool = False,
+        clone_timeout: int = 1800,
     ) -> None:
         """Clone a template into a new VM. Waits for the clone task before configuring.
+
+        clone_timeout bounds the clone/migrate wait (not the shorter default): a full
+        clone of a large disk on Ceph is slow — a 60G Windows template takes ~11-16 min,
+        well past the 600s default — so allow up to 30 min before giving up.
 
         The clone is initiated on the node that owns the template. When that differs
         from the target node and the destination storage is shared (Ceph/NFS), the
@@ -238,13 +243,13 @@ class ProxmoxClient:
                             node, vmid, template_vmid, name, full, storage, template_node)
                 upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
                 if upid:
-                    self.wait_for_task(template_node, upid)
+                    self.wait_for_task(template_node, upid, timeout=clone_timeout)
                 self._log("migrate      vmid=%s %s -> %s (with local disks)", vmid, template_node, node)
                 upid = self._px.nodes(template_node).qemu(vmid).migrate.post(
                     target=node, **{"with-local-disks": 1, "targetstorage": storage}
                 )
                 if upid:
-                    self.wait_for_task(template_node, upid)
+                    self.wait_for_task(template_node, upid, timeout=clone_timeout)
             else:
                 if cross_node:
                     kwargs["target"] = node
@@ -252,7 +257,7 @@ class ProxmoxClient:
                             node, vmid, template_vmid, name, full, storage)
                 upid = self._px.nodes(template_node).qemu(template_vmid).clone.post(**kwargs)
                 if upid:
-                    self.wait_for_task(template_node, upid)
+                    self.wait_for_task(template_node, upid, timeout=clone_timeout)
 
             config_kwargs: dict = dict(cores=cpus, memory=memory, agent=1 if qemu_agent else 0)
             if cpu_type is not None:

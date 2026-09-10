@@ -107,6 +107,61 @@ It boots the disk under Packer, configures it over the serial console (`vagrant`
 - The disk is imported on **virtio-blk** (not virtio-SCSI): IOSvL2 can only reach its flash (`flash0:`, where startup-config/nvram live) on virtio-blk or IDE, so this is set automatically.
 - IOSvL2 is Ethernet-only and needs **Intel E1000** NICs and a **serial console** — a scenario using `template: cisco-iosvl2` must set those on the VM (e1000 NIC model + a `serial0` socket). Interfaces map one-per-NIC: first NIC = `Gi0/0` (management), the rest = `Gi0/1…` switchports.
 
+#### Cisco Catalyst 8000v
+
+Builds a Cisco **Catalyst 8000v** (IOS-XE) router template the same way, via Packer ([celeroon/cisco-catalyst-8kv-vagrant-libvirt](https://github.com/celeroon/cisco-catalyst-8kv-vagrant-libvirt)). Cisco ships the 8000v as a bootable `.qcow2` — pass it with `--source`:
+
+```bash
+lab template build cisco-8kv --source ./cisco-cat8kv.qcow2
+```
+
+It boots the disk under Packer, configures it over the serial console (`vagrant`/`vagrant`, SSH), and imports the result as template **`cisco-8kv`**. Nothing is downloaded — the image comes from `--source`.
+
+- IOS-XE is Linux-based, so the disk is imported on the default **virtio-SCSI** (no flash quirk like IOSvL2). Interfaces map one-per-NIC: first NIC = `GigabitEthernet1` (management), the rest = `Gi2…`.
+- The [`network-lab1`](scenarios/network-lab1/scenario.yml) scenario builds a full CCNP practice topology from these routers plus `cisco-iosvl2` switches and Debian hosts (9 routers, 5 switches, 4 hosts) — deploy sets hostnames and interface descriptions only; addressing, routing, FHRP, EtherChannel and NAT are configured by hand.
+
+---
+
+### Snapshots (detonation range)
+
+Snapshots turn a deployment into a repeatable **detonation range**: take a clean baseline,
+fire tests, revert, repeat — no redeploy. These commands are **admin only**, and each takes
+`--user <user>` to target another user's deployment.
+
+A VM can only be baselined if its scenario spec opts in with **`snapshot: disk | live`** — this
+must be added **per VM** (or once under `defaults:` to cover every VM). `disk` = fresh boot on
+rollback; `live` = RAM/vmstate (instant resume, but wakes with a stale guest clock). Add
+`rollback: true` to auto-revert a VM at the start of every `lab detonate` (requires `snapshot`).
+See [`scenarios/art-topology-a1/`](scenarios/art-topology-a1/) for a worked example.
+
+```yaml
+# scenario.yml — baseline every VM by default; one victim overrides + auto-reverts
+defaults:
+  snapshot: disk
+vms:
+  - name: win-user-1
+    snapshot: disk        # per-VM: this VM gets a clean-baseline snapshot
+    rollback: true        # and is auto-reverted at the start of each detonate
+```
+
+```bash
+lab snapshot create   <deployment> --user <user>                  # take/refresh baselines on snapshot-declared VMs
+lab snapshot create   <deployment> --user <user> --vm win-user-1  # only this VM
+lab snapshot list     <deployment> --user <user>                  # which VMs hold a baseline
+lab snapshot rollback <deployment> --user <user> --vm win-user-1  # manual revert, one VM
+lab snapshot rollback <deployment> --user <user> --all            # whole-lab reset (all baselined VMs)
+lab snapshot delete   <deployment> --user <user>                  # remove baselines
+
+# detonate: revert rollback VMs → run phase:detonate tasks → report
+lab detonate <deployment> --user <user>                           # all tests
+lab detonate <deployment> --user <user> --tactic initial-access   # only this ATT&CK tactic (comma-separated)
+lab detonate <deployment> --user <user> --per-technique           # one report per base technique
+```
+
+Extra `lab detonate` flags — `--revert vm[,vm]` (roll back only these victims) and `--settle N`
+(seconds to wait after rollback for agent check-in / clock resync, default 90) — are documented
+per scenario, e.g. [`scenarios/art-topology-a1/README.md`](scenarios/art-topology-a1/README.md).
+
 ---
 
 ## Scenarios

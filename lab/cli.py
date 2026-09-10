@@ -753,13 +753,13 @@ def template_build(
     skip_update: bool = typer.Option(False, "--skip-update", help="Windows only: skip Windows Update during the build (default: updates run)."),
     skip_optimize: bool = typer.Option(False, "--skip-optimize", help="Windows only: skip the SDelete free-space zero-fill (default: it runs)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Windows only: print the detected node/storage/bridge/VLAN + patched config and exit, building nothing."),
-    source: str = typer.Option("", "--source", help="cisco-iosvl2: path to the extracted virtioa.qcow2 disk image to build from."),
+    source: str = typer.Option("", "--source", help="cisco-iosvl2 / cisco-8kv: path to the source qcow2 disk image to build from."),
 ):
     """Build a Proxmox template via Packer (background).
 
     nethsecurity is built via libvirt and imported; windows is built directly on a
     Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only);
-    cisco-iosvl2 boots the disk image given by --source and imports the result.
+    cisco-iosvl2 and cisco-8kv boot the disk image given by --source and import the result.
     """
     if not is_admin():
         typer.echo("error: lab template build requires admin", err=True)

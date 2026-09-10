@@ -40,6 +40,17 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         # IOSvL2 can't see a virtio-SCSI disk as flash0: — import on virtio-blk.
         "disk_bus": "virtio0",
     },
+    # Cisco Catalyst 8000v router (IOS-XE): same --source flow as cisco-iosvl2 — clones
+    # the packer repo, boots the supplied qcow2, configures it over serial, and produces
+    # a version-less cisco-8kv.qcow2 which is then imported. IOS-XE is Linux-based, so the
+    # default virtio-SCSI import works (no flash0: quirk like the switch).
+    "cisco-8kv": {
+        "script": "build-cisco-8kv.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "output_dir": "/var/lib/lab-platform/build-work/cisco-8kv-out",
+        "output_file": "cisco-8kv.qcow2",
+    },
 }
 
 

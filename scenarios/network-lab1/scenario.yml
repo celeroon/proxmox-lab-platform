@@ -1,16 +1,279 @@
 version: 1
-name: Cisco IOSvL2 (switch + host)
+name: CCNP topology (9 routers, 5 switches, 4 hosts)
 description: >-
-  One Cisco IOSvL2 switch with a Debian host on Gi0/1, for hand-testing L2 topologies.
-  Deploy is intentionally minimal (hostnames + a host IP); configure the switch itself
-  by hand over the serial console or `lab ssh`. Keep both VMs on the same Proxmox node.
+  Full CCNP practice topology from LAB-NETWORK.drawio.svg: a 7-router core (r1-r7) with two
+  internet-edge routers (r4, r5) NAT'ing out their mgmt interface, an access switch block
+  (sw1-sw4) dual-homed with EtherChannel, and a second switch block (sw5) dual-homed to r8/r9.
+  Deploy only sets hostnames + interface descriptions — all addressing, routing (OSPF/EIGRP/BGP),
+  FHRP (HSRP/VRRP), EtherChannel/LACP and NAT/ACL are configured by hand for learning.
+  Two link pairs are intentionally doubled for EtherChannel labs: sw1=sw4 (Po1) and sw4=r1 (Po2).
+  r4/r5 reach the internet via their Gi1 mgmt interface (NAT configured manually).
 vm_prefix: ""
 
+# Interface mapping reminder:
+#   8kv routers  : net0->Gi1 (mgmt), net1->Gi2, net2->Gi3, net3->Gi4, net4->Gi5
+#   IOSvL2 switch: net0->Gi0/0 (mgmt), net1->Gi0/1, net2->Gi0/2, net3->Gi0/3, net4->Gi1/0, net5->Gi1/1
+#   debian host  : net0->eth0 (mgmt), net1->eth1
+
 networks:
-  - name: sw-access
-    type: vnet
+  # switch access block
+  - {name: host1-sw2, type: vnet}
+  - {name: sw1-sw2, type: vnet}
+  - {name: sw2-sw3, type: vnet}
+  - {name: sw3-sw4, type: vnet}
+  - {name: sw1-sw4-a, type: vnet}     # Po1 member
+  - {name: sw1-sw4-b, type: vnet}     # Po1 member
+  - {name: sw4-r1-a, type: vnet}      # Po2 member
+  - {name: sw4-r1-b, type: vnet}      # Po2 member
+  # router core
+  - {name: r1-r2, type: vnet}
+  - {name: r2-r3, type: vnet}
+  - {name: r2-r7, type: vnet}
+  - {name: r3-r4, type: vnet}
+  - {name: r3-r6, type: vnet}
+  - {name: r5-r6, type: vnet}
+  - {name: r6-r7, type: vnet}
+  - {name: r7-r8, type: vnet}
+  - {name: r7-r9, type: vnet}
+  # right switch block
+  - {name: r8-sw5, type: vnet}
+  - {name: r9-sw5, type: vnet}
+  # hosts on the core
+  - {name: host2-r3, type: vnet}
+  - {name: host3-r6, type: vnet}
+  - {name: host4-sw5, type: vnet}
 
 vms:
+  # ─────────────── routers (Catalyst 8000v) ───────────────
+  - name: r1
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: sw4-r1-a}   # Gi2
+      - {name: eth2, type: vnet, network: sw4-r1-b}   # Gi3
+      - {name: eth3, type: vnet, network: r1-r2}      # Gi4
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r1}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to sw4 (Po2 member)"}
+              - {name: GigabitEthernet3, text: "to sw4 (Po2 member)"}
+              - {name: GigabitEthernet4, text: "to r2"}
+
+  - name: r2
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r1-r2}      # Gi2
+      - {name: eth2, type: vnet, network: r2-r3}      # Gi3
+      - {name: eth3, type: vnet, network: r2-r7}      # Gi4
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r2}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r1"}
+              - {name: GigabitEthernet3, text: "to r3"}
+              - {name: GigabitEthernet4, text: "to r7"}
+
+  - name: r3
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r2-r3}      # Gi2
+      - {name: eth2, type: vnet, network: r3-r4}      # Gi3
+      - {name: eth3, type: vnet, network: r3-r6}      # Gi4
+      - {name: eth4, type: vnet, network: host2-r3}   # Gi5
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r3}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r2"}
+              - {name: GigabitEthernet3, text: "to r4"}
+              - {name: GigabitEthernet4, text: "to r6"}
+              - {name: GigabitEthernet5, text: "to host2"}
+
+  - name: r4
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r3-r4}      # Gi2  (Gi1/mgmt = internet NAT uplink)
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r4}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r3 (inside)"}
+
+  - name: r5
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r5-r6}      # Gi2  (Gi1/mgmt = internet NAT uplink)
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r5}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r6 (inside)"}
+
+  - name: r6
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r3-r6}      # Gi2
+      - {name: eth2, type: vnet, network: r5-r6}      # Gi3
+      - {name: eth3, type: vnet, network: r6-r7}      # Gi4
+      - {name: eth4, type: vnet, network: host3-r6}   # Gi5
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r6}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r3"}
+              - {name: GigabitEthernet3, text: "to r5"}
+              - {name: GigabitEthernet4, text: "to r7"}
+              - {name: GigabitEthernet5, text: "to host3"}
+
+  - name: r7
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r2-r7}      # Gi2
+      - {name: eth2, type: vnet, network: r6-r7}      # Gi3
+      - {name: eth3, type: vnet, network: r7-r8}      # Gi4
+      - {name: eth4, type: vnet, network: r7-r9}      # Gi5
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r7}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r2"}
+              - {name: GigabitEthernet3, text: "to r6"}
+              - {name: GigabitEthernet4, text: "to r8"}
+              - {name: GigabitEthernet5, text: "to r9"}
+
+  - name: r8
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r7-r8}      # Gi2
+      - {name: eth2, type: vnet, network: r8-sw5}     # Gi3
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r8}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r7"}
+              - {name: GigabitEthernet3, text: "to sw5"}
+
+  - name: r9
+    template: cisco-8kv
+    clone_mode: full
+    cpus: 2
+    memory: 4096
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    interfaces:
+      - {name: eth1, type: vnet, network: r7-r9}      # Gi2
+      - {name: eth2, type: vnet, network: r9-sw5}     # Gi3
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: r9}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet2, text: "to r7"}
+              - {name: GigabitEthernet3, text: "to sw5"}
+
+  # ─────────────── switches (Cisco IOSvL2) ───────────────
   - name: sw1
     template: cisco-iosvl2
     clone_mode: full
@@ -21,39 +284,194 @@ vms:
     vga: serial0
     nic_model: e1000
     interfaces:
-      - name: eth1          # net1 -> Gi0/1 toward host-a
-        type: vnet
-        network: sw-access
+      - {name: eth1, type: vnet, network: sw1-sw2}    # Gi0/1
+      - {name: eth2, type: vnet, network: sw1-sw4-a}  # Gi0/2 (Po1 member)
+      - {name: eth3, type: vnet, network: sw1-sw4-b}  # Gi0/3 (Po1 member)
     ansible:
-      connection:
-        type: network_cli
-        network_os: ios
-        user: vagrant
-        password: vagrant
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
       gather_facts: false
       become: false
       tasks:
         - task: cisco-ios/set_hostname
           vars: {hostname: sw1}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet0/1, text: "to sw2"}
+              - {name: GigabitEthernet0/2, text: "to sw4 (Po1 member)"}
+              - {name: GigabitEthernet0/3, text: "to sw4 (Po1 member)"}
 
-  - name: host-a
-    depends_on: [sw1]
+  - name: sw2
+    template: cisco-iosvl2
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    nic_model: e1000
+    interfaces:
+      - {name: eth1, type: vnet, network: host1-sw2}  # Gi0/1
+      - {name: eth2, type: vnet, network: sw1-sw2}    # Gi0/2
+      - {name: eth3, type: vnet, network: sw2-sw3}    # Gi0/3
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: sw2}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet0/1, text: "to host1"}
+              - {name: GigabitEthernet0/2, text: "to sw1"}
+              - {name: GigabitEthernet0/3, text: "to sw3"}
+
+  - name: sw3
+    template: cisco-iosvl2
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    nic_model: e1000
+    interfaces:
+      - {name: eth1, type: vnet, network: sw2-sw3}    # Gi0/1
+      - {name: eth2, type: vnet, network: sw3-sw4}    # Gi0/2
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: sw3}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet0/1, text: "to sw2"}
+              - {name: GigabitEthernet0/2, text: "to sw4"}
+
+  - name: sw4
+    template: cisco-iosvl2
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    nic_model: e1000
+    interfaces:
+      - {name: eth1, type: vnet, network: sw3-sw4}    # Gi0/1
+      - {name: eth2, type: vnet, network: sw1-sw4-a}  # Gi0/2 (Po1 member)
+      - {name: eth3, type: vnet, network: sw1-sw4-b}  # Gi0/3 (Po1 member)
+      - {name: eth4, type: vnet, network: sw4-r1-a}   # Gi1/0 (Po2 member) — verify name after 1st deploy
+      - {name: eth5, type: vnet, network: sw4-r1-b}   # Gi1/1 (Po2 member) — verify name after 1st deploy
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: sw4}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet0/1, text: "to sw3"}
+              - {name: GigabitEthernet0/2, text: "to sw1 (Po1 member)"}
+              - {name: GigabitEthernet0/3, text: "to sw1 (Po1 member)"}
+              - {name: GigabitEthernet1/0, text: "to r1 (Po2 member)"}
+              - {name: GigabitEthernet1/1, text: "to r1 (Po2 member)"}
+
+  - name: sw5
+    template: cisco-iosvl2
+    clone_mode: full
+    cpus: 1
+    memory: 1024
+    qemu_agent: false
+    console: serial
+    vga: serial0
+    nic_model: e1000
+    interfaces:
+      - {name: eth1, type: vnet, network: r8-sw5}     # Gi0/1
+      - {name: eth2, type: vnet, network: r9-sw5}     # Gi0/2
+      - {name: eth3, type: vnet, network: host4-sw5}  # Gi0/3
+    ansible:
+      connection: {type: network_cli, network_os: ios, user: vagrant, password: vagrant}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ios/set_hostname
+          vars: {hostname: sw5}
+        - task: cisco-ios/set_interface_description
+          vars:
+            interface_descriptions:
+              - {name: GigabitEthernet0/1, text: "to r8"}
+              - {name: GigabitEthernet0/2, text: "to r9"}
+              - {name: GigabitEthernet0/3, text: "to host4"}
+
+  # ─────────────── hosts (Debian, low resources) ───────────────
+  - name: host1
     template: generic-x64/debian12
     clone_mode: full
     cpus: 1
     memory: 512
     qemu_agent: true
     interfaces:
-      - name: eth1          # net1 -> eth1, wired to sw1 Gi0/1
-        type: vnet
-        network: sw-access
+      - {name: eth1, type: vnet, network: host1-sw2}
     ansible:
-      connection:
-        type: ssh
-        user: vagrant
-        password: vagrant
+      connection: {type: ssh, user: vagrant, password: vagrant}
       gather_facts: true
       become: true
       tasks:
         - task: linux/set_hostname
-          vars: {hostname: host-a}
+          vars: {hostname: host1}
+
+  - name: host2
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: host2-r3}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+          vars: {hostname: host2}
+
+  - name: host3
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: host3-r6}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+          vars: {hostname: host3}
+
+  - name: host4
+    template: generic-x64/debian12
+    clone_mode: full
+    cpus: 1
+    memory: 512
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: host4-sw5}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+          vars: {hostname: host4}

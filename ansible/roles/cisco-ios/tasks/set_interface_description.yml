@@ -1,0 +1,13 @@
+---
+# Task: Set interface descriptions on Cisco IOS / IOS-XE (descriptions only — no addressing,
+# no shutdown/no-shutdown, no protocol config). Everything else is left for hand-configuration.
+# Variables:
+#   interface_descriptions: list of { name: <interface>, text: <description> }
+
+- name: Configure interface descriptions
+  cisco.ios.ios_config:
+    parents: "interface {{ item.name }}"
+    lines:
+      - "description {{ item.text }}"
+  loop: "{{ interface_descriptions }}"
+  when: interface_descriptions is defined and interface_descriptions | length > 0
