@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     deploy_ssh_timeout: int = 300
     web_url: str = ""
 
+    # SSM registration token for FMCv smart-license registration; empty = skip it.
+    fmc_smart_token: str = ""
+
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 
 

@@ -7,6 +7,11 @@
     version: "15.14.0"
     state: present
     ignore_checksums: yes
+  register: _sysmon_install
+  # Ride out transient community.chocolatey.org 503s / rate-limits.
+  retries: "{{ chocolatey_retries | default(3) }}"
+  delay: 30
+  until: _sysmon_install is succeeded
 
 - name: Download Sysmon config (sysmon-modular)
   ansible.windows.win_get_url:

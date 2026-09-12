@@ -1,0 +1,65 @@
+---
+# Register a Firewall Management Center (FMCv) with Cisco Smart Software Manager via the REST API.
+# FMC is API-managed (not SSH), so these run from the controller against the FMC mgmt URL — the
+# owning play should set gather_facts:false; tasks delegate_to localhost.
+#
+# Skipped entirely when no token is set (fmc_token empty) — deploy proceeds without registering.
+#
+# DRAFT — not yet wired into a scenario/deploy. Validated flow lives in
+# /opt/lab/fmc-smartlicense-test.sh (schema confirmed: registrationType=REGISTER, not regStatus).
+# Verify the auth-token header key + status codes on first real run.
+#
+# Required to run:
+#   fmc_token - SSM registration token (from Settings.fmc_smart_token / .env FMC_SMART_TOKEN;
+#               pass via extra_vars — never commit). Empty = registration skipped.
+# Optional vars:
+#   fmc_host  - FMC mgmt IP (default: the VM's mgmt IP {{ vm_mgmt_ip }})
+#   fmc_port  - API port (default: 443)
+#   fmc_user  - admin user (default: admin)
+#   fmc_pass  - admin password (default: {{ fmc_admin_password }})
+
+- name: Smart-license registration
+  when: fmc_token | default('') | length > 0
+  block:
+    - name: Wait for the FMC API and get an auth token
+      uri:
+        url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ fmc_user | default('admin') }}"
+        password: "{{ fmc_pass | default(fmc_admin_password) }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 40          # FMC API can take 30-40m after firstboot to come up
+      delay: 60
+
+    - name: Register the FMC with Smart Software Manager
+      uri:
+        url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
+        method: POST
+        headers:
+          X-auth-access-token: "{{ fmc_auth['x-auth-access-token'] }}"
+        body_format: json
+        body:
+          registrationType: REGISTER
+          token: "{{ fmc_token }}"
+          force: false
+        validate_certs: no
+        status_code: [200, 201]
+      delegate_to: localhost
+
+    - name: Wait until the smart license reports REGISTERED
+      uri:
+        url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth['x-auth-access-token'] }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: fmc_lic
+      until: fmc_lic.json['items'][0].regStatus == "REGISTERED"
+      retries: 20
+      delay: 15

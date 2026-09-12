@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -39,6 +40,7 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         "output_file": "cisco-iosvl2.qcow2",
         # IOSvL2 can't see a virtio-SCSI disk as flash0: — import on virtio-blk.
         "disk_bus": "virtio0",
+        "min_free_gb": 6,
     },
     # Cisco Catalyst 8000v router (IOS-XE): same --source flow as cisco-iosvl2 — clones
     # the packer repo, boots the supplied qcow2, configures it over serial, and produces
@@ -50,8 +52,53 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         "source_arg": True,
         "output_dir": "/var/lib/lab-platform/build-work/cisco-8kv-out",
         "output_file": "cisco-8kv.qcow2",
+        "min_free_gb": 10,
+    },
+    # Cisco Secure Firewall Threat Defense Virtual (FTDv). Same --source flow: clones the
+    # packer repo, boots the supplied qcow2, runs the setup wizard, and produces an
+    # UNREGISTERED configured qcow2 (registration to FMC is a post-deploy step). single_use
+    # marks each imported template so it can never be cloned by more than one deployment —
+    # FTDv is a pet registered to FMC, not cattle. Auto-numbered pool (cisco-ftd-1, -2, …).
+    "cisco-ftd": {
+        "script": "build-cisco-ftd.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "single_use": True,
+        "output_dir": "/var/lib/lab-platform/build-work/cisco-ftd-out",
+        "output_file": "cisco-ftd.qcow2",
+        "min_free_gb": 20,
+    },
+    # Cisco Secure Firewall Management Center Virtual (FMCv). Same single-use pet model as
+    # cisco-ftd (registers to Cisco SSM). Heavier build: 32 GB RAM, ~40m boot.
+    "cisco-fmc": {
+        "script": "build-cisco-fmc.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "single_use": True,
+        "output_dir": "/var/lib/lab-platform/build-work/cisco-fmc-out",
+        "output_file": "cisco-fmc.qcow2",
+        # FMCv firstboot populates its DB and the working qcow2 grows to tens of GB; a full
+        # disk pauses the build VM mid-boot (QEMU werror=stop). Require real headroom.
+        "min_free_gb": 60,
     },
 }
+
+# Proxmox tag stamped on single_use templates; the deploy engine keys the one-deployment
+# claim off this tag (see lab/deploy.py). The marker lives on the template, not scenario.yml.
+SINGLE_USE_TAG = "single-use"
+
+
+def is_single_use_build(build_name: str) -> bool:
+    return bool(SUPPORTED_BUILDS.get(build_name, {}).get("single_use"))
+
+
+def _free_gb(path: Path) -> float:
+    """Free space (GB) on the filesystem holding path, walking up to an existing ancestor
+    (the build/output dir may not exist yet)."""
+    p = path
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return shutil.disk_usage(p).free / (1024 ** 3)
 
 
 class BuildManager:
@@ -82,6 +129,8 @@ class BuildManager:
         skip_optimize: bool = False,
         dry_run: bool = False,
         source: str = "",
+        count: int = 1,
+        gui: bool = False,
     ) -> int:
         if build_name not in SUPPORTED_BUILDS:
             supported = ", ".join(SUPPORTED_BUILDS)
@@ -92,6 +141,11 @@ class BuildManager:
         if not script.exists():
             raise FileNotFoundError(f"build script not found: {script}")
 
+        if count != 1 and not spec.get("single_use"):
+            raise ValueError(f"--count is only supported for single-use builds (cisco-ftd, cisco-fmc), not '{build_name}'")
+        if count < 1:
+            raise ValueError(f"--count must be >= 1, got {count}")
+
         if spec.get("builder") == "proxmox":
             return self._build_proxmox(
                 build_name, version, script, skip_update, skip_optimize, log_fn, dry_run
@@ -99,28 +153,67 @@ class BuildManager:
         if dry_run:
             raise ValueError(f"--dry-run is not supported for '{build_name}'")
 
-        # Image-source builds (cisco-iosvl2): the script takes a local disk-image path
-        # and writes a fixed-name qcow2 into output_dir (via OUT_DIR), which we import.
+        # Image-source builds (cisco-iosvl2 / cisco-8kv / cisco-ftd / cisco-fmc): the script
+        # takes a local disk-image path and writes a fixed-name qcow2 into output_dir (via
+        # OUT_DIR), which we import.
         if spec.get("source_arg"):
             if not source:
                 raise ValueError(f"'{build_name}' requires --source <path to disk image>")
             src = Path(source).expanduser().resolve()
             if not src.exists():
                 raise FileNotFoundError(f"source image not found: {src}")
+            tmgr = TemplateManager(self._proxmox, self._s)
+
+            # single_use builds are an auto-numbered pool (cisco-ftd-1, -2, …): each build
+            # boots the source fresh so every template is its own first boot, and a later
+            # run continues past the highest existing number. Non-pool builds keep the
+            # historical single-template name (build_name-version, or build_name).
+            single_use = bool(spec.get("single_use"))
+            if single_use:
+                start = tmgr.next_pool_index(build_name)
+                tpl_names = [f"{build_name}-{start + i}" for i in range(count)]
+            else:
+                tpl_names = [f"{build_name}-{version}" if version else build_name]
+
             out_dir = Path(spec["output_dir"])
             env = dict(os.environ)
             env["OUT_DIR"] = str(out_dir)
+            if gui:
+                # Turn off headless in the packer build so the QEMU window opens (test/watch).
+                env["GUI"] = "1"
             log_fn(f"source: {src}")
-            log_fn(f"running {script.name}")
-            self._stream([str(script), str(src)], log_fn, env=env)
-            output = out_dir / spec["output_file"]
-            if not output.exists():
-                raise RuntimeError(f"build completed but {output} was not produced")
-            log_fn(f"output: {output}")
-            tpl_name = f"{build_name}-{version}" if version else build_name
-            return TemplateManager(self._proxmox, self._s).import_qcow2(
-                tpl_name, output, log_fn=log_fn, disk=spec.get("disk_bus", "scsi0")
-            )
+
+            # Fail fast if the build volume can't hold this appliance's transient disk. FMCv
+            # firstboot alone grows the working qcow2 to tens of GB — without this the build
+            # runs ~40 min then QEMU pauses on ENOSPC mid-boot. Checked per iteration since a
+            # --count pool accumulates imported templates on the same filesystem.
+            min_free = spec.get("min_free_gb")
+
+            last_vmid = 0
+            for tpl_name in tpl_names:
+                if min_free:
+                    free = _free_gb(out_dir)
+                    if free < min_free:
+                        raise RuntimeError(
+                            f"not enough disk space to build '{build_name}': need ~{min_free} GB "
+                            f"free on {out_dir}'s filesystem, have {free:.0f} GB — free space or "
+                            f"grow the volume before building (a full disk pauses the build VM "
+                            f"mid-boot)"
+                        )
+                    log_fn(f"disk check: {free:.0f} GB free on build volume (need >= {min_free} GB) — OK")
+                log_fn(f"=== building {tpl_name} ===")
+                log_fn(f"running {script.name}")
+                self._stream([str(script), str(src)], log_fn, env=env)
+                output = out_dir / spec["output_file"]
+                if not output.exists():
+                    raise RuntimeError(f"build completed but {output} was not produced")
+                log_fn(f"output: {output}")
+                last_vmid = tmgr.import_qcow2(
+                    tpl_name, output, log_fn=log_fn, disk=spec.get("disk_bus", "scsi0"),
+                    tags=SINGLE_USE_TAG if single_use else "",
+                    protection=single_use,
+                )
+            return last_vmid
 
         cmd = [str(script), version]
         if spec["requires_source"]:

@@ -1754,6 +1754,110 @@ def _set_deployment_status(deployment_id: int, status: str) -> None:
                 "UPDATE deployments SET status=%s, updated_at=NOW() WHERE id=%s",
                 (status, deployment_id),
             )
+    # Tearing a deployment down frees any single-use appliance (FTD/FMC) it held, so the
+    # template returns to the pool. Centralised here so every 'destroyed' transition
+    # (full or targeted destroy) releases the claims — it can't be forgotten in one path.
+    if status == "destroyed":
+        _release_single_use_claims(deployment_id)
+
+
+# ── Single-use appliance claims (FTD/FMC) ─────────────────────────────────────
+# FTD/FMC templates are tagged 'single-use' at build time (see lab/build.py). They register
+# to FMC / Cisco SSM, so a template may back only ONE live deployment at a time. These helpers
+# enforce that: the claim is keyed on the template appearing in a scenario (even a disabled
+# node), taken at deploy, and released when the deployment is destroyed.
+
+def _single_use_templates(spec: ScenarioSpec, tmgr: TemplateManager) -> list[str]:
+    """Distinct VM templates named ANYWHERE in the scenario that are tagged single-use.
+
+    Scans the whole spec.vms (not a --target subset), so an FTD/FMC node claims/blocks even
+    when it is disabled or not selected — the marker lives on the Proxmox template, not the
+    scenario, so we look each one up and check its tag.
+    """
+    from lab.build import SINGLE_USE_TAG
+    wanted = {vm.template for vm in spec.vms if vm.type == "vm"}
+    if not wanted:
+        return []
+    by_name = {t.name: t for t in tmgr.list()}  # one template scan, not one per name
+    return sorted(
+        name for name in wanted
+        if (tpl := by_name.get(name)) and SINGLE_USE_TAG in tpl.tags
+    )
+
+
+def _single_use_holder(cur, template: str) -> dict | None:
+    """Return the claim row (deployment_id, status, name) for a template, or None.
+
+    A claim whose deployment is 'destroyed' is stale (teardown should have cleared it, but a
+    failed/abandoned deploy may leave one) and is reported so callers can treat it as free.
+    """
+    cur.execute(
+        "SELECT c.deployment_id, d.status, d.name "
+        "FROM single_use_claims c JOIN deployments d ON c.deployment_id = d.id "
+        "WHERE c.template = %s",
+        (template,),
+    )
+    return cur.fetchone()
+
+
+def _check_single_use_available(templates: list[str], current_deployment_id: int | None) -> None:
+    """Fail fast (before creating any resources) if a single-use template is already taken.
+
+    Taken = claimed by a different, non-destroyed deployment. A claim owned by this deployment
+    (a --target re-run) or by a destroyed one does not block.
+    """
+    if not templates:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for tpl in templates:
+                row = _single_use_holder(cur, tpl)
+                if not row or row["deployment_id"] == current_deployment_id or row["status"] == "destroyed":
+                    continue
+                raise RuntimeError(
+                    f"template '{tpl}' is single-use (FTD/FMC) and already in use by deployment "
+                    f"'{row['name']}' — destroy that deployment first, or use another template "
+                    f"from the pool"
+                )
+
+
+def _claim_single_use(deployment_id: int, templates: list[str]) -> None:
+    """Claim each single-use template for this deployment (atomic via the template PK).
+
+    Idempotent for this deployment; takes over a stale (destroyed-deployment) claim; raises if
+    another live deployment holds it. A true concurrent race surfaces as a unique-violation on
+    INSERT — which still prevents double-booking, the whole point.
+    """
+    if not templates:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for tpl in templates:
+                row = _single_use_holder(cur, tpl)
+                if row:
+                    if row["deployment_id"] == deployment_id:
+                        continue
+                    if row["status"] != "destroyed":
+                        raise RuntimeError(
+                            f"template '{tpl}' is single-use (FTD/FMC) and already in use by "
+                            f"deployment '{row['name']}'"
+                        )
+                    cur.execute(
+                        "UPDATE single_use_claims SET deployment_id=%s, claimed_at=NOW() WHERE template=%s",
+                        (deployment_id, tpl),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO single_use_claims (template, deployment_id) VALUES (%s, %s)",
+                        (tpl, deployment_id),
+                    )
+
+
+def _release_single_use_claims(deployment_id: int) -> None:
+    """Release every single-use claim held by a deployment (called on destroy)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM single_use_claims WHERE deployment_id=%s", (deployment_id,))
 
 
 def _check_storage_headroom(
@@ -2007,6 +2111,12 @@ class DeployEngine:
                         )
                     template_vmids[vm_spec.template] = vmid
 
+        # 5b. Single-use (FTD/FMC) pre-flight: scan the WHOLE scenario and block before
+        # creating anything if any single-use template is already claimed by another live
+        # deployment. Reused below to claim them once this deployment's row exists.
+        single_use_names = _single_use_templates(spec, tmgr)
+        _check_single_use_available(single_use_names, deployment_id_existing)
+
         # 6. Compute execution plan
         plan = [[vm.name for vm in target_specs]] if target_specs is not None else execution_plan(spec)
 
@@ -2052,6 +2162,10 @@ class DeployEngine:
             log_fn(f"deployment {deployment_id} created (name={deployment_name}, base_vm_index={base_idx})")
 
         try:
+            # 9b. Claim single-use appliances now the deployment row exists. Inside the try so
+            # a claim lost to a concurrent deploy marks this deployment failed and cleans up.
+            _claim_single_use(deployment_id, single_use_names)
+
             # 10. Hot template pre-flight: ensure fast-storage copies exist for linked-clone VMs
             if target_specs is not None:
                 _hot_spec = ScenarioSpec(

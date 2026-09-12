@@ -753,13 +753,17 @@ def template_build(
     skip_update: bool = typer.Option(False, "--skip-update", help="Windows only: skip Windows Update during the build (default: updates run)."),
     skip_optimize: bool = typer.Option(False, "--skip-optimize", help="Windows only: skip the SDelete free-space zero-fill (default: it runs)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Windows only: print the detected node/storage/bridge/VLAN + patched config and exit, building nothing."),
-    source: str = typer.Option("", "--source", help="cisco-iosvl2 / cisco-8kv: path to the source qcow2 disk image to build from."),
+    source: str = typer.Option("", "--source", help="cisco-iosvl2 / cisco-8kv / cisco-ftd / cisco-fmc: path to the source qcow2 disk image to build from."),
+    count: int = typer.Option(1, "--count", help="cisco-ftd / cisco-fmc only: build N auto-numbered single-use templates (cisco-ftd-1, -2, …), continuing past any that already exist."),
+    gui: bool = typer.Option(False, "--gui", help="cisco-ftd / cisco-fmc only: open the QEMU window during the build (headless by default). On the headless mgmt VM the window is a display reached over remote desktop."),
 ):
     """Build a Proxmox template via Packer (background).
 
     nethsecurity is built via libvirt and imported; windows is built directly on a
     Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only);
-    cisco-iosvl2 and cisco-8kv boot the disk image given by --source and import the result.
+    cisco-iosvl2 / cisco-8kv / cisco-ftd / cisco-fmc boot the disk image given by --source
+    and import the result. cisco-ftd/cisco-fmc are single-use appliances: each import is
+    tagged so it can be used by only one deployment (--count builds a numbered pool).
     """
     if not is_admin():
         typer.echo("error: lab template build requires admin", err=True)
@@ -782,7 +786,7 @@ def template_build(
             BuildManager(ProxmoxClient(s), s).build(
                 build_name, version, log_fn=typer.echo,
                 skip_update=skip_update, skip_optimize=skip_optimize, dry_run=True,
-                source=source,
+                source=source, count=count, gui=gui,
             )
         except (RuntimeError, ValueError, FileNotFoundError) as exc:
             typer.echo(f"error: {exc}", err=True)
@@ -794,7 +798,8 @@ def template_build(
     op_id = create_operation("template_build", command, current_username(), target)
     spawn_background(
         op_id, "template_build", build_name, version, url,
-        "1" if skip_update else "0", "1" if skip_optimize else "0", source,
+        "1" if skip_update else "0", "1" if skip_optimize else "0", source, str(count),
+        "1" if gui else "0",
     )
     typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
 

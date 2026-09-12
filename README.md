@@ -120,6 +120,22 @@ It boots the disk under Packer, configures it over the serial console (`vagrant`
 - IOS-XE is Linux-based, so the disk is imported on the default **virtio-SCSI** (no flash quirk like IOSvL2). Interfaces map one-per-NIC: first NIC = `GigabitEthernet1` (management), the rest = `Gi2…`.
 - The [`network-lab1`](scenarios/network-lab1/scenario.yml) scenario builds a full CCNP practice topology from these routers plus `cisco-iosvl2` switches and Debian hosts (9 routers, 5 switches, 4 hosts) — deploy sets hostnames and interface descriptions only; addressing, routing, FHRP, EtherChannel and NAT are configured by hand.
 
+#### Cisco Secure Firewall — FTDv / FMCv
+
+Builds Cisco **Secure Firewall Threat Defense Virtual (FTDv)** and **Management Center Virtual (FMCv)** templates via Packer ([celeroon/cisco-ftd-fmc-vagrant-libvirt](https://github.com/celeroon/cisco-ftd-fmc-vagrant-libvirt)). Cisco ships each as a bootable `.qcow2` — pass it with `--source`:
+
+```bash
+lab template build cisco-ftd --source ./ftdv.qcow2            # → template cisco-ftd-1
+lab template build cisco-fmc --source ./fmcv.qcow2            # → template cisco-fmc-1
+lab template build cisco-ftd --source ./ftdv.qcow2 --count 3  # a pool: cisco-ftd-1, -2, -3
+lab template build cisco-ftd --source ./ftdv.qcow2 --gui      # open the QEMU window during the build
+```
+
+Packer boots the disk, runs the setup wizard over the console (admin password `SuperPassword123$`, DHCP management), shuts down, and imports the result. The image is **unregistered** — registering FTD to FMC / FMC to Cisco SSM is a post-deploy step.
+
+- **Single-use appliances.** FTDv/FMCv are pets registered to FMC/SSM, so each imported template is tagged `single-use` and may back only **one** live deployment at a time — a scenario naming a template already in use is blocked (it frees again when that deployment is destroyed). Build a **pool** with `--count N`; a later `--count` continues past the highest existing number (`cisco-ftd-4`, `-5`, …).
+- **Sizing:** FTDv needs 4 vCPU / 8 GB and ≥4 NICs; FMCv needs 4 vCPU / 32 GB and boots slowly (~40 min). `--gui` (FTD/FMC only) turns off headless so you can watch the build; default is headless.
+
 ---
 
 ### Snapshots (detonation range)

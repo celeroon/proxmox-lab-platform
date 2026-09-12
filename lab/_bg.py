@@ -53,6 +53,8 @@ def _template_build(
     skip_update: str = "0",
     skip_optimize: str = "0",
     source: str = "",
+    count: str = "1",
+    gui: str = "0",
 ) -> None:
     from lab.build import BuildManager
     from lab.config import get_settings
@@ -66,6 +68,8 @@ def _template_build(
         skip_update=skip_update == "1",
         skip_optimize=skip_optimize == "1",
         source=source,
+        count=int(count),
+        gui=gui == "1",
     )
 
 

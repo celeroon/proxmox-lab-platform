@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _CT_EXT_RE = re.compile(r'\.tar\.(gz|xz|zst)$')
@@ -34,6 +34,7 @@ class VMStatus:
     status: str   # running | stopped | paused | template
     node: str
     description: str = ""
+    tags: list[str] = field(default_factory=list)  # Proxmox tags, e.g. ["single-use"]
 
 
 @dataclass
@@ -483,17 +484,22 @@ class ProxmoxClient:
         for vm in self._px.nodes(node).qemu.get():
             if vm.get("template"):
                 vmid = vm["vmid"]
+                desc = ""
+                tags: list[str] = []
                 try:
                     cfg = self._px.nodes(node).qemu(vmid).config.get()
                     desc = cfg.get("description", "")
+                    # Proxmox stores tags as a ';'- (or ',') separated string.
+                    tags = [t for t in re.split(r"[;,]", cfg.get("tags", "") or "") if t]
                 except Exception:
-                    desc = ""
+                    pass
                 result.append(VMStatus(
                     vmid=vmid,
                     name=vm.get("name", ""),
                     status="template",
                     node=node,
                     description=desc,
+                    tags=tags,
                 ))
         return result
 
@@ -501,9 +507,10 @@ class ProxmoxClient:
         self._log("mk_template  node=%s vmid=%s", node, vmid)
         self._px.nodes(node).qemu(vmid).template.post()
 
-    def create_blank_vm(self, node: str, vmid: int, name: str, memory: int = 2048, cores: int = 2, description: str = "") -> None:
+    def create_blank_vm(self, node: str, vmid: int, name: str, memory: int = 2048, cores: int = 2,
+                        description: str = "", tags: str = "", protection: bool = False) -> None:
         self._log("create_vm    node=%s vmid=%s name=%s", node, vmid, name)
-        self._px.nodes(node).qemu.post(
+        kwargs: dict = dict(
             vmid=vmid,
             name=name,
             memory=memory,
@@ -511,6 +518,13 @@ class ProxmoxClient:
             scsihw="virtio-scsi-pci",
             description=description,
         )
+        # tags mark the template (e.g. "single-use" for FTD/FMC); protection blocks
+        # accidental deletion of the pet appliance.
+        if tags:
+            kwargs["tags"] = tags
+        if protection:
+            kwargs["protection"] = 1
+        self._px.nodes(node).qemu.post(**kwargs)
 
     def rename_vm(self, node: str, vmid: int, new_name: str, description: str = "") -> None:
         kwargs: dict[str, str] = {"name": new_name}

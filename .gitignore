@@ -53,7 +53,10 @@ windows-vagrant/
 
 atomic-workstation-tests.md
 
-# temporary local clone of the external packer repo
+# temporary local clones of the external packer repos (separate git repos)
 cisco-catalyst-8kv-vagrant-libvirt/
+cisco-ftd-fmc-vagrant-libvirt/
+cisco-iosvl2-vagrant-libvirt/
+fortigate-vagrant-libvirt/
 
 test-topology-*/

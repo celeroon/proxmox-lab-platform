@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -308,13 +309,16 @@ class TemplateManager:
         log_fn: Callable[[str], None],
         description: str = "",
         disk: str = "scsi0",
+        tags: str = "",
+        protection: bool = False,
     ) -> None:
         """Blank VM → import disk → convert to template. Cleans up VM and disk on failure."""
         storage_path = f"{_NFS_STORAGE}:{vmid}/{qcow2_path.name}"
         vm_created = False
         try:
             log_fn(f"creating blank VM (VMID {vmid})")
-            self._client.create_blank_vm(node, vmid, name, description=description)
+            self._client.create_blank_vm(node, vmid, name, description=description,
+                                         tags=tags, protection=protection)
             vm_created = True
 
             log_fn(f"importing disk ({disk})")
@@ -348,6 +352,30 @@ class TemplateManager:
             if t.name == target:
                 return t.vmid
         return None
+
+    def get_template(self, name: str) -> VMStatus | None:
+        """Look up a template by name, returning its full status (incl. tags), or None."""
+        target = box_to_name(name) if "/" in name else name
+        for t in self._collect():
+            if t.name == target:
+                return t
+        return None
+
+    def next_pool_index(self, prefix: str) -> int:
+        """Next free integer suffix for a pool of templates named '<prefix>-<N>'.
+
+        Scans existing templates and returns max(N)+1 (1 if none exist). Monotonic:
+        a deleted middle number is never reused, so a freed slot can't collide with a
+        template a scenario still names. Used to auto-number single-use pools
+        (cisco-ftd-1, -2, …) so a later build continues past what's already there.
+        """
+        pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+        highest = 0
+        for t in self._collect():
+            m = pat.match(t.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+        return highest + 1
 
     def cleanup_orphaned_slots(self) -> list[int]:
         """Remove NFS images/<vmid>/ directories that have no Proxmox VM.
@@ -437,14 +465,15 @@ class TemplateManager:
         return vmid
 
     def import_qcow2(self, name: str, source: Path, log_fn: Callable[[str], None] = print,
-                     disk: str = "scsi0") -> int:
+                     disk: str = "scsi0", tags: str = "", protection: bool = False) -> int:
         """Import a local QCOW2/VMDK/raw disk as a Proxmox template.
 
         source must be a path accessible on the management VM.
         disk is the bus the disk is attached on (default scsi0 = virtio-SCSI); pass
         e.g. "virtio0" or "ide0" for guests whose firmware can't use virtio-SCSI
         (Cisco IOSvL2 needs virtio-blk/IDE to see flash).
-        Returns the VMID of the created template.
+        tags stamps the template (e.g. "single-use" for FTD/FMC pets); protection
+        blocks accidental deletion. Returns the VMID of the created template.
         """
         if self.get_vmid(name) is not None:
             raise RuntimeError(
@@ -462,7 +491,8 @@ class TemplateManager:
         log_fn(f"copying disk to NFS storage ({source.stat().st_size // 1024 // 1024} MB)")
         shutil.copy2(source, qcow2_path)
 
-        self._run_import(node, vmid, name, qcow2_path, log_fn, description=name, disk=disk)
+        self._run_import(node, vmid, name, qcow2_path, log_fn, description=name, disk=disk,
+                         tags=tags, protection=protection)
         log_fn(f"template ready: {name}")
         return vmid
 
