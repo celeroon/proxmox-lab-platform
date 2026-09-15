@@ -1,0 +1,32 @@
+---
+# Task: commit and persist staged NVUE configuration.
+#
+# Equivalent of the old nvidia.nvue.config new+apply pair: `apply` makes the staged
+# revision live, `save` writes it to startup so it survives a reboot.
+#
+# The FIRST apply on a fresh switch is slow: it builds the bridge, creates the VLANs and
+# reconfigures the ports, restarting the dataplane. Measured >120s on Cumulus 5.12, while
+# a later no-op apply is ~0.1s. Ansible's `timeout` aborts the whole task, so retries never
+# run — the budget has to be generous rather than retried.
+#
+# Variables:
+#   nv_apply_timeout: seconds to allow for apply (default 600)
+
+- name: Apply staged NVUE configuration
+  command: nv config apply --assume-yes
+  become: true
+  register: nv_apply
+  retries: 3
+  delay: 10
+  until: nv_apply is success
+  changed_when: true
+  timeout: "{{ nv_apply_timeout | default(600) }}"
+
+- name: Save configuration to startup
+  command: nv config save
+  become: true
+  register: nv_save
+  retries: 3
+  delay: 5
+  until: nv_save is success
+  changed_when: true

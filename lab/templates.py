@@ -208,17 +208,19 @@ def _copy_release_cache(src: IO[bytes], dst: IO[bytes], src_fd: int) -> None:
 
 
 def _extract_qcow2(box_path: Path, dest: Path) -> None:
-    """Stream the box's disk image out of the tar.gz into dest.
+    """Stream the box's disk image out of the box archive into dest.
 
-    Stream mode ("r|gz") reads the archive exactly once. The seekable mode needs
-    a full member index before it can extract anything, which decompresses the
-    whole archive an extra time — ~13 GB of wasted reads for a Windows box.
+    Stream mode reads the archive exactly once. The seekable mode needs a full
+    member index before it can extract anything, which decompresses the whole
+    archive an extra time — ~13 GB of wasted reads for a Windows box. "r|*"
+    rather than "r|gz": boxes also ship as plain tar (norcams/sonic2411 is an
+    uncompressed POSIX tar), which pinning gz rejects with "not a gzip file".
     Member names are not fixed: HashiCorp-hosted boxes nest the disk in a
     numbered directory ('15140074115/box_0.img'), so match on suffix.
     """
     seen: list[str] = []
     with open(box_path, "rb") as raw:
-        with tarfile.open(fileobj=raw, mode="r|gz") as tar:
+        with tarfile.open(fileobj=raw, mode="r|*") as tar:
             for member in tar:
                 seen.append(member.name)
                 if not member.isfile():
@@ -413,8 +415,18 @@ class TemplateManager:
                 return
         raise RuntimeError(f"template '{name}' not found")
 
-    def fetch_vagrant(self, box: str, log_fn: Callable[[str], None] = print) -> int:
-        """Download a Vagrant Cloud libvirt box, import it as a Proxmox template."""
+    def fetch_vagrant(self, box: str, log_fn: Callable[[str], None] = print,
+                      disk: str = "scsi0") -> int:
+        """Download a Vagrant Cloud libvirt box, import it as a Proxmox template.
+
+        disk is the bus to attach on. There is no globally correct default: scsi0
+        (virtio-SCSI) works for boxes whose initrd carries virtio_scsi — every box
+        fetched so far — while boxes shipping only virtio_blk need "virtio0" or they
+        drop to an initramfs shell with "ALERT! UUID=... does not exist", no block
+        device having appeared (CumulusCommunity/cumulus-vx does exactly this).
+        Flipping the default would just move the breakage to images whose grub/fstab
+        pins /dev/sdaX, so it stays explicit: pass --disk-bus when a box needs it.
+        """
         if "/" not in box:
             raise ValueError(
                 f"invalid box name '{box}' — expected 'user/name' (e.g. generic-x64/debian12)"
@@ -460,7 +472,7 @@ class TemplateManager:
         box_path.unlink(missing_ok=True)
 
         # description stores the original box name (with /) for display in lab template list
-        self._run_import(node, vmid, tpl_name, qcow2_path, log_fn, description=box)
+        self._run_import(node, vmid, tpl_name, qcow2_path, log_fn, description=box, disk=disk)
         log_fn(f"template ready: {box}")
         return vmid
 

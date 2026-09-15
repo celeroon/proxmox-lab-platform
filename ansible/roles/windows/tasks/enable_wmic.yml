@@ -1,0 +1,36 @@
+---
+# Restore wmic.exe — Microsoft removed it on Windows 24H2+ (LTSC 2024 / 25H2), but
+# several atomics (T1047 x6, some T1218) still invoke it. It is a Feature-on-Demand.
+#
+# NOT wired into art-topology-a1 by default: on the LTSC-2024 eval image the FoD install
+# ran ~20 min via TiWorker and never landed wmic.exe (source throttled/blocked), so the
+# wmic atomics are simply N/A there. Kept for images where the FoD IS reachable — opt in
+# by adding `- task: windows/enable_wmic` to the win task list.
+#
+# Gotchas: (1) DISM capability install needs a FULL elevated token, so runas SYSTEM
+# (the WinRM logon token yields CBS 0x80070005). (2) best-effort — never fails the deploy.
+- name: Check for wmic.exe
+  become: false
+  ansible.windows.win_stat:
+    path: C:\Windows\System32\wbem\wmic.exe
+  register: _wmic_stat
+
+- name: Restore WMIC via Feature-on-Demand (runas SYSTEM; slow FoD, best-effort)
+  when: not _wmic_stat.stat.exists
+  become: true
+  become_method: runas
+  become_user: SYSTEM
+  ansible.windows.win_shell: dism.exe /online /add-capability /capabilityname:WMIC~~~~
+  register: _wmic_fod
+  async: 360
+  poll: 30
+  failed_when: false
+  changed_when: "'completed successfully' in (_wmic_fod.stdout | default(''))"
+
+- name: Report WMIC state
+  become: false
+  ansible.builtin.debug:
+    msg: >-
+      wmic.exe {{ 'already present' if _wmic_stat.stat.exists
+        else ('restored' if (_wmic_fod.changed | default(false))
+        else 'NOT restored (FoD unavailable/slow) - wmic atomics will be N/A') }}

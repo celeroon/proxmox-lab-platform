@@ -12,14 +12,14 @@ def _log(op_id: int, msg: str, level: str = "info") -> None:
     append_log(op_id, msg, level)
 
 
-def _template_fetch(op_id: int, box: str) -> None:
+def _template_fetch(op_id: int, box: str, disk: str = "scsi0") -> None:
     from lab.config import get_settings
     from lab.proxmox import ProxmoxClient
     from lab.templates import TemplateManager
 
     s = get_settings()
     mgr = TemplateManager(ProxmoxClient(s), s)
-    mgr.fetch_vagrant(box, log_fn=lambda msg: _log(op_id, msg))
+    mgr.fetch_vagrant(box, log_fn=lambda msg: _log(op_id, msg), disk=disk)
 
 
 def _template_import(op_id: int, name: str, source: str) -> None:

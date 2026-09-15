@@ -52,7 +52,16 @@ lab template fetch vyos/current
 lab template fetch joaobrlt/ubuntu-desktop-24.04
 lab template fetch kalilinux/rolling
 lab template fetch gusztavvargadr/windows-11-22h2-enterprise
+lab template fetch generic-x64/ubuntu2204
 lab template list
+```
+
+Disks attach on virtio-SCSI by default. Boxes whose initrd ships only `virtio_blk` must
+be fetched with `--disk-bus virtio0`, or the guest finds no root device and drops to an
+initramfs shell (`ALERT! UUID=... does not exist`):
+
+```bash
+lab template fetch CumulusCommunity/cumulus-vx --disk-bus virtio0
 ```
 
 LXC container templates:

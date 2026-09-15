@@ -31,6 +31,7 @@ ansible/collections/
 packer_cache/
 output-*/
 *.qcow2
+*.box
 
 # database
 *.sqlite
@@ -60,3 +61,4 @@ cisco-iosvl2-vagrant-libvirt/
 fortigate-vagrant-libvirt/
 
 test-topology-*/
+*.tar.xz

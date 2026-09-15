@@ -573,7 +573,10 @@ def ssh(
 # ── template ──────────────────────────────────────────────────────────────────
 
 @template_app.command("fetch", hidden=not _caller_is_admin)
-def template_fetch(box: str = typer.Argument(..., help="Vagrant Cloud box (e.g. generic-x64/debian12).")):
+def template_fetch(
+    box: str = typer.Argument(..., help="Vagrant Cloud box (e.g. generic-x64/debian12)."),
+    disk_bus: str = typer.Option("scsi0", "--disk-bus", help="Bus to attach the disk on: scsi0 (default), virtio0, ide0. Boxes that ship only virtio_blk (e.g. CumulusCommunity/cumulus-vx) need virtio0, else the guest drops to an initramfs shell."),
+):
     """Download a Vagrant Cloud box, extract qcow2, import as a Proxmox template (background)."""
     if not is_admin():
         typer.echo("error: lab template fetch requires admin (root or sudo group)", err=True)
@@ -582,7 +585,7 @@ def template_fetch(box: str = typer.Argument(..., help="Vagrant Cloud box (e.g. 
     require_proxmox(s)
     command = " ".join(sys.argv)
     op_id = create_operation("template_fetch", command, current_username(), box)
-    spawn_background(op_id, "template_fetch", box)
+    spawn_background(op_id, "template_fetch", box, disk_bus)
     typer.echo(f"operation {op_id} started — get logs with command below:\n  $ lab ops logs {op_id} --follow")
 
 

@@ -1,0 +1,12 @@
+---
+# Pre-accept the Sysinternals EULA for the atomic-run user (vagrant). Without this,
+# PsExec-based atomics (T1569.002 etc.) fail non-interactively with "Access is denied"
+# on the first-run EULA prompt. The key lives in the user hive, so it persists to the
+# SSH session the atomics actually run in.
+- name: Accept Sysinternals EULA (PsExec/PsExec-based atomics)
+  become: false
+  ansible.windows.win_regedit:
+    path: HKCU:\Software\Sysinternals
+    name: EulaAccepted
+    data: 1
+    type: dword

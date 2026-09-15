@@ -76,6 +76,7 @@ PACKER_LOG=1 PACKER_NO_COLOR=1 packer build \
   -var "image_path=$WORK_DIR" \
   -var "out_dir=tmp_out_fmc" \
   -var "version=$VERSION_LABEL" \
+  -var "disk_cache=${DISK_CACHE:-unsafe}" \
   "${GUI_ARGS[@]}" \
   "$HCL_FILE"
 popd >/dev/null

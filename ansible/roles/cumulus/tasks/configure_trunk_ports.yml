@@ -1,0 +1,53 @@
+---
+# Task: put switch ports into a VLAN-aware bridge as trunk ports.
+#
+# Companion to configure_access_ports: an access port carries one untagged VLAN, a trunk
+# carries several tagged ones — what a firewall with per-VLAN subinterfaces expects.
+# Staged only — nothing is live until cumulus/save_config runs.
+#
+# Variables:
+#   trunk_ports:   list of {port, vlans, description} (required)
+#                    - {port: swp1, vlans: [10, 20], description: "*** ftd-1 inside ***"}
+#   bridge_domain: NVUE bridge domain name (default br_default)
+#   port_mtu:      L2 MTU for the ports (default 1450, matching the SDN VNet)
+
+- name: Stage bridge domain as VLAN-aware
+  command: nv set bridge domain {{ bridge_domain | default('br_default') }} type vlan-aware
+  become: true
+  changed_when: true
+
+# Union of every VLAN any trunk carries, de-duplicated — no separate list to keep in sync.
+- name: Stage VLANs on the bridge domain
+  command: >
+    nv set bridge domain {{ bridge_domain | default('br_default') }}
+    vlan {{ item }}
+  become: true
+  loop: "{{ trunk_ports | map(attribute='vlans') | flatten | unique | sort | list }}"
+  changed_when: true
+
+- name: Stage trunk port description
+  command: nv set interface {{ item.port }} description "{{ item.description }}"
+  become: true
+  loop: "{{ trunk_ports }}"
+  loop_control: {label: "{{ item.port }}"}
+  when: item.description is defined
+  changed_when: true
+
+- name: Stage trunk port MTU
+  command: nv set interface {{ item.port }} link mtu {{ port_mtu | default(1450) }}
+  become: true
+  loop: "{{ trunk_ports }}"
+  loop_control: {label: "{{ item.port }}"}
+  changed_when: true
+
+# No "access" keyword: listing VLANs on the bridge domain leaves them tagged, which is
+# what makes this a trunk rather than an access port.
+- name: Stage port as bridge trunk
+  command: >
+    nv set interface {{ item.port }}
+    bridge domain {{ bridge_domain | default('br_default') }}
+    vlan {{ item.vlans | join(',') }}
+  become: true
+  loop: "{{ trunk_ports }}"
+  loop_control: {label: "{{ item.port }} -> vlans {{ item.vlans | join(',') }}" }
+  changed_when: true

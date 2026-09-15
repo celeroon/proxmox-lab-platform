@@ -266,6 +266,31 @@ vms:
               - name: eth4
                 type: access
                 tag: 20
+              - name: eth5           # new ubuntu-1 — VLAN 20 (same segment as win-user-1/art-1); change tag to move it
+                type: access
+                tag: 20
+
+  - name: vectr-1
+    depends_on: [ovs-core-1]
+    template: generic-x64/ubuntu2204
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    # interfaces:
+    #   - name: eth1
+    #     type: vnet
+    #     network: 
+    ansible:
+      connection:
+        type: ssh
+        user: vagrant
+        password: vagrant
+      gather_facts: false
+      become: false
+      tasks:
+        - task: linux/install_docker
+        - task: linux/install_vectr
 
   - name: elk-1
     depends_on: [ovs-core-1]
@@ -370,7 +395,10 @@ vms:
               - {name: putty.install}
               - {name: sysinternals}
               - {name: notepadplusplus}
+              - {name: dotnet-sdk}   # T1574.001 prereq (LTSC has no winget to install it on demand)
               # - {name: powershell-core} # powershell-core omitted: the windows-11 template already ships
+        # PsExec atomics (T1569.002) need the Sysinternals EULA pre-accepted, else "Access is denied".
+        - task: windows/accept_sysinternals_eula
         - task: windows/install_openssh_server
         - task: windows/authorize_ssh_key
         - task: windows/setup_directory_files

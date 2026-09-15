@@ -3,9 +3,18 @@
     cmd: ip route replace default via {{ gateway_ip }}
   changed_when: true
 
+# Only Debian-style hosts have this file. Ubuntu guests are netplan-managed and have
+# no /etc/network/interfaces, so persisting there both fails and would do nothing.
+# The runtime route above is what provisioning actually depends on.
+- name: Check for a Debian-style interfaces file
+  ansible.builtin.stat:
+    path: /etc/network/interfaces
+  register: eni
+
 - name: Persist default gateway in static interface config
   ansible.builtin.lineinfile:
     path: /etc/network/interfaces
     regexp: '^\s*gateway '
     line: "    gateway {{ gateway_ip }}"
     insertafter: 'netmask 255\.255\.0\.0'
+  when: eni.stat.exists

@@ -33,8 +33,13 @@
     url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
     dest: "/tmp/elastic-agent-{{ elk_version }}-linux-x86_64.tar.gz"
     mode: '0644'
+    timeout: 300
   become: yes
   when: not agent_tarball_tmp.stat.exists
+  register: agent_linux_dl
+  until: agent_linux_dl is succeeded
+  retries: 5          # artifacts.elastic.co truncates mid-transfer; get_url has no retry of its own
+  delay: 10
 
 - name: Copy elastic-agent tarball to nginx mirror
   copy:
@@ -99,6 +104,10 @@
     timeout: 300
   become: yes
   when: mirror_windows_agent | default(false) | bool
+  register: agent_win_dl
+  until: agent_win_dl is succeeded
+  retries: 5          # 237 MB pull, frequently truncated — retry instead of aborting the deploy
+  delay: 10
 
 # ── Step 5: Start nginx ───────────────────────────────────────────
 

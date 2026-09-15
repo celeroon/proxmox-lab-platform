@@ -35,6 +35,11 @@
   retries: "{{ item.retries | default(chocolatey_retries | default(2)) }}"
   delay: 20
   until: _choco_install is succeeded
+  # A WinRM read-timeout on one slow package (googlechrome under load) is 'unreachable',
+  # which until/retries do NOT catch — and it would abort the whole deploy even though
+  # every other package installed. Don't let one blip be fatal: the loop still installs
+  # the rest, and the host is re-checked on the next task.
+  ignore_unreachable: true
 
 - name: Software install summary
   ansible.builtin.debug:

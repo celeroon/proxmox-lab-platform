@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import secrets
 import socket
 import subprocess
 import sys
@@ -593,6 +594,94 @@ def _wait_for_ssh(
     raise TimeoutError(f"VM {vmid} at {ip} did not accept SSH within {timeout}s")
 
 
+# sshd emits one of these when the account's password is expired and PAM wants it
+# changed before granting a session. Non-interactive SSH has no TTY for that dialog,
+# so auth fails permanently rather than transiently — retrying alone never clears it.
+_PASSWORD_EXPIRED_RE = re.compile(
+    r"password (?:has )?expired"
+    r"|required to change your password"
+    r"|Password change required",
+    re.I,
+)
+
+
+def _reset_expired_password(
+    ip: str, user: str, password: str, log_fn: Callable[[str], None] | None = None,
+) -> bool:
+    """Clear a forced first-login password change, restoring the scenario password.
+
+    PAM refuses to let the account keep its current password ("same as the old one",
+    "contains less than 1 digits"), so this changes it to a strong throwaway over a
+    PTY, then writes the original straight back as a hash with usermod -p, which
+    bypasses pwquality, and disables ageing so it cannot expire again.
+
+    Images that ship a pre-expired account (CumulusCommunity/cumulus-vx) are otherwise
+    unprovisionable: ansible can never get a session. Returns True on success.
+    """
+    def _log(msg: str) -> None:
+        if log_fn:
+            log_fn(f"  [pw-reset] {msg}")
+    try:
+        import pexpect
+    except ImportError:
+        _log("pexpect not installed — cannot clear the expired password")
+        return False
+
+    temp = "Lab" + secrets.token_urlsafe(9).replace("-", "x").replace("_", "y") + "7!"
+    opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            "-o PreferredAuthentications=password -o PubkeyAuthentication=no")
+    try:
+        _log(f"{user}@{ip}: password expired, performing forced change over a PTY")
+        child = pexpect.spawn(f"ssh -tt {opts} {user}@{ip}", timeout=60, encoding="utf-8")
+        child.expect(r"[Pp]assword:")
+        child.sendline(password)
+        idx = child.expect([r"Current password:", r"New password:", pexpect.EOF, pexpect.TIMEOUT])
+        if idx > 1:
+            _log("guest did not present a password-change prompt")
+            return False
+        if idx == 0:
+            child.sendline(password)
+            child.expect([r"New password:", pexpect.TIMEOUT])
+        child.sendline(temp)
+        child.expect([r"Retype new password:", r"Re-enter", pexpect.TIMEOUT])
+        child.sendline(temp)
+        # the guest drops the session after a forced change ("login again")
+        child.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=40)
+        child.close()
+    except Exception as exc:
+        _log(f"forced change failed: {exc}")
+        return False
+
+    # Hash on the controller: passing it over stdin avoids quoting the $-laden crypt
+    # string through a shell, and does not depend on openssl existing in the guest.
+    try:
+        hashed = subprocess.run(
+            ["openssl", "passwd", "-6", password],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+    except Exception as exc:
+        _log(f"could not hash the original password: {exc}")
+        return False
+
+    script = (
+        f"usermod -p '{hashed}' {user}\n"
+        f"chage -M -1 -I -1 -E -1 -d $(date +%Y-%m-%d) {user}\n"
+    )
+    try:
+        subprocess.run(
+            ["sshpass", "-p", temp, "ssh", "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=10",
+             f"{user}@{ip}", "sudo -S bash -s"],
+            input=script, capture_output=True, text=True, timeout=60, check=True,
+        )
+    except Exception as exc:
+        _log(f"could not restore the original password: {exc}")
+        return False
+
+    _log("original password restored and ageing disabled")
+    return True
+
+
 def _wait_for_ssh_password_auth(
     ip: str,
     vmid: int,
@@ -601,6 +690,8 @@ def _wait_for_ssh_password_auth(
     timeout: int = 300,
     interval: int = 5,
     deployment_id: int | None = None,
+    allow_password_reset: bool = False,
+    log_fn: Callable[[str], None] | None = None,
 ) -> None:
     """Like _wait_for_ssh, but also confirms password authentication actually works.
 
@@ -618,6 +709,7 @@ def _wait_for_ssh_password_auth(
     """
     _wait_for_ssh(ip, vmid, timeout=timeout, deployment_id=deployment_id)
     deadline = time.monotonic() + timeout
+    reset_done = False
     while time.monotonic() < deadline:
         if deployment_id is not None:
             _check_cancelled(deployment_id)
@@ -633,6 +725,24 @@ def _wait_for_ssh_password_auth(
             return
         if result.returncode == 0:
             return
+        # Expired password never clears by retrying: sshd wants an interactive change
+        # and there is no TTY. Handle it once, or say exactly how to enable handling.
+        output = (result.stdout or b"") + (result.stderr or b"")
+        if _PASSWORD_EXPIRED_RE.search(output.decode("utf-8", "replace")):
+            if not allow_password_reset:
+                raise RuntimeError(
+                    f"{user}@{ip} (VMID {vmid}): the guest requires a password change at "
+                    f"first login, which ansible cannot perform over SSH. Add "
+                    f"'password_reset: true' to this VM's ansible.connection block to let "
+                    f"the platform clear it automatically."
+                )
+            if not reset_done:
+                reset_done = True
+                if not _reset_expired_password(ip, user, password, log_fn=log_fn):
+                    raise RuntimeError(
+                        f"{user}@{ip} (VMID {vmid}): could not clear the expired password"
+                    )
+                continue
         time.sleep(interval)
     raise TimeoutError(f"SSH password auth to {ip} (VMID {vmid}) did not succeed within {timeout}s")
 
@@ -645,7 +755,7 @@ def _wait_for_ssh_password_auth(
 _WINRM_SETTLE_SECONDS = 90
 
 # Upper bound on "boot, then finish first boot" for a Windows guest.
-_WINRM_FIRST_BOOT_TIMEOUT = 1800
+_WINRM_FIRST_BOOT_TIMEOUT = 3600
 
 # Measured on a real first boot of a Windows 11 Vagrant box: at the moment WinRM
 # starts accepting connections, every registry marker below already reads clean
@@ -874,7 +984,11 @@ def _wait_for_ssh_ready(
             log_fn=log_fn,
         )
     elif conn_type == "ssh" and password:
-        _wait_for_ssh_password_auth(ip, vmid, user, password, timeout=timeout, deployment_id=deployment_id)
+        _wait_for_ssh_password_auth(
+            ip, vmid, user, password, timeout=timeout, deployment_id=deployment_id,
+            allow_password_reset=bool(connection.get("password_reset", False)),
+            log_fn=log_fn,
+        )
     else:
         _wait_for_ssh(ip, vmid, timeout=timeout, deployment_id=deployment_id)
 
@@ -969,6 +1083,11 @@ def _generate_vm_playbook(
         "lab_ansible_dir": str(_ANSIBLE_DIR),
         "gateway_ip": ids.gateway_ip(user_id),
         "mgmt_timezone": _local_timezone(),
+        # FMCv smart-licensing: the role skips itself when the token is empty, so this is
+        # inert for every scenario that does not use it. Password is the one the FTD/FMC
+        # packer build bakes in; a scenario can override either via task vars.
+        "fmc_token": get_settings().fmc_smart_token,
+        "fmc_admin_password": "SuperPassword123$",
     }
     for name, ip in other_vms:
         play_vars[f"{name.replace('-', '_')}_ip"] = ip
@@ -985,6 +1104,7 @@ def _generate_vm_playbook(
         "tasks": tasks,
     }
     playbook_path.write_text(yaml.dump([play], default_flow_style=False, sort_keys=False))
+    playbook_path.chmod(0o600)   # play vars can carry the FMC smart-license token
     return playbook_path
 
 
@@ -1023,11 +1143,13 @@ def _build_inventory(vm_name: str, mgmt_ip: str, conn: dict) -> str:
         transport = conn.get("winrm_transport", "basic")
         # pywinrm defaults (20s op / 30s read) are too tight: a slow choco install
         # (e.g. googlechrome pulling its MSI) can make a single WSMan Receive take
-        # >30s under load -> read timeout -> the host is marked UNREACHABLE, which
-        # ansible does NOT apply until/retries to. Give it real headroom; read must
+        # minutes under load — a heavy MSI install plus lingering first-boot servicing
+        # starves the WinRM service — and if a Receive exceeds read_timeout the host is
+        # marked UNREACHABLE, which ansible does NOT apply until/retries to, so one slow
+        # package aborts the whole deploy. Give it real headroom (10 min read); read must
         # stay > operation. Overridable per scenario via winrm_operation/read_timeout.
         op_timeout = conn.get("winrm_operation_timeout", 120)
-        read_timeout = conn.get("winrm_read_timeout", 150)
+        read_timeout = conn.get("winrm_read_timeout", 600)
         host_vars += (
             f" ansible_connection=winrm"
             f" ansible_winrm_scheme={scheme}"

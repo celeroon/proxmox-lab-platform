@@ -1,0 +1,213 @@
+---
+# Install and configure VECTR (docs.vectr.io) on a fresh VM, replacing the vendor's
+# bundled Caddy gateway with upstream caddy — see [[vectr-ssl-caddy-bug]] memory /
+# comment in the patched docker-compose.yml for why: securityriskadvisors/vectr_caddy_gateway
+# fails every TLS handshake (SSL_ERROR_INTERNAL_ERROR_ALERT) here, across every version
+# tested, because its Caddyfile binds the site to a literal hostname/IP address. A
+# wildcard address bind (https://:8443) on upstream caddy:2-alpine fixes it.
+#
+# Variables:
+#   vectr_version:   VECTR CE release tag to install (default: 9.14.1)
+#   vectr_dir:       Install directory                (default: /opt/vectr)
+#   vectr_port:      Published HTTPS port              (default: 8081)
+#   vectr_project:   COMPOSE_PROJECT_NAME              (default: vectr)
+#   vectr_data_key, vectr_jws_key, vectr_jwe_key, vectr_redis_password,
+#   vectr_postgres_password: lab-default secrets, override per scenario if needed.
+#
+# Reachable at https://{{ management_ip }}:{{ vectr_port }} — default login
+# admin / 11_ThisIsTheFirstPassword_11 (change on first login).
+
+- name: Install VECTR prerequisites
+  apt:
+    name:
+      - unzip
+      - openssl
+    state: present
+  become: true
+
+- name: Check whether VECTR is already installed
+  stat:
+    path: "{{ vectr_dir | default('/opt/vectr') }}/.lab-vectr-installed"
+  register: _vectr_marker
+
+- name: Install and configure VECTR
+  when: not _vectr_marker.stat.exists
+  block:
+    - name: Create VECTR install directory
+      file:
+        path: "{{ vectr_dir | default('/opt/vectr') }}"
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Download VECTR {{ vectr_version | default('9.14.1') }} runtime
+      get_url:
+        url: "https://github.com/SecurityRiskAdvisors/VECTR/releases/download/ce-{{ vectr_version | default('9.14.1') }}/sra-vectr-runtime-{{ vectr_version | default('9.14.1') }}-ce.zip"
+        dest: "{{ vectr_dir | default('/opt/vectr') }}/sra-vectr-runtime-{{ vectr_version | default('9.14.1') }}-ce.zip"
+      become: true
+
+    - name: Extract VECTR runtime
+      unarchive:
+        src: "{{ vectr_dir | default('/opt/vectr') }}/sra-vectr-runtime-{{ vectr_version | default('9.14.1') }}-ce.zip"
+        dest: "{{ vectr_dir | default('/opt/vectr') }}"
+        remote_src: true
+        creates: "{{ vectr_dir | default('/opt/vectr') }}/docker-compose.yml"
+      become: true
+
+    - name: Set ownership of VECTR install dir to {{ ansible_user | default('vagrant') }}
+      file:
+        path: "{{ vectr_dir | default('/opt/vectr') }}"
+        owner: "{{ ansible_user | default('vagrant') }}"
+        group: "{{ ansible_user | default('vagrant') }}"
+        recurse: true
+      become: true
+
+    - name: Write VECTR .env
+      copy:
+        dest: "{{ vectr_dir | default('/opt/vectr') }}/.env"
+        content: |
+          VECTR_HOSTNAME={{ management_ip }}
+          VECTR_PORT={{ vectr_port | default(8081) }}
+          VECTR_CERTPROFILE=usercert
+          VECTR_CONTAINER_LOG_LEVEL=WARN
+          VECTR_DATA_KEY={{ vectr_data_key | default('labdatakeyCHANGEME') }}
+          JWS_KEY={{ vectr_jws_key | default('labjwssigningkeyCHANGEME') }}
+          JWE_KEY={{ vectr_jwe_key | default('labjweencryptkeyCHANGEME') }}
+          COMPOSE_PROJECT_NAME={{ vectr_project | default('vectr') }}
+          VECTR_DATA_DIR=/var/data/
+          REDIS_PASSWORD={{ vectr_redis_password | default('labredispassword') }}
+          POSTGRES_PASSWORD={{ vectr_postgres_password | default('labpostgrespassword') }}
+          POSTGRES_USER=vectr
+          POSTGRES_DB=vectr
+        mode: '0600'
+      become: false
+
+    - name: Generate self-signed cert for the gateway ({{ management_ip }})
+      shell: |
+        set -e
+        mkdir -p /tmp/vectr-cert
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+          -keyout /tmp/vectr-cert/ssl.key -out /tmp/vectr-cert/ssl.crt \
+          -subj "/CN={{ management_ip }}" \
+          -addext "subjectAltName=IP:{{ management_ip }}"
+      args:
+        creates: /tmp/vectr-cert/ssl.crt
+      become: false
+
+    - name: Write wildcard-address Caddyfile (works around the vendor gateway TLS bug)
+      copy:
+        dest: "{{ vectr_dir | default('/opt/vectr') }}/Caddyfile.custom"
+        content: |
+          {
+          	admin off
+
+          	servers {
+          	}
+          }
+
+          https://:8443 {
+          	tls /opt/vectr/cert/current/ssl.crt /opt/vectr/cert/current/ssl.key
+          	log {
+          		level WARN
+          	}
+
+          	@appRedir {
+          		path /sra-purpletools-webui/app
+          		not path /sra-purpletools-webui/app/
+          	}
+          	redir @appRedir /sra-purpletools-webui/app/
+
+          	handle_path /sra-purpletools-webui/* {
+          		reverse_proxy http://vectr-webui
+          	}
+
+          	handle /static/* {
+          		reverse_proxy http://vectr-webui
+          	}
+
+          	handle /auth/* {
+          		reverse_proxy http://vectr-tomcat:8080 {
+          			header_up X-Forwarded-Port {http.request.port}
+          		}
+          	}
+
+          	handle /sra-purpletools-rest/auth/* {
+          		respond 404
+          	}
+
+          	handle /sra-purpletools-rest/internal/* {
+          		respond 404
+          	}
+
+          	handle /internal/* {
+          		respond 404
+          	}
+
+          	handle_path /sra-purpletools-rest/* {
+          		reverse_proxy http://vectr-tomcat:8080
+          	}
+
+          	handle {
+          		redir * /sra-purpletools-webui/app/
+          	}
+          }
+        mode: '0644'
+      become: false
+
+    - name: Replace the broken vendor gateway image with upstream caddy
+      replace:
+        path: "{{ vectr_dir | default('/opt/vectr') }}/docker-compose.yml"
+        regexp: 'image: securityriskadvisors/vectr_caddy_gateway:[^\n]+'
+        replace: 'image: caddy:2-alpine'
+      become: false
+
+    - name: Point the gateway service at the custom Caddyfile
+      # The vectr-cert mount line appears once for vectr-tomcat and once for
+      # vectr-caddy-gateway; insertafter targets the LAST match, which is the
+      # gateway's (nothing after it in the file re-mounts vectr-cert).
+      lineinfile:
+        path: "{{ vectr_dir | default('/opt/vectr') }}/docker-compose.yml"
+        insertafter: '^\s*- vectr-cert:/opt/vectr/cert\s*$'
+        line: '      - ./Caddyfile.custom:/etc/caddy/Caddyfile:ro'
+      become: false
+
+    - name: Bring up VECTR
+      command: docker compose up -d
+      args:
+        chdir: "{{ vectr_dir | default('/opt/vectr') }}"
+      become: false
+
+    - name: Generate the usercert self-signed cert into the gateway's volume
+      shell: |
+        set -e
+        V=$(docker volume inspect {{ vectr_project | default('vectr') }}-vectr-cert --format '{{ '{{' }} .Mountpoint {{ '}}' }}')
+        mkdir -p "$V/current"
+        cp /tmp/vectr-cert/ssl.crt /tmp/vectr-cert/ssl.key "$V/current/"
+        chown -R 10001:10001 "$V/current"
+        chmod 600 "$V/current/ssl.key"
+        chmod 644 "$V/current/ssl.crt"
+      become: true
+
+    - name: Restart the gateway to pick up the cert and custom Caddyfile
+      command: docker compose up -d --force-recreate vectr-caddy-gateway
+      args:
+        chdir: "{{ vectr_dir | default('/opt/vectr') }}"
+      become: false
+
+    - name: Wait for VECTR to answer over HTTPS
+      uri:
+        url: "https://{{ management_ip }}:{{ vectr_port | default(8081) }}/sra-purpletools-webui/app/"
+        validate_certs: false
+        status_code: 200
+      register: _vectr_ready
+      until: _vectr_ready.status == 200
+      retries: 20
+      delay: 10
+      become: false
+
+    - name: Mark VECTR as installed
+      file:
+        path: "{{ vectr_dir | default('/opt/vectr') }}/.lab-vectr-installed"
+        state: touch
+        mode: '0644'
+      become: false

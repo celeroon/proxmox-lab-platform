@@ -18,7 +18,7 @@ With --wait, polls the alerts index until detections settle (or timeout) before
 rendering — use this right after a run so the 5-minute rule interval has elapsed.
 Read-only against Elasticsearch.
 """
-import argparse, csv, glob, json, os, ssl, base64, urllib.request, datetime, html, sys, time
+import argparse, csv, glob, json, os, ssl, base64, urllib.request, urllib.parse, datetime, html, sys, time
 from zoneinfo import ZoneInfo
 
 # Defaults, all overridable via flags/env. ES has NO baked-in IP on purpose: every
@@ -496,6 +496,17 @@ def main():
         print(f"[wait] polling up to {args.wait_timeout}s for detections on {tests[0]['host']}…", flush=True)
         wait_for_alerts(es, tests[0]["host"], rs, re_, args.wait_timeout, args.poll)
     run = correlate(es, tests)
+    # Kibana bakes its publicBaseUrl (the internal lab IP) into kibana.alert.url, which
+    # isn't reachable from the mgmt network the report is read on. Rewrite the link host to
+    # the elk mgmt IP (the --es host, already per-user) so "open alert in Kibana" is clickable.
+    _mgmt_host = urllib.parse.urlsplit(args.es).hostname
+    if _mgmt_host:
+        for _t in run["tests"]:
+            for _a in _t.get("alerts", []):
+                if _a.get("url"):
+                    _p = urllib.parse.urlsplit(_a["url"])
+                    _a["url"] = urllib.parse.urlunsplit(
+                        (_p.scheme, f"{_mgmt_host}:{_p.port or 5601}", _p.path, _p.query, _p.fragment))
     parse_errors(os.path.join(args.out, f"run-{runid}.log"), run["tests"])
 
     tactics = [t.strip() for t in args.tactic.split(",") if t.strip()]

@@ -1,0 +1,24 @@
+---
+# Task: set the hostname on a Cumulus Linux (NVUE) switch.
+#
+# Uses the `nv` CLI over SSH rather than the nvidia.nvue collection: the platform's
+# inventory speaks ssh/network_cli, and the CLI writes the same NVUE config store,
+# so it stays declarative and idempotent without pulling in a new collection.
+# Staged only — the change is not live until cumulus/save_config runs.
+#
+# Variables:
+#   hostname: hostname to set (required)
+
+- name: Wait for NVUE to be ready
+  command: nv show system
+  become: true
+  register: nvue_ready
+  retries: 10
+  delay: 10
+  until: nvue_ready is success
+  changed_when: false
+
+- name: Stage hostname
+  command: nv set system hostname {{ hostname }}
+  become: true
+  changed_when: true

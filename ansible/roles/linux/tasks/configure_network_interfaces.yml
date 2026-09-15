@@ -37,10 +37,19 @@
         dest: /etc/network/interfaces
         mode: '0644'
 
+    # async/poll:0 — the restart cycles eth0 (the mgmt link ansible rides on), so run it
+    # detached and reconnect, instead of blocking on the session it's about to drop.
     - name: Restart networking
       systemd:
         name: networking
         state: restarted
+      async: 45
+      poll: 0
+
+    - name: Wait for the management connection to recover
+      wait_for_connection:
+        delay: 3
+        timeout: 120
 
     # On Debian without the `resolvconf` package, the `dns-nameservers` directive
     # in /etc/network/interfaces is silently ignored, and restarting networking
