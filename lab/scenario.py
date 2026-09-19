@@ -49,6 +49,11 @@ class VMSpec:
     # virtio (the platform default). Optional; set only for guests that need it
     # (Cisco IOSvL2 has no virtio-net driver and must use e1000).
     nic_model: str | None = None
+    # Seconds to wait for this VM's management transport before giving up, overriding
+    # the global deploy_ssh_timeout. Firewall appliances boot far slower than a Linux
+    # guest — FMCv needs ~40 min — and the default 300s fails them long before sshd
+    # is up. None = use the global setting.
+    ssh_timeout: int | None = None
     # Snapshot-reset (detonation range) controls. snapshot declares that this VM gets
     # a baseline snapshot so it CAN be rolled back: "live" = RAM/vmstate (instant
     # resume), "disk" = disk-only (fresh boot). rollback marks it for AUTO-revert at
@@ -212,6 +217,13 @@ def parse_scenario(path: Path) -> ScenarioSpec:
                 f"VM '{base_name}': nic_model must be a string, got {nic_model!r}"
             )
 
+        ssh_timeout = v.get("ssh_timeout", defaults.get("ssh_timeout", None))
+        if ssh_timeout is not None and (not isinstance(ssh_timeout, int) or ssh_timeout <= 0):
+            raise ValueError(
+                f"VM '{base_name}': ssh_timeout must be a positive integer (seconds), "
+                f"got {ssh_timeout!r}"
+            )
+
         efidisk = v.get("efidisk", defaults.get("efidisk", False))
         tpm = v.get("tpm", defaults.get("tpm", False))
         for field, val in (("efidisk", efidisk), ("tpm", tpm)):
@@ -276,6 +288,7 @@ def parse_scenario(path: Path) -> ScenarioSpec:
             memory=memory,
             console=console,
             clone_mode=clone_mode,
+            ssh_timeout=ssh_timeout,
             qemu_agent=qemu_agent,
             disk_gb=disk_gb,
             cpu_type=cpu_type,

@@ -64,6 +64,10 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         "requires_source": False,
         "source_arg": True,
         "single_use": True,
+        # Packer builds this with disk_interface="virtio" (virtio-blk, /dev/vda). Importing
+        # on the scsi0 default gives the guest /dev/sda instead — it still boots, but the
+        # appliance misbehaves later, so keep the bus the image was built against.
+        "disk_bus": "virtio0",
         "output_dir": "/var/lib/lab-platform/build-work/cisco-ftd-out",
         "output_file": "cisco-ftd.qcow2",
         "min_free_gb": 20,
@@ -75,6 +79,10 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         "requires_source": False,
         "source_arg": True,
         "single_use": True,
+        # Packer builds this with disk_interface="virtio" (virtio-blk, /dev/vda). Importing
+        # on the scsi0 default gives the guest /dev/sda instead — it still boots, but the
+        # appliance misbehaves later, so keep the bus the image was built against.
+        "disk_bus": "virtio0",
         "output_dir": "/var/lib/lab-platform/build-work/cisco-fmc-out",
         "output_file": "cisco-fmc.qcow2",
         # FMCv firstboot populates its DB and the working qcow2 grows to tens of GB; a full

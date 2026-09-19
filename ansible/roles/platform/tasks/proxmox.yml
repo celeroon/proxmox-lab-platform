@@ -9,6 +9,7 @@
     px_auth: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
     px_ssl: "{{ (lookup('env', 'PROXMOX_VERIFY_SSL') | default('false', true)) | bool }}"
     tmpl_dir: "{{ lookup('env', 'TEMPLATES_DIR') | default('/var/lib/lab-platform/templates', true) }}"
+    sdn_mtu: "{{ lookup('env', 'SDN_MTU') | default('1500', true) }}"
   tags: proxmox
 
 # ── Get cluster nodes ──────────────────────────────────────────────────────────
@@ -57,6 +58,38 @@
   ansible.builtin.meta: flush_handlers
   tags: proxmox
 
+# ── Underlay MTU preflight ────────────────────────────────────────────────────
+# VNets are VXLAN-backed, so every guest frame carries 50 bytes of encapsulation:
+# a guest MTU of sdn_mtu needs sdn_mtu+50 on the wire between nodes. Getting this
+# wrong fails silently — frames fragment (slow, and dropped by some switches), and
+# appliances that insist on a full 1500 MTU never bring their data interfaces up at
+# all. Cisco FTDv is one: its DPDK ports refuse a 1450 vnet, so lina spins on a
+# never-ready port until its watchdog aborts and the appliance reboots, forever.
+# Probing from here is a proxy — the controller shares the node L2 segment, so it
+# exercises the same physical path the VXLAN tunnels use.
+
+- name: Probe underlay MTU to each Proxmox node
+  ansible.builtin.command:
+    argv: ["ping", "-M", "do", "-s", "{{ sdn_mtu | int + 22 }}", "-c", "2", "-W", "3", "{{ item }}"]
+  loop: "{{ px_node_ips }}"
+  register: sdn_mtu_probe
+  changed_when: false
+  failed_when: false
+  tags: proxmox
+
+- name: Require an underlay that can carry sdn_mtu plus VXLAN overhead
+  ansible.builtin.assert:
+    that: sdn_mtu_probe.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      Underlay cannot carry {{ sdn_mtu | int + 50 }}-byte frames to
+      {{ sdn_mtu_probe.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | join(', ') }}.
+      VXLAN adds 50 bytes, so sdn_mtu={{ sdn_mtu }} needs at least {{ sdn_mtu | int + 50 }}
+      MTU on the node NICs, their bridge, and the physical switch between them.
+      Raise those (9000 is the usual choice), or set SDN_MTU=1450 in .env to stay inside
+      a 1500-byte underlay — at 1450 Cisco FTDv will not start its data interfaces.
+    success_msg: "Underlay carries {{ sdn_mtu | int + 50 }} bytes - sdn_mtu {{ sdn_mtu }} is safe"
+  tags: proxmox
+
 # ── SDN zones ─────────────────────────────────────────────────────────────────
 
 - name: Set SDN peers
@@ -87,6 +120,7 @@
       zone: labmgmt
       type: vxlan
       peers: "{{ sdn_peers }}"
+      mtu: "{{ sdn_mtu }}"
     status_code: 200
   when: zone_labmgmt.status != 200
   tags: proxmox
@@ -101,6 +135,7 @@
     body_format: form-urlencoded
     body:
       peers: "{{ sdn_peers }}"
+      mtu: "{{ sdn_mtu }}"
     status_code: 200
   when: zone_labmgmt.status == 200
   tags: proxmox
@@ -128,6 +163,7 @@
       zone: labzone
       type: vxlan
       peers: "{{ sdn_peers }}"
+      mtu: "{{ sdn_mtu }}"
     status_code: 200
   when: zone_labzone.status != 200
   tags: proxmox
@@ -142,6 +178,7 @@
     body_format: form-urlencoded
     body:
       peers: "{{ sdn_peers }}"
+      mtu: "{{ sdn_mtu }}"
     status_code: 200
   when: zone_labzone.status == 200
   tags: proxmox

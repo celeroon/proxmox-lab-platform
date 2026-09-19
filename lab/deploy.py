@@ -2373,7 +2373,8 @@ class DeployEngine:
                 _set_vm_status(deployment_id, _vm_name, "running")
 
                 _wait_for_ssh_ready(_mgmt_ip, _vmid_val, _vm_spec.ansible.get("connection", {}),
-                                    timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
+                                    timeout=_vm_spec.ssh_timeout or s.deploy_ssh_timeout,
+                                    deployment_id=deployment_id, log_fn=log_fn)
                 _check_cancelled(deployment_id)
                 _set_vm_ansible_status(deployment_id, _vm_name, "running")
                 ok = _provision_vm(_vm_name, _mgmt_ip, _vm_spec, user_id, log_fn, other_vms=standalone_vm_ips)
@@ -2403,9 +2404,10 @@ class DeployEngine:
                     _set_vm_status(deployment_id, _name, "running")
 
                 _group_conn = _group_specs[0].ansible.get("connection", {})
+                _group_ssh_timeout = _group_specs[0].ssh_timeout or s.deploy_ssh_timeout
                 for _info, _ip in zip(_group_infos, _group_ips):
                     _wait_for_ssh_ready(_ip, _info["vmid"], _group_conn,
-                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
+                                        timeout=_group_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                 _check_cancelled(deployment_id)
 
                 for _name in _group_names:
@@ -2722,7 +2724,8 @@ class DeployEngine:
                     mgmt_ip = ids.mgmt_ip(user_id, vm_index)
 
                     _wait_for_ssh_ready(mgmt_ip, vmid_val, vm_spec.ansible.get("connection", {}),
-                                        timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
+                                        timeout=vm_spec.ssh_timeout or s.deploy_ssh_timeout,
+                                        deployment_id=deployment_id, log_fn=log_fn)
                     _check_cancelled(deployment_id)
                     _set_vm_ansible_status(deployment_id, vm_name, "running")
                     ok = _provision_vm(vm_name, mgmt_ip, vm_spec, user_id, log_fn, other_vms=standalone_vm_ips)
@@ -2754,9 +2757,10 @@ class DeployEngine:
 
                     log_fn(f"[{base_name}] waiting for SSH on {len(group_names)} replicas...")
                     _group_conn = group_specs[0].ansible.get("connection", {})
+                    _group_ssh_timeout = group_specs[0].ssh_timeout or s.deploy_ssh_timeout
                     for vm_name, mgmt_ip, vmid_val in zip(group_names, group_ips, group_vmids):
                         _wait_for_ssh_ready(mgmt_ip, vmid_val, _group_conn,
-                                            timeout=s.deploy_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
+                                            timeout=_group_ssh_timeout, deployment_id=deployment_id, log_fn=log_fn)
                     _check_cancelled(deployment_id)
 
                     for vm_name in group_names:

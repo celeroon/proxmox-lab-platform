@@ -266,7 +266,7 @@ vms:
               - name: eth4
                 type: access
                 tag: 20
-              - name: eth5           # new ubuntu-1 — VLAN 20 (same segment as win-user-1/art-1); change tag to move it
+              - name: eth5
                 type: access
                 tag: 20
 

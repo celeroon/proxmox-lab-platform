@@ -260,7 +260,10 @@ class ProxmoxClient:
                 if upid:
                     self.wait_for_task(template_node, upid, timeout=clone_timeout)
 
-            config_kwargs: dict = dict(cores=cpus, memory=memory, agent=1 if qemu_agent else 0)
+            # protection=0 explicitly: single-use templates set protection=1 and Proxmox
+            # copies it to the clone, which would make the lab VM undeletable.
+            config_kwargs: dict = dict(cores=cpus, memory=memory,
+                                       agent=1 if qemu_agent else 0, protection=0)
             if cpu_type is not None:
                 config_kwargs["cpu"] = cpu_type
             if bios is not None:
@@ -394,7 +397,17 @@ class ProxmoxClient:
             self._log("delete_vm    vmid=%s not found on any node — already gone", vmid)
             return
         self._log("delete_vm    node=%s vmid=%s", actual, vmid)
-        upid = self._px.nodes(actual).qemu(vmid).delete()
+        try:
+            upid = self._px.nodes(actual).qemu(vmid).delete()
+        except Exception as exc:
+            # Single-use templates carry protection=1 and Proxmox copies it to clones,
+            # so a lab VM can end up undeletable. Protection guards the template, never
+            # the disposable clone — clear it and retry rather than orphaning the VM.
+            if "protection mode enabled" not in str(exc):
+                raise
+            self._log("delete_vm    vmid=%s protected — clearing protection and retrying", vmid)
+            self._px.nodes(actual).qemu(vmid).config.put(protection=0)
+            upid = self._px.nodes(actual).qemu(vmid).delete()
         if wait and upid:
             self.wait_for_task(actual, upid)
 

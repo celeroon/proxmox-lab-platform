@@ -14,8 +14,32 @@ Successor to [lab-platform](https://github.com/celeroon/lab-platform), a libvirt
 - Management VM: Debian 12 or 13, static IP, SSH accessible
 - Proxmox API token for `root@pam` (privilege separation disabled)
 - SDN `labmgmt` zone with the built-in `pve` IPAM plugin
+- Jumbo frames between Proxmox nodes — see **VNet MTU** below
 
 ---
+
+### VNet MTU
+
+Lab VNets are VXLAN-backed, so each guest frame carries 50 bytes of encapsulation.
+A guest MTU of `SDN_MTU` needs **`SDN_MTU` + 50** on the node NICs, their bridge, and
+the physical switch between nodes:
+
+| SDN_MTU (guest sees) | underlay must carry |
+|---|---|
+| 1450 | 1500 — a stock untuned network |
+| **1500** (default) | **1550** — needs jumbo frames configured |
+
+On a stock 1500-byte underlay you get 1450 inside the guest. That is fine for ordinary
+workloads, but **Cisco FTDv will not run on it**: its DPDK ports refuse anything below a
+full 1500, so lina polls a port that never becomes ready until its watchdog aborts and the
+appliance reboots — indefinitely, with no error that names the MTU. The symptom in
+`/mnt/disk0/dpdk.log` is `MTU (1500) > device max MTU (1450)` followed by
+`rx_pkt_burst for not ready port`.
+
+`setup.sh` probes the underlay and **fails** if it cannot carry `SDN_MTU` + 50, rather than
+leaving you with silent fragmentation. To raise it, set `mtu 9000` on each node's VXLAN
+transport NIC, its bridge and the VLAN interface carrying the peer IPs, and enable jumbo
+frames on the switch. To opt out instead, set `SDN_MTU=1450` in `.env`.
 
 ## Setup
 
