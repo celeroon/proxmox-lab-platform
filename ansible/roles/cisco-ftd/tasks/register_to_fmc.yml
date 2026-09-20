@@ -1,0 +1,213 @@
+---
+# Register an FTD with an FMC. The handshake has two sides that must agree on a
+# shared one-time key: the FTD is told who manages it (`configure manager add`),
+# and the FMC is given a device record with the same key. Neither side reaches
+# in — they rendezvous over sftunnel (TCP 8305), so order does not matter.
+#
+# Everything here runs from the controller (delegate_to: localhost), so the owning
+# VM should use `connection: {type: local}`. Do NOT use `type: ssh`: FTD's admin
+# shell is clish, which answers the platform's `true` readiness probe with
+# "Unknown command" and exit 1, hanging the deploy for the whole ssh_timeout.
+# The FTD side is driven with sshpass because clish accepts a single command
+# argument over ssh and returns rc=0 (verified against FTDv 10.0).
+#
+# Idempotent: re-running skips the FTD side once a manager is configured, and
+# skips the FMC side once a device of the same name exists.
+#
+# Required:
+#   fmc_host        - FMC mgmt IP. In a scenario use the injected {{ fmc_1_ip }}.
+# Optional:
+#   ftd_host        - FTD mgmt IP        (default: this VM's {{ vm_mgmt_ip }})
+#   ftd_user/pass   - FTD CLI creds      (default: admin / {{ fmc_admin_password }})
+#   fmc_user/pass   - FMC API creds      (default: admin / {{ fmc_admin_password }})
+#   ftd_reg_key     - shared handshake key, any string, must match both sides
+#   ftd_acp_name    - access control policy to attach; created if absent
+#   ftd_device_name - name shown in FMC  (default: the VM name)
+#   ftd_license_caps- license entitlements to grant
+
+- name: Register FTD with FMC
+  vars:
+    _ftd_host: "{{ ftd_host | default(vm_mgmt_ip) }}"
+    _ftd_user: "{{ ftd_user | default('admin') }}"
+    _ftd_pass: "{{ ftd_pass | default(fmc_admin_password) }}"
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _reg_key: "{{ ftd_reg_key | default('Cisco123Reg') }}"
+    _acp_name: "{{ ftd_acp_name | default('lab-acp') }}"
+    _dev_name: "{{ ftd_device_name | default(vm_name) | default(inventory_hostname) }}"
+    _caps: "{{ ftd_license_caps | default(['BASE', 'THREAT', 'MALWARE']) }}"
+    _ssh: >-
+      ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=15 -o PreferredAuthentications=password -o PubkeyAuthentication=no
+    # -tt forces a pty. `configure manager add` reads its yes/no prompt from the
+    # TERMINAL, not stdin, so without this the piped answer never reaches it and the
+    # command hangs until killed (rc 124). Verified against FTDv 10.0.
+    _ssh_tty: "{{ _ssh | replace('ssh ', 'ssh -tt ', 1) }}"
+  block:
+
+    # ── FTD side ─────────────────────────────────────────────────────────────
+    # "Managed locally." means no manager is configured yet. Re-adding an existing
+    # one errors with "Manager with this name is already added", so guard on it.
+    # connection: local means the platform's own readiness gate never ran, so the
+    # guest may not exist yet — a freshly cloned FTDv answers "No route to host" for
+    # minutes. Wait here rather than inheriting a wait we deliberately skipped.
+    - name: Wait for the FTD management interface to answer
+      ansible.builtin.wait_for:
+        host: "{{ _ftd_host }}"
+        port: 22
+        timeout: "{{ ftd_boot_timeout | default(1800) }}"
+        sleep: 10
+      delegate_to: localhost
+
+    # sshd accepts before clish is ready to serve commands, so retry on rc until the
+    # CLI actually answers instead of trusting the open port.
+    - name: Read the FTD's current manager
+      ansible.builtin.shell:
+        cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'show managers'"
+      delegate_to: localhost
+      register: ftd_mgr
+      changed_when: false
+      failed_when: false
+      until: ftd_mgr.rc == 0
+      retries: 60
+      delay: 15
+
+    # `configure manager add` is INTERACTIVE when a local manager (FDM) is present:
+    # it asks "Do you want to continue[yes/no]:" and waits forever with no tty. Passing
+    # the command as an ssh argument leaves nothing to answer it and the task hangs.
+    # clish reads successive lines from stdin, so send the command and the confirmation
+    # as two lines and pass no argument at all (verified against FTDv 10.0).
+    # timeout(1) is a backstop: ansible's shell module has no timeout of its own, and a
+    # hang here blocks the whole deploy with no error.
+    - name: Point the FTD at the FMC
+      ansible.builtin.shell:
+        cmd: >-
+          printf 'configure manager add {{ fmc_host }} {{ _reg_key }}\nyes\nexit\n'
+          | timeout {{ ftd_cli_timeout | default(180) }}
+          sshpass -p '{{ _ftd_pass }}' {{ _ssh_tty }} {{ _ftd_user }}@{{ _ftd_host }}
+      delegate_to: localhost
+      register: ftd_add
+      changed_when: true
+      # The command itself succeeds well before the session ends; with a pty clish sits
+      # at its "> " prompt until stdin closes it, hence the trailing `exit`. rc is not
+      # the arbiter here — 124 (timeout) can still mean the manager was configured — so
+      # the confirm task below decides.
+      failed_when: false
+      when: "'Managed locally' in ftd_mgr.stdout"
+
+    # Confirm the manager actually took rather than trusting console wording, which
+    # differs between a first add and a re-add.
+    - name: Confirm the FTD now has a manager
+      ansible.builtin.shell:
+        cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'show managers'"
+      delegate_to: localhost
+      register: ftd_mgr2
+      changed_when: false
+      failed_when: "'Managed locally' in ftd_mgr2.stdout"
+
+    # ── FMC: authenticate ────────────────────────────────────────────────────
+    # Tokens are short-lived, so this runs immediately before the calls that use
+    # it. The header key is snake_cased by the uri module: x_auth_access_token.
+    - name: Get an FMC auth token
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 40          # FMC API can take 30-40m to come up after firstboot
+      delay: 60
+
+    - name: Note the FMC domain UUID
+      ansible.builtin.set_fact:
+        _dom: "{{ fmc_auth.domain_uuid }}"
+
+    # ── FMC: access control policy ───────────────────────────────────────────
+    # A device record cannot be created without one, and a fresh FMC has none.
+    - name: Look for the access control policy
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/accesspolicies?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: acp_list
+
+    - name: Create the access control policy when missing
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/accesspolicies"
+        method: POST
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        body_format: json
+        body:
+          name: "{{ _acp_name }}"
+          defaultAction: {action: BLOCK}
+        validate_certs: no
+        status_code: [200, 201]
+      delegate_to: localhost
+      register: acp_new
+      when: _acp_name not in (acp_list.json.get('items', []) | map(attribute='name') | list)
+
+    - name: Settle on the policy id
+      ansible.builtin.set_fact:
+        _acp_id: >-
+          {{ acp_new.json.id if acp_new is changed
+             else (acp_list.json.get('items', []) | selectattr('name', 'equalto', _acp_name)
+                   | map(attribute='id') | first) }}
+
+    # ── FMC: device record ───────────────────────────────────────────────────
+    - name: Look for an existing device record
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dev_list
+
+    - name: Add the device to FMC
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords"
+        method: POST
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        body_format: json
+        body:
+          name: "{{ _dev_name }}"
+          hostName: "{{ _ftd_host }}"
+          regKey: "{{ _reg_key }}"
+          type: Device
+          license_caps: "{{ _caps }}"
+          accessPolicy: {id: "{{ _acp_id }}", type: AccessPolicy}
+        validate_certs: no
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      when: _dev_name not in (dev_list.json.get('items', []) | map(attribute='name') | list)
+
+    # Registration is asynchronous — the POST returns a task id, and the device
+    # only appears once the sftunnel is up. sw_version is populated from the
+    # device itself, so it is the signal that the tunnel actually formed.
+    - name: Wait for the device to finish registering
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dev_check
+      until: >-
+        dev_check.json.get('items', [])
+        | selectattr('name', 'equalto', _dev_name)
+        | selectattr('sw_version', 'defined')
+        | list | length > 0
+      retries: 30
+      delay: 20

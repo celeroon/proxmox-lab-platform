@@ -20,26 +20,23 @@ Successor to [lab-platform](https://github.com/celeroon/lab-platform), a libvirt
 
 ### VNet MTU
 
-Lab VNets are VXLAN-backed, so each guest frame carries 50 bytes of encapsulation.
-A guest MTU of `SDN_MTU` needs **`SDN_MTU` + 50** on the node NICs, their bridge, and
-the physical switch between nodes:
+VNets are VXLAN-backed, so 50 bytes go to encapsulation and guests see 1450. That is the
+default and needs no configuration. **Only Cisco FTDv cares** — its DPDK ports refuse
+anything under 1500 and the appliance reboot-loops without it.
 
-| SDN_MTU (guest sees) | underlay must carry |
+| your setup | `SDN_MTU` in `.env` |
 |---|---|
-| 1450 | 1500 — a stock untuned network |
-| **1500** (default) | **1550** — needs jumbo frames configured |
+| no FTDv | leave unset (1450) |
+| FTDv, single Proxmox node | `1500` |
+| FTDv, Proxmox cluster | `1500`, and the underlay must carry 1550 |
 
-On a stock 1500-byte underlay you get 1450 inside the guest. That is fine for ordinary
-workloads, but **Cisco FTDv will not run on it**: its DPDK ports refuse anything below a
-full 1500, so lina polls a port that never becomes ready until its watchdog aborts and the
-appliance reboots — indefinitely, with no error that names the MTU. The symptom in
-`/mnt/disk0/dpdk.log` is `MTU (1500) > device max MTU (1450)` followed by
-`rx_pkt_burst for not ready port`.
+On a single node nothing is ever encapsulated onto the wire — VM-to-VM is bridged locally —
+so 1500 costs nothing. On a cluster a 1500-byte guest frame becomes 1550 once encapsulated,
+so the node NICs, their bridges and the switch between them have to carry that much. Without
+it FTDv still starts, but cross-node full-size frames get fragmented.
 
-`setup.sh` probes the underlay and **fails** if it cannot carry `SDN_MTU` + 50, rather than
-leaving you with silent fragmentation. To raise it, set `mtu 9000` on each node's VXLAN
-transport NIC, its bridge and the VLAN interface carrying the peer IPs, and enable jumbo
-frames on the switch. To opt out instead, set `SDN_MTU=1450` in `.env`.
+Changing the MTU needs a full VM **stop/start**, not a reboot: `host_mtu` is set on the
+virtio device when QEMU creates it.
 
 ## Setup
 

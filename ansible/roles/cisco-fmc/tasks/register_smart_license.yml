@@ -5,9 +5,13 @@
 #
 # Skipped entirely when no token is set (fmc_token empty) — deploy proceeds without registering.
 #
-# DRAFT — not yet wired into a scenario/deploy. Validated flow lives in
-# /opt/lab/fmc-smartlicense-test.sh (schema confirmed: registrationType=REGISTER, not regStatus).
-# Verify the auth-token header key + status codes on first real run.
+# Verified against FMCv 10.0 on 2026-09-20: generatetoken returns 204 with the token in
+# response header key `x_auth_access_token` — ansible's uri module normalises response
+# headers to snake_case, so `fmc_auth['x-auth-access-token']` raises "object of type 'dict'
+# has no attribute". GET smartlicenses returns 200 with items[0].regStatus (UNREGISTERED
+# before registering). The POST that actually registers is NOT exercised here — it creates a
+# product instance in SSM, so it stays unverified until a real deploy runs it. Schema
+# confirmed against /opt/lab/fmc-smartlicense-test.sh: registrationType=REGISTER, not regStatus.
 #
 # Required to run:
 #   fmc_token - SSM registration token (from Settings.fmc_smart_token / .env FMC_SMART_TOKEN;
@@ -41,7 +45,7 @@
         url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
         method: POST
         headers:
-          X-auth-access-token: "{{ fmc_auth['x-auth-access-token'] }}"
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
         body_format: json
         body:
           registrationType: REGISTER
@@ -56,7 +60,7 @@
         url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
         method: GET
         headers:
-          X-auth-access-token: "{{ fmc_auth['x-auth-access-token'] }}"
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
         validate_certs: no
       delegate_to: localhost
       register: fmc_lic

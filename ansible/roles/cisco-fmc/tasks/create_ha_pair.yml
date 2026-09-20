@@ -1,0 +1,242 @@
+---
+# Build an FTD HA (failover) pair through the FMC REST API.
+#
+# Runs entirely from the controller (uri + delegate_to: localhost), so the owning
+# VM should use `connection: {type: local}`. Nothing here touches either guest.
+#
+# Put this on the SECONDARY unit: it deploys after the primary, so by the time it
+# runs both units are registered, deployed and green — which is what HA formation
+# requires. Both units must have no pending policy first (cisco-fmc/deploy_pending).
+#
+# Idempotent: skips when a pair of this name already exists.
+#
+# ─── WARNING ──────────────────────────────────────────────────────────────────
+# DELETE on /devicehapairs/ftddevicehapairs/{id} does NOT just break the pair — it
+# unregisters BOTH devices from FMC and clears `configure manager` on each FTD
+# (observed on FMC 10.0). Recovery is a full re-registration of both units. Do not
+# treat breaking a pair as a cheap operation.
+#
+# ─── Single link vs dedicated state link ──────────────────────────────────────
+# One interface can carry both failover and state traffic. The API expresses this
+# with `useSameLinkForFailovers`, a REQUIRED boolean on ftdHABootstrap — it is the
+# GUI's State Link -> "Same as LAN Failover Link". When true, send statefulFailover
+# as a FULL copy of lanFailover (same interface, logicalName, IPs, mask).
+#
+# Omitting the flag makes FMC compare the two blocks and reject every combination:
+#   same iface + different logicalName -> "Invalid interface name for LAN failover
+#                                          and state link interfaces"
+#   same iface + identical everything  -> same error
+#   statefulFailover with interface only -> "Stateful failover Link active IP is
+#                                            missing" (the block is mandatory)
+# Set ha_state_interface for a genuinely separate state link; the flag then goes
+# false and the state block describes that second interface.
+#
+# Schema is served by the FMC itself at /api/api-explorer/fmc.json — definitions
+# IFTDDeviceHABootStrap and IFTDDeviceHAFailoverLink. Worth reading before guessing:
+#   IFTDDeviceHABootStrap   required: lanFailover, statefulFailover, useSameLinkForFailovers
+#   IFTDDeviceHAFailoverLink required: activeIP, standbyIP, logicalName, interfaceObject
+#
+# Required:
+#   fmc_host         - FMC mgmt IP. In a scenario use the injected {{ fmc_1_ip }}.
+#   ha_primary       - device name of the primary unit, as registered in FMC
+# Optional:
+#   ha_secondary     - secondary device name (default: this VM's name)
+#   ha_name          - pair name in FMC (default: <primary>-ha)
+#   ha_interface     - failover interface, FMC naming (default: Ethernet0/3).
+#                      NOTE FMC reports FTDv interfaces as Ethernet0/x, NOT
+#                      GigabitEthernet0/x. vnic5 in a scenario == Ethernet0/3.
+#   ha_logical_name  - failover nameif (default: FOLINK). Arbitrary label, max 48 chars.
+#   ha_active_ip / ha_standby_ip / ha_netmask - failover link addressing. These are
+#                      point-to-point on the failover vnet and are never routed.
+#   ha_state_interface - set to use a DEDICATED state link instead of sharing
+#   ha_state_logical_name / ha_state_active_ip / ha_state_standby_ip / ha_state_netmask
+#   ha_retries / ha_delay - formation poll budget (default 60 x 30s = 30m)
+
+- name: Create the FTD HA pair
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _secondary: "{{ ha_secondary | default(vm_name) | default(inventory_hostname) }}"
+    _ha_name: "{{ ha_name | default(ha_primary ~ '-ha') }}"
+    _if_name: "{{ ha_interface | default('Ethernet0/3') }}"
+    _dedicated: "{{ (ha_state_interface | default('')) | length > 0 }}"
+  block:
+
+    - name: Get an FMC auth token
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: ha_auth
+      until: ha_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Look for an existing HA pair
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devicehapairs/ftddevicehapairs?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: ha_existing
+
+    - name: Report that the pair already exists
+      ansible.builtin.debug:
+        msg: "HA pair '{{ _ha_name }}' already exists - nothing to do"
+      when: _ha_name in (ha_existing.json.get('items', []) | map(attribute='name') | list)
+
+    # Everything below only runs when the pair is absent.
+    - name: Build the HA pair
+      when: _ha_name not in (ha_existing.json.get('items', []) | map(attribute='name') | list)
+      block:
+
+        - name: List registered devices
+          uri:
+            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devices/devicerecords?limit=1000"
+            method: GET
+            headers:
+              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+            validate_certs: no
+          delegate_to: localhost
+          register: ha_devs
+
+        - name: Resolve the two device ids
+          ansible.builtin.set_fact:
+            _pri_id: "{{ ha_devs.json.get('items', []) | selectattr('name', 'equalto', ha_primary) | map(attribute='id') | first | default('') }}"
+            _sec_id: "{{ ha_devs.json.get('items', []) | selectattr('name', 'equalto', _secondary) | map(attribute='id') | first | default('') }}"
+
+        - name: Fail when either unit is not registered
+          ansible.builtin.fail:
+            msg: >-
+              HA needs both units registered in FMC. primary '{{ ha_primary }}'
+              {{ 'OK' if _pri_id else 'NOT FOUND' }}, secondary '{{ _secondary }}'
+              {{ 'OK' if _sec_id else 'NOT FOUND' }}. Registered: {{ ha_devs.json.get('items', []) | map(attribute='name') | list }}
+          when: not _pri_id or not _sec_id
+
+        # The interface id must be the PRIMARY's; FMC applies the matching interface
+        # on the secondary itself.
+        - name: List the primary's physical interfaces
+          uri:
+            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devices/devicerecords/{{ _pri_id }}/physicalinterfaces?limit=1000"
+            method: GET
+            headers:
+              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+            validate_certs: no
+          delegate_to: localhost
+          register: ha_ifs
+
+        - name: Resolve the failover interface ids
+          ansible.builtin.set_fact:
+            _if_id: "{{ ha_ifs.json.get('items', []) | selectattr('name', 'equalto', _if_name) | map(attribute='id') | first | default('') }}"
+            _state_if_id: "{{ ha_ifs.json.get('items', []) | selectattr('name', 'equalto', ha_state_interface | default('')) | map(attribute='id') | first | default('') }}"
+
+        - name: Fail when the failover interface does not exist
+          ansible.builtin.fail:
+            msg: >-
+              Interface '{{ _if_name }}' not found on {{ ha_primary }}. Available:
+              {{ ha_ifs.json.get('items', []) | map(attribute='name') | list }}.
+              FMC names FTDv interfaces Ethernet0/x, not GigabitEthernet0/x.
+          when: not _if_id
+
+        # FMC refuses to pair units with undeployed config: "Primary and Secondary
+        # devices are not compatible. One or both Peers are dirty, One or both peer
+        # deployment is in progress". Both peers must be absent from deployabledevices
+        # before the POST, so wait rather than failing on a transient state.
+        - name: Wait until neither peer has pending config
+          uri:
+            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/deployment/deployabledevices?limit=1000"
+            method: GET
+            headers:
+              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+            validate_certs: no
+          delegate_to: localhost
+          register: ha_pending
+          until: >-
+            {{ (ha_pending.json.get('items', [])
+                | selectattr('name', 'in', [ha_primary, _secondary])
+                | list | length) == 0 }}
+          retries: "{{ ha_clean_retries | default(30) }}"
+          delay: "{{ ha_clean_delay | default(20) }}"
+
+        - name: Request HA formation
+          uri:
+            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devicehapairs/ftddevicehapairs"
+            method: POST
+            headers:
+              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+            body_format: json
+            body:
+              name: "{{ _ha_name }}"
+              type: DeviceHAPair
+              primary: {id: "{{ _pri_id }}"}
+              secondary: {id: "{{ _sec_id }}"}
+              ftdHABootstrap:
+                isEncryptionEnabled: false
+                useSameLinkForFailovers: "{{ not (_dedicated | bool) }}"
+                lanFailover:
+                  useIPv6Address: false
+                  subnetMask: "{{ ha_netmask | default('255.255.255.252') }}"
+                  interfaceObject: {id: "{{ _if_id }}", type: PhysicalInterface, name: "{{ _if_name }}"}
+                  activeIP: "{{ ha_active_ip | default('192.168.255.1') }}"
+                  standbyIP: "{{ ha_standby_ip | default('192.168.255.2') }}"
+                  logicalName: "{{ ha_logical_name | default('FOLINK') }}"
+                # Shared link: statefulFailover is a full copy of lanFailover, and
+                # useSameLinkForFailovers above tells FMC they are one link.
+                statefulFailover: >-
+                  {{ {'useIPv6Address': false,
+                      'subnetMask': ha_state_netmask | default('255.255.255.252'),
+                      'interfaceObject': {'id': _state_if_id, 'type': 'PhysicalInterface', 'name': ha_state_interface | default('')},
+                      'activeIP': ha_state_active_ip | default(''),
+                      'standbyIP': ha_state_standby_ip | default(''),
+                      'logicalName': ha_state_logical_name | default('STATELINK')}
+                     if (_dedicated | bool) else
+                     {'useIPv6Address': false,
+                      'subnetMask': ha_netmask | default('255.255.255.252'),
+                      'interfaceObject': {'id': _if_id, 'type': 'PhysicalInterface', 'name': _if_name},
+                      'activeIP': ha_active_ip | default('192.168.255.1'),
+                      'standbyIP': ha_standby_ip | default('192.168.255.2'),
+                      'logicalName': ha_logical_name | default('FOLINK')} }}
+            validate_certs: no
+            # 500 is accepted here only so `until` can retry it. FMC returns a bare
+            # "An error has occurred when performing the device operation ... Please
+            # try your operation again" while it is still settling after a previous
+            # HA teardown — an immediate retry succeeds. Anything still failing after
+            # the retries is a real error and fails the task.
+            status_code: [200, 201, 202, 500]
+          delegate_to: localhost
+          register: ha_req
+          until: ha_req.status in [200, 201, 202]
+          retries: "{{ ha_post_retries | default(5) }}"
+          delay: "{{ ha_post_delay | default(30) }}"
+
+        # Formation reboots the secondary and takes 10-20 minutes.
+        - name: Wait for HA formation to finish
+          uri:
+            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/job/taskstatuses/{{ ha_req.json.metadata.task.id }}"
+            method: GET
+            headers:
+              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+            validate_certs: no
+          delegate_to: localhost
+          register: ha_task
+          until: ha_task.json.status | default('') in ['SUCCESS', 'Deployed', 'Completed', 'FAILED', 'Failed']
+          retries: "{{ ha_retries | default(60) }}"
+          delay: "{{ ha_delay | default(30) }}"
+
+        - name: Fail when HA formation did not succeed
+          ansible.builtin.fail:
+            msg: "HA formation finished as '{{ ha_task.json.status }}': {{ ha_task.json.message | default('no message') }}"
+          when: ha_task.json.status not in ['SUCCESS', 'Deployed', 'Completed']
+
+        - name: Report the result
+          ansible.builtin.debug:
+            msg: >-
+              HA pair '{{ _ha_name }}' formed: {{ ha_primary }} + {{ _secondary }} on {{ _if_name }}
+              ({{ 'dedicated state link ' ~ ha_state_interface if (_dedicated | bool) else 'shared failover/state link' }})

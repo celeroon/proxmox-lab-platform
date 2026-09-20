@@ -969,6 +969,14 @@ def _wait_for_ssh_ready(
     user = connection.get("user", "")
     password = connection.get("password", "")
     conn_type = connection.get("type", "ssh")
+    if conn_type == "local":
+        # Tasks run on the controller (ansible_connection=local), so nothing in the
+        # guest has to accept a login. Waiting on guest SSH here is not just wasted
+        # time, it is unsatisfiable on appliances whose admin shell is a restricted
+        # CLI: FMC drops you into clish, which answers the `true` probe with
+        # "Unknown command" and exit 1 forever. The role does its own readiness
+        # polling against the service it actually uses.
+        return
     if conn_type == "winrm":
         _wait_for_winrm(
             ip, vmid,
@@ -1089,6 +1097,12 @@ def _generate_vm_playbook(
         "fmc_token": get_settings().fmc_smart_token,
         "fmc_admin_password": "SuperPassword123$",
     }
+    # Also a real play var, not only a {{ vm_mgmt_ip }} substitution into task vars:
+    # roles that talk to the guest over its API rather than over the ansible connection
+    # (cisco-fmc) reference it from inside the role file, where substitution never reached.
+    # Left undefined when there is no IP so the failure is loud rather than a bad URL.
+    if vm_ip:
+        play_vars["vm_mgmt_ip"] = vm_ip
     for name, ip in other_vms:
         play_vars[f"{name.replace('-', '_')}_ip"] = ip
     play_vars.update(ansible_section.get("vars", {}))
@@ -1159,6 +1173,8 @@ def _build_inventory(vm_name: str, mgmt_ip: str, conn: dict) -> str:
             f" ansible_winrm_operation_timeout_sec={op_timeout}"
             f" ansible_winrm_read_timeout_sec={read_timeout}"
         )
+    elif conn_type == "local":
+        host_vars += " ansible_connection=local"
     elif conn_type in ("network_cli", "httpapi"):
         network_os = conn.get("network_os", "")
         host_vars += (

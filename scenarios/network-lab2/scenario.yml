@@ -127,8 +127,38 @@ vms:
             routing:
               default_route: "10.{USER_ID}.0.1"   # mgmt gateway -> real internet
 
+  # FMC: net0 on the platform mgmt network (how you reach the GUI and how it manages
+  # the FTDs today), plus eth1 in the HQ servers VLAN so its gateway can later be
+  # re-pointed at the FTD inside address.
+  - name: fmc-1
+    # FMC comes before the firewalls: they register themselves to it at provision time,
+  # so {{ fmc_1_ip }} has to resolve by then. Its own data leg on sw-hq swp5 comes up
+  # later — everything FMC needs during deploy runs over the mgmt network.
+    depends_on: [vyos-1]
+    template: cisco-fmc-1
+    clone_mode: full
+    ssh_timeout: 3600     # README measures FMCv first boot at ~40 min
+    cpus: 4
+    memory: 32768
+    qemu_agent: false
+    cpu_type: host        # FTD/FMC are ASA-lineage and expect AES-NI; kvm64 masks it
+    interfaces:
+      - {name: eth1, type: vnet, network: hq-sw-fmc}   # 192.168.200.60/24, access vlan 200
+    ansible:
+      # local: every task in the role is uri + delegate_to localhost against FMC's
+      # REST API, so nothing ever connects to the guest. type: ssh would block the
+      # deploy for the full ssh_timeout — FMC's admin shell is clish, which rejects
+      # the readiness probe's `true` with "Unknown command" and exit 1 forever.
+      connection: {type: local}
+      gather_facts: false
+      become: false
+      tasks:
+        # no-op unless FMC_SMART_TOKEN is set in .env
+        - task: cisco-fmc/register_smart_license
+
   # ═══════════════════════════ HQ — FTD HA + FMC ═══════════════════════════
-  # No ansible block: FTD is wizard/FMC-managed, so deploy only builds and boots it.
+  # The ansible block only registers the unit to FMC; everything else (interfaces,
+  # routing, policy) is configured from FMC after registration.
   #
   # FTDv interface order is FIXED by the platform and cannot be rearranged:
   #   vnic0 Management0/0   net0, injected by the lab platform
@@ -140,7 +170,7 @@ vms:
   # Ref: https://www.cisco.com/c/en/us/td/docs/security/firepower/quick_start/consolidated_ftdv_gsg/ftdv-gsg/m-ftdv-kvm-gsg.html
   - name: ftd-1
     # ISP side first: without vyos there is nothing on isp-a/isp-b to talk to.
-    depends_on: [vyos-1]
+    depends_on: [fmc-1]
     template: cisco-ftd-1
     clone_mode: full      # single-use appliance — never a linked clone
     ssh_timeout: 1800     # FTDv first boot runs the setup wizard; 300s default is far too short
@@ -154,6 +184,25 @@ vms:
       - {name: eth3, type: vnet, network: hq-ftd1-sw}     # vnic3 Gi0/1 INSIDE  (trunk to sw-hq)
       - {name: eth4, type: vnet, network: isp-b}          # vnic4 Gi0/2 ISP2 secondary
       - {name: eth5, type: vnet, network: hq-failover}    # vnic5 Gi0/3 HA failover/state
+    ansible:
+      # local: the role drives both sides of the handshake from the controller —
+      # sshpass into FTD's clish for `configure manager add`, and FMC's REST API for
+      # the device record. type: ssh would deadlock on clish (see fmc-1 above).
+      connection: {type: local}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ftd/register_to_fmc
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_reg_key: Cisco123Reg
+            ftd_acp_name: lab-acp
+        # A freshly registered unit always has pending policy; until it is pushed
+        # the device is unusable and HA formation fails for reasons that look like
+        # HA bugs. Skips itself when nothing is pending.
+        - task: cisco-fmc/deploy_pending
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
 
   - name: ftd-2
     # Secondary only after the primary: bring one FTDv through its setup wizard and
@@ -172,33 +221,47 @@ vms:
       - {name: eth3, type: vnet, network: hq-ftd2-sw}     # vnic3 Gi0/1 INSIDE  (trunk to sw-hq)
       - {name: eth4, type: vnet, network: isp-b}          # vnic4 Gi0/2 ISP2 secondary
       - {name: eth5, type: vnet, network: hq-failover}    # vnic5 Gi0/3 HA failover/state
-
-  # FMC: net0 on the platform mgmt network (how you reach the GUI and how it manages
-  # the FTDs today), plus eth1 in the HQ servers VLAN so its gateway can later be
-  # re-pointed at the FTD inside address.
-  - name: fmc-1
-    template: cisco-fmc-1
-    clone_mode: full
-    ssh_timeout: 3600     # README measures FMCv first boot at ~40 min
-    cpus: 4
-    memory: 32768
-    qemu_agent: false
-    cpu_type: host        # FTD/FMC are ASA-lineage and expect AES-NI; kvm64 masks it
-    interfaces:
-      - {name: eth1, type: vnet, network: hq-sw-fmc}   # 192.168.200.60/24, access vlan 200
     ansible:
-      connection: {type: ssh, user: admin, password: "SuperPassword123$"}
+      # local: the role drives both sides of the handshake from the controller —
+      # sshpass into FTD's clish for `configure manager add`, and FMC's REST API for
+      # the device record. type: ssh would deadlock on clish (see fmc-1 above).
+      connection: {type: local}
       gather_facts: false
       become: false
       tasks:
-        # no-op unless FMC_SMART_TOKEN is set in .env
-        - task: cisco-fmc/register_smart_license
+        - task: cisco-ftd/register_to_fmc
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_reg_key: Cisco123Reg
+            ftd_acp_name: lab-acp
+        # A freshly registered unit always has pending policy; until it is pushed
+        # the device is unusable and HA formation fails for reasons that look like
+        # HA bugs. Skips itself when nothing is pending.
+        - task: cisco-fmc/deploy_pending
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+        # HA runs on the SECONDARY: by now both units are registered, deployed and
+        # green, which is what formation needs. Single link — Ethernet0/3 carries both
+        # failover and state (vnic5 = hq-failover). Skips if the pair already exists.
+        # NB breaking a pair later UNREGISTERS BOTH UNITS from FMC, it is not cheap.
+        - task: cisco-fmc/create_ha_pair
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ha_primary: ftd-1
+            ha_name: hq-ftd-ha
+            ha_interface: Ethernet0/3
+            ha_logical_name: HALINK
+            ha_active_ip: 192.168.255.1
+            ha_standby_ip: 192.168.255.2
+            ha_netmask: 255.255.255.252
 
   - name: sw-hq
+    # The HQ switch sits behind the firewall pair — bring it up once both FTDs are in.
+    depends_on: [ftd-2]
     template: CumulusVXCommunity/cumulus-vx
     clone_mode: linked
     cpus: 4
-    memory: 4096
+    memory: 5120
     qemu_agent: false
     interfaces:
       - {name: eth1, type: vnet, network: hq-ftd1-sw}    # swp1 trunk 100,200
@@ -247,7 +310,7 @@ vms:
         - task: linux/set_hostname
           vars: {hostname: ubuntu-hq}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: ens19, lab_ip: 192.168.200.50, lab_prefix: 24, lab_gateway: 192.168.200.1}
+          vars: {lab_interface: ens19, lab_ip: 192.168.100.50, lab_prefix: 24, lab_gateway: 192.168.200.1}
 
   # Windows client in the users VLAN. GPT/EFI image, so it needs ovmf + q35 + TPM 2.0;
   # vga:virtio avoids the Bochs fallback that pins the desktop to firmware resolution.
@@ -377,6 +440,25 @@ vms:
       - {name: eth1, type: vnet, network: ftd3-reserved}  # vnic1 reserved — do not use
       - {name: eth2, type: vnet, network: isp-e}          # vnic2 Gi0/0 OUTSIDE 198.51.100.10/29
       - {name: eth3, type: vnet, network: br2-fw-sw}      # vnic3 Gi0/1 INSIDE  192.168.20.1/24
+    ansible:
+      # local: the role drives both sides of the handshake from the controller —
+      # sshpass into FTD's clish for `configure manager add`, and FMC's REST API for
+      # the device record. type: ssh would deadlock on clish (see fmc-1 above).
+      connection: {type: local}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: cisco-ftd/register_to_fmc
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_reg_key: Cisco123Reg
+            ftd_acp_name: lab-acp
+        # A freshly registered unit always has pending policy; until it is pushed
+        # the device is unusable and HA formation fails for reasons that look like
+        # HA bugs. Skips itself when nothing is pending.
+        - task: cisco-fmc/deploy_pending
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
 
   - name: sw-br2
     template: CumulusVXCommunity/cumulus-vx

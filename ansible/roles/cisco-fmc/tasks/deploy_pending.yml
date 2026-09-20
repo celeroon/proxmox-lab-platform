@@ -1,0 +1,131 @@
+---
+# Push pending policy from FMC to a device. A freshly registered FTD always has
+# pending config, and until it is deployed the unit is not usable — and HA
+# formation fails in ways that look like HA bugs but are really unpushed config.
+#
+# Runs entirely from the controller (uri + delegate_to: localhost), so the owning
+# VM should use `connection: {type: local}`. Nothing here touches the guest.
+#
+# Idempotent: FMC only lists a device under deployabledevices while it has pending
+# changes, so a second run finds nothing and skips.
+#
+# Required:
+#   fmc_host        - FMC mgmt IP. In a scenario use the injected {{ fmc_1_ip }}.
+# Optional:
+#   fmc_user/pass   - FMC API creds     (default: admin / {{ fmc_admin_password }})
+#   deploy_device   - device to deploy  (default: this VM's name)
+#   deploy_all      - true deploys every pending device instead of just this one
+#   deploy_ignore_warning - default true. FMC REFUSES a device reporting warnings
+#                     without it, and a first push always warns (trafficInterruption
+#                     YES, because the dataplane restarts).
+#   deploy_force    - true redeploys even when already up to date (default false)
+#   deploy_retries/deploy_delay - task-status poll budget (default 60 x 20s = 20m)
+
+- name: Deploy pending FMC policy
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dev_name: "{{ deploy_device | default(vm_name) | default(inventory_hostname) }}"
+  block:
+
+    - name: Get an FMC auth token
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: dep_auth
+      until: dep_auth is succeeded
+      retries: 10
+      delay: 30
+
+    # FMC lists a device here only while it has undeployed changes, so an absent
+    # entry is the normal "already deployed" case, not an error.
+    #
+    # But straight after registration FMC reports the device with upToDate:false AND
+    # canBeDeployed:false — dirty, yet not yet ready to deploy. Treating that as
+    # "nothing pending" leaves the unit dirty, and a later HA attempt is refused with
+    # "One or both Peers are dirty". So wait for it to settle: either the entry goes
+    # away (clean) or canBeDeployed flips true (ready to push).
+    - name: Wait until the device is ready to deploy, or already clean
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_list
+      until: >-
+        {{ (dep_list.json.get('items', []) | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0
+           if (deploy_all | default(false) | bool)
+           else (dep_list.json.get('items', []) | selectattr('name', 'equalto', _dev_name)
+                 | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0 }}
+      retries: "{{ deploy_settle_retries | default(30) }}"
+      delay: "{{ deploy_settle_delay | default(20) }}"
+
+    - name: Select what to deploy
+      ansible.builtin.set_fact:
+        _targets: >-
+          {{ (dep_list.json.get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list)
+             if (deploy_all | default(false) | bool)
+             else (dep_list.json.get('items', []) | selectattr('canBeDeployed', 'equalto', true)
+                   | selectattr('name', 'equalto', _dev_name) | list) }}
+
+    - name: Report that nothing is pending
+      ansible.builtin.debug:
+        msg: "No pending deployment for {{ 'any device' if (deploy_all | default(false) | bool) else _dev_name }} - already up to date"
+      when: _targets | length == 0
+
+    # version stamps WHICH pending config is being pushed; FMC rejects a stale one.
+    # With several devices the newest stamp covers them all.
+    - name: Request the deployment
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deploymentrequests"
+        method: POST
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        body_format: json
+        body:
+          type: DeploymentRequest
+          version: "{{ _targets | map(attribute='version') | map('int') | max | string }}"
+          forceDeploy: "{{ deploy_force | default(false) | bool }}"
+          ignoreWarning: "{{ deploy_ignore_warning | default(true) | bool }}"
+          deviceList: "{{ _targets | map(attribute='id') | list }}"
+        validate_certs: no
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      register: dep_req
+      when: _targets | length > 0
+
+    # The POST only queues the job. Status goes Deploying -> Deployed, and passes
+    # through PARTIALLY_SUCCEEDED mid-push, which is progress and not a failure.
+    - name: Wait for the deployment to finish
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/job/taskstatuses/{{ dep_req.json.metadata.task.id }}"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_task
+      until: dep_task.json.status | default('') in ['Deployed', 'Completed', 'Failed']
+      retries: "{{ deploy_retries | default(60) }}"
+      delay: "{{ deploy_delay | default(20) }}"
+      when: _targets | length > 0
+
+    - name: Fail when the deployment did not succeed
+      ansible.builtin.fail:
+        msg: "FMC deployment finished as '{{ dep_task.json.status }}': {{ dep_task.json.message | default('no message') }}"
+      when:
+        - _targets | length > 0
+        - dep_task.json.status not in ['Deployed', 'Completed']
+
+    - name: Report the deployment result
+      ansible.builtin.debug:
+        msg: "Deployed {{ _targets | map(attribute='name') | join(', ') }} - {{ dep_task.json.message | default('') }}"
+      when: _targets | length > 0
