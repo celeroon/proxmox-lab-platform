@@ -89,6 +89,21 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         # disk pauses the build VM mid-boot (QEMU werror=stop). Require real headroom.
         "min_free_gb": 60,
     },
+    # Fortinet FortiGate (FortiOS). Same --source flow: clones the packer repo, boots the
+    # supplied qcow2, configures it over serial (admin + vagrant/vagrant, SSH key, port1 in
+    # VRF 1, self-signed cert), and produces a configured qcow2 imported as fortigate-<version>.
+    # The FortiOS version is passed to the build via BUILD_VERSION (see below).
+    "fortigate": {
+        "script": "build-fortigate.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "output_dir": "/var/lib/lab-platform/build-work/fortigate-out",
+        "output_file": "fortigate.qcow2",
+        # HCL builds with disk_interface="virtio" (virtio-blk); import on the same bus so the
+        # guest sees its disk where it expects it (matches the FTDv/FMCv appliances).
+        "disk_bus": "virtio0",
+        "min_free_gb": 8,
+    },
 }
 
 # Proxmox tag stamped on single_use templates; the deploy engine keys the one-deployment
@@ -186,6 +201,9 @@ class BuildManager:
             out_dir = Path(spec["output_dir"])
             env = dict(os.environ)
             env["OUT_DIR"] = str(out_dir)
+            # FortiGate bakes the version into its intermediate qcow2 name; other source_arg
+            # scripts ignore it. The imported template name is still derived from `version` below.
+            env["BUILD_VERSION"] = version
             if gui:
                 # Turn off headless in the packer build so the QEMU window opens (test/watch).
                 env["GUI"] = "1"

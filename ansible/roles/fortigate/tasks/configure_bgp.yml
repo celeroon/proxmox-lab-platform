@@ -1,0 +1,14 @@
+---
+# Configure BGP. Var: bgp_config passed straight to fortios_router_bgp, e.g.
+#   {as, router_id, neighbor:[{ip, remote_as, weight, soft_reconfiguration,
+#    route_map_in, route_map_out}], network:[{id, prefix}]}
+
+- name: Configure BGP
+  fortinet.fortios.fortios_router_bgp:
+    vdom: "{{ vdom | default('root') }}"
+    router_bgp: "{{ bgp_config }}"
+  when: bgp_config is defined
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

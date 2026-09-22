@@ -1,0 +1,14 @@
+---
+# Create route-maps. Var: route_maps (list), each {name, rule:[{id, action, match_ip_address}]}
+# match_ip_address references a prefix-list (or access-list) name.
+
+- name: Configure route-maps
+  fortinet.fortios.fortios_router_route_map:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    router_route_map: "{{ item }}"
+  loop: "{{ route_maps | default([]) }}"
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

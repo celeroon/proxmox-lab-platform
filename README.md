@@ -166,6 +166,21 @@ Packer boots the disk, runs the setup wizard over the console (admin password `S
 - **Single-use appliances.** FTDv/FMCv are pets registered to FMC/SSM, so each imported template is tagged `single-use` and may back only **one** live deployment at a time — a scenario naming a template already in use is blocked (it frees again when that deployment is destroyed). Build a **pool** with `--count N`; a later `--count` continues past the highest existing number (`cisco-ftd-4`, `-5`, …).
 - **Sizing:** FTDv needs 4 vCPU / 8 GB and ≥4 NICs; FMCv needs 4 vCPU / 32 GB and boots slowly (~40 min). `--gui` (FTD/FMC only) turns off headless so you can watch the build; default is headless.
 
+#### Fortinet FortiGate
+
+Builds a **FortiGate** (FortiOS) firewall template from Fortinet's shipped disk image via Packer ([celeroon/fortigate-vagrant-libvirt](https://github.com/celeroon/fortigate-vagrant-libvirt)). Fortinet ships FortiOS as a bootable `.qcow2` — pass it with `--source`. The second argument is a **free-form name** (not a version): it becomes the template name `fortigate-<name>`, so you can build one template per unit:
+
+```bash
+lab template build fortigate fgt-1 --source ./fortios.qcow2         # → template fortigate-fgt-1
+lab template build fortigate fgt-2 --source ./fortios.qcow2         # → template fortigate-fgt-2 (e.g. an HA peer)
+lab template build fortigate fgt-1 --source ./fortios.qcow2 --gui   # open the QEMU window during the build
+```
+
+It boots the disk under Packer, configures it over the serial console, and imports the result as template **`fortigate-<name>`**. Nothing is downloaded — the image comes from `--source`. (`--gui` opens the QEMU window; headless by default. For an HA pair just build two, e.g. `fgt-1` and `fgt-2`.)
+
+- The console seed creates a `vagrant`/`vagrant` `super_admin` (plus an SSH key), puts **`port1`** in VRF 1 with `ping/http/https/ssh/fgfm/snmp` allowed, and installs a self-signed admin/SSL certificate. `port1` is the management interface (first NIC); remaining NICs map one-per-interface (`port2…`).
+- The disk is imported on **virtio-blk** (matching the image the build was made against). FortiOS is licensed per-VM — a fresh template runs in unlicensed evaluation mode until you apply a license.
+
 ---
 
 ### Snapshots (detonation range)

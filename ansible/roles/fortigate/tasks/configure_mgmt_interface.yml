@@ -1,0 +1,31 @@
+---
+# Task: pin the management interface (port1) to a static IP and move it to the global
+# VRF (vrf 0). The FortiOS build seeds port1 as DHCP in vrf 1 (a management VRF); for HA
+# we instead use the reserved HA management interface for per-unit management, so port1
+# goes back to vrf 0 with a fixed address the platform already owns.
+#
+# Runs over the same port1 that the httpapi session uses, but the IP is unchanged (it
+# equals the mgmt IP the box already holds via DHCP) — only mode/vrf change, so the
+# session survives; retries absorb any brief blip while the interface re-applies.
+#
+# Variables:
+#   mgmt_interface:   interface name (default port1)
+#   mgmt_ip:          IPv4 (default {{ vm_mgmt_ip }} — the platform-assigned mgmt IP)
+#   mgmt_netmask:     mask (default 255.255.0.0 — the /16 mgmt network)
+#   mgmt_vrf:         target VRF (default 0 — the global VRF)
+#   mgmt_allowaccess: management protocols (default ping https ssh http fgfm snmp)
+
+- name: Pin management interface to a static IP in vrf 0
+  fortinet.fortios.fortios_system_interface:
+    vdom: "{{ vdom | default('root') }}"
+    state: present
+    system_interface:
+      name: "{{ mgmt_interface | default('port1') }}"
+      mode: static
+      ip: "{{ mgmt_ip | default(vm_mgmt_ip) }} {{ mgmt_netmask | default('255.255.0.0') }}"
+      vrf: "{{ mgmt_vrf | default(0) }}"
+      allowaccess: "{{ mgmt_allowaccess | default(['ping','https','ssh','http','fgfm','snmp']) }}"
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

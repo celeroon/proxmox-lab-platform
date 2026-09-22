@@ -5,19 +5,10 @@ description: >-
   active/standby HA pair managed by FMC, with a Cumulus switch inside carrying two VLANs
   (users/servers). Three branches sit behind their own firewall and Cumulus switch on a
   single VLAN. Traffic path per site is: vyos (ISP) -> firewall -> cumulus -> host.
-  Deploy builds the topology and addresses VyOS, the switches and the hosts; the
-  firewalls (FTD HA formation, FMC registration, policy, FortiGate) are configured by hand.
+  Deploy builds the topology and addresses VyOS, the switches and the hosts; the FTD HA
+  pair is configured by hand (FMC), while the branch1 FortiGate HA pair is configured by
+  ansible (interfaces, SD-WAN, IPsec, BGP, policy, FGCP HA).
 vm_prefix: ""
-
-# Staged bring-up — verify each layer before adding the next:
-#   lab deploy start network-lab2 --user cisco --target vyos-1
-#       check the six ISP interfaces, NAT and the default route first
-#   lab deploy start network-lab2 --user cisco --target sw-hq,sw-br1,sw-br2,sw-br3
-#   lab deploy start network-lab2 --user cisco --target ubuntu-hq,deb-srv-hq,win-hq,win-srv-hq,deb-br1,deb-br2,deb-br3
-#   lab deploy start network-lab2 --user cisco --target ftd-1      (requires vyos-1)
-#   lab deploy start network-lab2 --user cisco --target ftd-2      (requires ftd-1)
-#   lab deploy start network-lab2 --user cisco --target ftd-3,fmc-1
-#       slowest layer: FTDv ~15 min, FMCv ~40 min (see ssh_timeout below)
 
 # ─────────────────────────────── addressing ───────────────────────────────
 # ISPs are the three RFC 5737 documentation ranges, one per "provider", so each
@@ -25,28 +16,25 @@ vm_prefix: ""
 #   ISP1 TEST-NET-1 192.0.2.0/24   ISP2 TEST-NET-2 198.51.100.0/24
 #   ISP3 TEST-NET-3 203.0.113.0/24
 #
-#   isp-a  HQ primary     ISP1  192.0.2.0/29      vyos .1   ftd .2 act / .3 standby
-#   isp-b  HQ secondary   ISP2  198.51.100.0/29   vyos .1   ftd .2 act / .3 standby
+#   isp-a  HQ primary     ISP1  192.0.2.0/29      vyos .1   ftd .2
+#   isp-b  HQ secondary   ISP2  198.51.100.0/29   vyos .1   ftd .2
 #   isp-c  br1 primary    ISP1  192.0.2.8/29      vyos .9   fgt .10
 #   isp-d  br1 secondary  ISP3  203.0.113.0/29    vyos .1   fgt .2
 #   isp-e  br2            ISP2  198.51.100.8/29   vyos .9   ftd .10
 #   isp-f  br3            ISP3  203.0.113.8/29    vyos .9   fgt .10
 #
-# All WAN segments are /29: an FTD HA pair needs router + active + standby, and the
-# single-firewall links use the same mask for consistency. isp-f sits at .8 because
-# .4 is not a /29 boundary and would overlap isp-d.
 #
 #   LAN   inside space is 192.168.0.0/16 — deliberately not 10/8, which the platform
 #         already uses for management (10.<user_id>.0.0/16).
-#           HQ  vlan100 users   192.168.100.0/24
-#           HQ  vlan200 servers 192.168.200.0/24
+#           HQ  vlan100 servers 192.168.100.0/24
+#           HQ  vlan200 users   192.168.200.0/24
 #           br1 vlan10          192.168.10.0/24
 #           br2 vlan20          192.168.20.0/24
 #           br3 vlan30          192.168.30.0/24
 #         VLAN id matches the third octet throughout. Gateway .1 on each
 #         (HQ: FTD HA .1 active / .2 standby).
-#           HQ vlan100 users   win-hq     .50
-#           HQ vlan200 servers ubuntu-hq  .50   fmc-1 .60
+#           HQ vlan200 users   win-hq     .50
+#           HQ vlan100 servers ubuntu-hq  .50   fmc-1 .60
 #                              deb-srv-hq .70   win-srv-hq .80
 #           branch hosts       .50
 
@@ -62,16 +50,18 @@ networks:
   # FTD HA failover/state link — two endpoints only, so point-to-point
   - {name: hq-failover, type: vnet}
   # HQ inside — one vnet per switch port
-  - {name: hq-ftd1-sw, type: vnet}    # ftd-1 inside  -> sw-hq swp1 (trunk 10,20)
-  - {name: hq-ftd2-sw, type: vnet}    # ftd-2 inside  -> sw-hq swp2 (trunk 10,20)
-  - {name: hq-sw-win, type: vnet}     # sw-hq swp3 (access 100, users)   -> win-hq
-  - {name: hq-sw-ubuntu, type: vnet}  # sw-hq swp4 (access 200, servers) -> ubuntu-hq
-  - {name: hq-sw-fmc, type: vnet}     # sw-hq swp5 (access 200, servers) -> fmc-1
-  - {name: hq-sw-debsrv, type: vnet}  # sw-hq swp6 (access 200, servers) -> deb-srv-hq
-  - {name: hq-sw-winsrv, type: vnet}  # sw-hq swp7 (access 200, servers) -> win-srv-hq
+  - {name: hq-ftd1-sw, type: vnet}    # ftd-1 inside  -> sw-hq swp1 (trunk 100,200)
+  - {name: hq-ftd2-sw, type: vnet}    # ftd-2 inside  -> sw-hq swp2 (trunk 100,200)
+  - {name: hq-sw-win, type: vnet}     # sw-hq swp3 (access 200, users)   -> win-hq
+  - {name: hq-sw-ubuntu, type: vnet}  # sw-hq swp4 (access 100, servers) -> ubuntu-hq
+  - {name: hq-sw-fmc, type: vnet}     # sw-hq swp5 (access 100, servers) -> fmc-1
+  - {name: hq-sw-debsrv, type: vnet}  # sw-hq swp6 (access 100, servers) -> deb-srv-hq
+  - {name: hq-sw-winsrv, type: vnet}  # sw-hq swp7 (access 100, servers) -> win-srv-hq
   # branches
   - {name: br1-fw-sw, type: vnet}
   - {name: br1-sw-host, type: vnet}
+  # FortiGate HA heartbeat — two endpoints only (fgt-1 <-> fgt-2), so point-to-point.
+  - {name: br1-fw-ha, type: vnet}
   - {name: br2-fw-sw, type: vnet}
   - {name: br2-sw-host, type: vnet}
   # FTDv vnic1 is reserved for internal use and must exist but carry nothing.
@@ -132,8 +122,8 @@ vms:
   # re-pointed at the FTD inside address.
   - name: fmc-1
     # FMC comes before the firewalls: they register themselves to it at provision time,
-  # so {{ fmc_1_ip }} has to resolve by then. Its own data leg on sw-hq swp5 comes up
-  # later — everything FMC needs during deploy runs over the mgmt network.
+    # so {{ fmc_1_ip }} has to resolve by then. Its own data leg on sw-hq swp5 comes up
+    # later — everything FMC needs during deploy runs over the mgmt network.
     depends_on: [vyos-1]
     template: cisco-fmc-1
     clone_mode: full
@@ -143,7 +133,7 @@ vms:
     qemu_agent: false
     cpu_type: host        # FTD/FMC are ASA-lineage and expect AES-NI; kvm64 masks it
     interfaces:
-      - {name: eth1, type: vnet, network: hq-sw-fmc}   # 192.168.200.60/24, access vlan 200
+      - {name: eth1, type: vnet, network: hq-sw-fmc}   # 192.168.100.60/24, access vlan 100
     ansible:
       # local: every task in the role is uri + delegate_to localhost against FMC's
       # REST API, so nothing ever connects to the guest. type: ssh would block the
@@ -266,11 +256,11 @@ vms:
     interfaces:
       - {name: eth1, type: vnet, network: hq-ftd1-sw}    # swp1 trunk 100,200
       - {name: eth2, type: vnet, network: hq-ftd2-sw}    # swp2 trunk 100,200
-      - {name: eth3, type: vnet, network: hq-sw-win}     # swp3 access 100 (users)
-      - {name: eth4, type: vnet, network: hq-sw-ubuntu}  # swp4 access 200 (servers)
-      - {name: eth5, type: vnet, network: hq-sw-fmc}     # swp5 access 200 (servers)
-      - {name: eth6, type: vnet, network: hq-sw-debsrv}  # swp6 access 200 (servers)
-      - {name: eth7, type: vnet, network: hq-sw-winsrv}  # swp7 access 200 (servers)
+      - {name: eth3, type: vnet, network: hq-sw-win}     # swp3 access 200 (users)
+      - {name: eth4, type: vnet, network: hq-sw-ubuntu}  # swp4 access 100 (servers)
+      - {name: eth5, type: vnet, network: hq-sw-fmc}     # swp5 access 100 (servers)
+      - {name: eth6, type: vnet, network: hq-sw-debsrv}  # swp6 access 100 (servers)
+      - {name: eth7, type: vnet, network: hq-sw-winsrv}  # swp7 access 100 (servers)
     ansible:
       connection: {type: ssh, user: vagrant, password: vagrant, password_reset: true}
       gather_facts: false
@@ -287,11 +277,11 @@ vms:
         - task: cumulus/configure_access_ports
           vars:
             access_ports:
-              - {port: swp3, vlan: 100, description: "*** users - win-hq ***"}
-              - {port: swp4, vlan: 200, description: "*** servers - ubuntu-hq ***"}
-              - {port: swp5, vlan: 200, description: "*** servers - fmc-1 ***"}
-              - {port: swp6, vlan: 200, description: "*** servers - deb-srv-hq ***"}
-              - {port: swp7, vlan: 200, description: "*** servers - win-srv-hq ***"}
+              - {port: swp3, vlan: 200, description: "*** users - win-hq ***"}
+              - {port: swp4, vlan: 100, description: "*** servers - ubuntu-hq ***"}
+              - {port: swp5, vlan: 100, description: "*** servers - fmc-1 ***"}
+              - {port: swp6, vlan: 100, description: "*** servers - deb-srv-hq ***"}
+              - {port: swp7, vlan: 100, description: "*** servers - win-srv-hq ***"}
         - task: cumulus/save_config
 
   - name: ubuntu-hq
@@ -310,7 +300,7 @@ vms:
         - task: linux/set_hostname
           vars: {hostname: ubuntu-hq}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: ens19, lab_ip: 192.168.100.50, lab_prefix: 24, lab_gateway: 192.168.200.1}
+          vars: {lab_interface: ens19, lab_ip: 192.168.100.50, lab_prefix: 24, lab_gateway: 192.168.100.1}
 
   # Windows client in the users VLAN. GPT/EFI image, so it needs ovmf + q35 + TPM 2.0;
   # vga:virtio avoids the Bochs fallback that pins the desktop to firmware resolution.
@@ -328,7 +318,7 @@ vms:
     cpu_type: host
     vga: virtio
     interfaces:
-      - {name: eth1, type: vnet, network: hq-sw-win}    # 192.168.100.50/24, access vlan 100
+      - {name: eth1, type: vnet, network: hq-sw-win}    # 192.168.200.50/24, access vlan 200
     ansible:
       connection: {type: winrm, user: vagrant, password: vagrant}
       gather_facts: true
@@ -353,7 +343,7 @@ vms:
         - task: linux/set_hostname
           vars: {hostname: deb-srv-hq}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: eth1, lab_ip: 192.168.200.70, lab_netmask: 255.255.255.0, lab_gateway: 192.168.200.1}
+          vars: {lab_interface: eth1, lab_ip: 192.168.100.70, lab_netmask: 255.255.255.0, lab_gateway: 192.168.100.1}
 
   # Second Windows, this one in the servers VLAN. Uses windows-11 because that is the
   # only Windows template built; swap to windows-2025 once `lab template build windows
@@ -372,7 +362,7 @@ vms:
     cpu_type: host
     vga: virtio
     interfaces:
-      - {name: eth1, type: vnet, network: hq-sw-winsrv}   # 192.168.200.80/24, access vlan 200
+      - {name: eth1, type: vnet, network: hq-sw-winsrv}   # 192.168.100.80/24, access vlan 100
     ansible:
       connection: {type: winrm, user: vagrant, password: vagrant}
       gather_facts: true
@@ -381,11 +371,242 @@ vms:
         - task: windows/set_hostname
           vars: {hostname: win-srv-hq}
 
-  # ═════════════ branch1 — FortiGate, dual ISP (placeholder until built) ═════════════
-  # - name: fgt-1
-  #     template: <fortigate template>
-  #     interfaces: eth1 isp-c (192.0.2.10/29), eth2 isp-d (203.0.113.2/29),
-  #                 eth3 br1-fw-sw (192.168.10.1/24)
+  # ═══════════════ branch1 firewall — FortiGate HA pair (FGCP), dual ISP ═══════════════
+  # fgt-1 + fgt-2 form an FGCP active-passive cluster: both units sit on the SAME data vnets
+  # (isp-c / isp-d / br1-fw-sw) and share one virtual MAC + IP per interface, plus a dedicated
+  # HA heartbeat link (br1-fw-ha). fgt-2 deploys FIRST as a bare secondary; fgt-1 then carries
+  # the full data-plane config and forms FGCP as PRIMARY (override + higher priority), so its
+  # config syncs down to fgt-2 once the cluster is up.
+  # NB: FortiGate-VM FGCP needs UNIQUE serial numbers; the build derives the eval serial from
+  # the SMBIOS UUID, so distinct Proxmox UUIDs give distinct serials and the cluster can form.
+  #
+  # FortiGate interface order: port1 is ALWAYS Management (net0, injected by the platform).
+  # The scenario NICs below then map one-per-port starting at port2, in listed order — the
+  # first data NIC is port2, the next port3, and so on.
+  #   net0  -> port1  Management  (platform mgmt IP; build enables https+ssh here)
+  #   eth1  -> port2  WAN1  isp-c  192.0.2.10/29   (vyos .9)
+  #   eth2  -> port3  WAN2  isp-d  203.0.113.2/29  (vyos .1)
+  #   eth3  -> port4  LAN trunk    carries vlan10 -> 192.168.10.1/24 on the vlan10 subif
+  #   eth4  -> port5  HA heartbeat br1-fw-ha (FGCP)
+
+  # ═══════════════ branch1 firewall — FortiGate HA secondary (deployed first) ═══════════════
+  # Bare unit: own static mgmt IP + join the cluster at a LOWER priority. Everything else
+  # (data interfaces, addresses, SD-WAN, IPsec, BGP, policy) syncs from fgt-1 once it forms.
+  - name: fgt-2
+    depends_on: [vyos-1]
+    template: fortigate-fgt-2        # build: lab template build fortigate fgt-2 --source ./fortios.qcow2 (same fortios.qcow2 as fgt-1 -> same model+firmware for FGCP)
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: false
+    interfaces:
+      - {name: eth1, type: vnet, network: isp-c}      # port2 WAN1
+      - {name: eth2, type: vnet, network: isp-d}      # port3 WAN2
+      - {name: eth3, type: vnet, network: br1-fw-sw}  # port4 LAN trunk (vlan10)
+      - {name: eth4, type: vnet, network: br1-fw-ha}  # port5 HA heartbeat (FGCP, no IP)
+    ansible:
+      connection:
+        type: httpapi
+        network_os: fortinet.fortios.fortios
+        user: vagrant
+        password: vagrant
+      gather_facts: false
+      become: false
+      vars:
+        ansible_httpapi_use_ssl: true
+        ansible_httpapi_validate_certs: false
+        ansible_httpapi_port: 443
+      tasks:
+        # Own static mgmt IP (its 10.N.0.11), kept per-unit via the reserved HA mgmt interface.
+        - task: fortigate/configure_mgmt_interface
+        # Join the cluster as SECONDARY (lower priority) — fgt-1 stays primary and syncs to it.
+        - task: fortigate/configure_ha
+          vars:
+            ha_group_name: br1-ha
+            ha_password: labhapassword
+            ha_priority: 100
+            ha_hbdev_interface: port5   # eth4 -> br1-fw-ha
+
+  # ═══════════════ branch1 firewall — FortiGate HA primary (full config) ═══════════════
+  # Carries the entire branch1 data plane; forms FGCP as primary and syncs it to fgt-2.
+  - name: fgt-1
+    depends_on: [fgt-2]
+    template: fortigate-fgt-1       # build: lab template build fortigate fgt-1 --source ./fortios.qcow2
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: false
+    interfaces:
+      - {name: eth1, type: vnet, network: isp-c}      # port2 WAN1
+      - {name: eth2, type: vnet, network: isp-d}      # port3 WAN2
+      - {name: eth3, type: vnet, network: br1-fw-sw}  # port4 LAN trunk (vlan10)
+      - {name: eth4, type: vnet, network: br1-fw-ha}  # port5 HA heartbeat (FGCP, no IP)
+    ansible:
+      # FortiOS is driven over its REST API (fortinet.fortios httpapi), not SSH/CLI. The
+      # SSL/port vars below are not emitted by the inventory builder for httpapi, so they
+      # are set here as connection/play vars; the build already allows https on port1 (mgmt).
+      connection:
+        type: httpapi
+        network_os: fortinet.fortios.fortios
+        user: vagrant
+        password: vagrant        # build sets admin/admin; a vagrant/vagrant super_admin also exists
+      gather_facts: false
+      become: false
+      vars:
+        ansible_httpapi_use_ssl: true
+        ansible_httpapi_validate_certs: false
+        ansible_httpapi_port: 443
+      tasks:
+        - task: fortigate/initial_setup
+          vars: {fgt_hostname: fgt-1}
+        # LAN10 (local) + HQ servers/users objects, referenced by the S2S policies below.
+        - task: fortigate/create_network_addresses
+          vars:
+            network_addresses:
+              - {name: "LAN10-192.168.10.0/24", subnet: "192.168.10.0 255.255.255.0"}
+              - {name: "HQ-SERVERS-192.168.100.0/24", subnet: "192.168.100.0 255.255.255.0"}
+              - {name: "HQ-USERS-192.168.200.0/24", subnet: "192.168.200.0 255.255.255.0"}
+        - task: fortigate/configure_interfaces
+          vars:
+            interfaces:
+              # WAN1 / WAN2 addressed from the vyos /29s. Descriptions/aliases avoid '<'/'>'
+              # (the FortiOS REST API rejects those as "XSS vulnerability characters", -173).
+              - {name: port2, ip: "192.0.2.10 255.255.255.248",  description: "WAN1 to ISP1 (vyos .9)", alias: WAN1, role: wan}
+              - {name: port3, ip: "203.0.113.2 255.255.255.248", description: "WAN2 to ISP3 (vyos .1)", alias: WAN2, role: wan}
+              # LAN as a trunk: port4 is the tagged parent (unaddressed), vlan10 subif is the gateway.
+              - {name: vlan10, interface: port4, vlanid: 10, ip: "192.168.10.1 255.255.255.0", description: "LAN vlan10", alias: LAN10, role: lan}
+        # Route-based IPsec: dual tunnels to br3 (one per WAN, BGP over APIPA transit IPs)
+        # plus dual tunnels to HQ. PSK "vagrant" on all four.
+        - task: fortigate/configure_ipsec_phase1
+          vars:
+            ipsec_psk: vagrant
+            ipsec_tunnels:
+              - {name: BR3-VPN1, interface: port2, remote_gw: 203.0.113.10, tunnel_ip: "169.254.10.1 255.255.255.255", tunnel_remote_ip: "169.254.10.2 255.255.255.255"}
+              - {name: BR3-VPN2, interface: port3, remote_gw: 203.0.113.10, tunnel_ip: "169.254.11.1 255.255.255.255", tunnel_remote_ip: "169.254.11.2 255.255.255.255"}
+              - {name: HQ-VPN1,  interface: port2, remote_gw: 192.0.2.2}
+              - {name: HQ-VPN2,  interface: port3, remote_gw: 198.51.100.2}
+        - task: fortigate/configure_ipsec_phase2
+          vars:
+            ipsec_phase2:
+              - {name: BR3-VPN1, phase1: BR3-VPN1, auto_negotiate: enable}
+              - {name: BR3-VPN2, phase1: BR3-VPN2, auto_negotiate: enable}
+              - {name: HQ-VPN1,  phase1: HQ-VPN1}
+              - {name: HQ-VPN2,  phase1: HQ-VPN2}
+        # SD-WAN over both WANs (vyos is the gateway on each); default route rides the zone.
+        - task: fortigate/configure_sdwan
+          vars:
+            sdwan_config:
+              status: enable
+              zone:
+                - {name: virtual-wan-link}
+              members:
+                - {seq_num: 1, interface: port2, gateway: 192.0.2.9}
+                - {seq_num: 2, interface: port3, gateway: 203.0.113.1}
+              service:
+                - name: allow-all
+                  id: 1
+                  mode: priority
+                  dst: [{name: all}]
+                  src: [{name: all}]
+                  health_check: [{name: Default_DNS}]
+                  priority_members:
+                    - {seq_num: 1}
+                    - {seq_num: 2}
+        - task: fortigate/configure_routing
+          vars:
+            static_routes:
+              - {seq_num: 1, dst: "0.0.0.0 0.0.0.0", sdwan_zone: [{name: virtual-wan-link}], distance: 1, status: enable}
+        # BGP filters (bound to the neighbors below): br1-bgp-out advertises the local LAN
+        # outbound to all peers, br3-bgp-in accepts br3's LAN, hq-bgp-in accepts HQ's networks.
+        - task: fortigate/configure_prefix_lists
+          vars:
+            prefix_lists:
+              - name: br1-bgp-out
+                rule:
+                  - {id: 1, action: permit, prefix: "192.168.10.0 255.255.255.0"}
+              - name: br3-bgp-in
+                rule:
+                  - {id: 1, action: permit, prefix: "192.168.30.0 255.255.255.0"}
+              - name: hq-bgp-in
+                rule:
+                  - {id: 1, action: permit, prefix: "192.168.100.0 255.255.255.0"}
+                  - {id: 2, action: permit, prefix: "192.168.200.0 255.255.255.0"}
+        - task: fortigate/configure_route_maps
+          vars:
+            route_maps:
+              - name: br1-bgp-out
+                rule:
+                  - {id: 1, action: permit, match_ip_address: br1-bgp-out}
+              - name: br3-bgp-in
+                rule:
+                  - {id: 1, action: permit, match_ip_address: br3-bgp-in}
+              - name: hq-bgp-in
+                rule:
+                  - {id: 1, action: permit, match_ip_address: hq-bgp-in}
+        # eBGP: AS 65110 (br1). Peers to br3 (AS 65130) over both BR3 tunnels and to HQ
+        # (AS 65100) over both HQ tunnels; weight picks the primary path per peer.
+        - task: fortigate/configure_bgp
+          vars:
+            bgp_config:
+              as: "65110"
+              router_id: 192.168.10.1
+              neighbor:
+                - {ip: 169.254.10.2, remote_as: "65130", weight: 200, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out}
+                - {ip: 169.254.11.2, remote_as: "65130", weight: 100, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out}
+                - {ip: 169.254.1.1,  remote_as: "65100", weight: 200, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out}
+                - {ip: 169.254.2.1,  remote_as: "65100", weight: 100, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out}
+              network:
+                - {id: 1, prefix: "192.168.10.0 255.255.255.0"}
+        # LAN -> internet (via SD-WAN, NAT), and both S2S directions between LAN and the tunnels.
+        - task: fortigate/configure_policies
+          vars:
+            firewall_policies:
+              - policyid: 1
+                name: lan-internet
+                srcintf: [{name: vlan10}]
+                dstintf: [{name: virtual-wan-link}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
+                dstaddr: [{name: all}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+                nat: enable
+              - policyid: 2
+                name: allow-s2s
+                srcintf: [{name: vlan10}]
+                dstintf: [{name: BR3-VPN1}, {name: BR3-VPN2}, {name: HQ-VPN1}, {name: HQ-VPN2}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}]
+                dstaddr: [{name: "LAN10-192.168.10.0/24"}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+              - policyid: 3
+                name: s2s-allow
+                srcintf: [{name: BR3-VPN1}, {name: BR3-VPN2}, {name: HQ-VPN1}, {name: HQ-VPN2}]
+                dstintf: [{name: vlan10}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
+                dstaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+        # Pin port1 (mgmt) to its static platform IP and move it out of the build's vrf 1 into
+        # vrf 0. Runs before HA so it can't perturb the tasks above.
+        - task: fortigate/configure_mgmt_interface
+        # Form FGCP as PRIMARY: override + higher priority so fgt-1 wins the election over the
+        # already-running fgt-2 and its config syncs down. port1 is the reserved per-unit mgmt
+        # interface (gw 10.N.0.1), so ansible keeps reaching each unit after the cluster forms.
+        - task: fortigate/configure_ha
+          vars:
+            ha_group_name: br1-ha
+            ha_password: labhapassword
+            ha_priority: 200
+            ha_override: enable
+            ha_hbdev_interface: port5   # eth4 -> br1-fw-ha
+
+  # ═══════════════ branch1 LAN — Cumulus switch + ubuntu host (after the fgt HA pair) ═══════════════
   - name: sw-br1
     template: CumulusVXCommunity/cumulus-vx
     clone_mode: linked
@@ -393,8 +614,8 @@ vms:
     memory: 4096
     qemu_agent: false
     interfaces:
-      - {name: eth1, type: vnet, network: br1-fw-sw}     # swp1 access 10 -> fgt-1
-      - {name: eth2, type: vnet, network: br1-sw-host}   # swp2 access 10 -> debian
+      - {name: eth1, type: vnet, network: br1-fw-sw}     # swp1 trunk 10 -> fgt LAN (tagged vlan10 subif)
+      - {name: eth2, type: vnet, network: br1-sw-host}   # swp2 access 10 -> ubuntu-br1
     ansible:
       connection: {type: ssh, user: vagrant, password: vagrant, password_reset: true}
       gather_facts: false
@@ -402,18 +623,25 @@ vms:
       tasks:
         - task: cumulus/set_hostname
           vars: {hostname: sw-br1}
+        # swp1 is a trunk: the FortiGate LAN rides a tagged vlan10 subinterface, so the
+        # switch port must accept tagged vlan10 (an access port would drop it).
+        - task: cumulus/configure_trunk_ports
+          vars:
+            trunk_ports:
+              - {port: swp1, vlans: [10], description: "*** fgt-1 LAN trunk (vlan10) ***"}
         - task: cumulus/configure_access_ports
           vars:
             access_ports:
-              - {port: swp1, vlan: 10, description: "*** fgt-1 inside ***"}
-              - {port: swp2, vlan: 10, description: "*** deb-br1 ***"}
+              - {port: swp2, vlan: 10, description: "*** ubuntu-br1 ***"}
         - task: cumulus/save_config
 
-  - name: deb-br1
-    template: generic-x64/debian12
+  # Branch1 LAN host — ubuntu on sw-br1 swp2 (access vlan10). ubuntu-desktop-24.04 names
+  # its lab NIC ens19 (like ubuntu-hq); debian generics would be eth1.
+  - name: ubuntu-br1
+    template: joaobrlt/ubuntu-desktop-24.04
     clone_mode: linked
-    cpus: 1
-    memory: 1024
+    cpus: 2
+    memory: 4096
     qemu_agent: true
     interfaces:
       - {name: eth1, type: vnet, network: br1-sw-host}
@@ -423,9 +651,9 @@ vms:
       become: true
       tasks:
         - task: linux/set_hostname
-          vars: {hostname: deb-br1}
+          vars: {hostname: ubuntu-br1}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: eth1, lab_ip: 192.168.10.50, lab_netmask: 255.255.255.0, lab_gateway: 192.168.10.1}
+          vars: {lab_interface: ens19, lab_ip: 192.168.10.50, lab_prefix: 24, lab_gateway: 192.168.10.1, lab_dns: 8.8.8.8}
 
   # ═══════════════════════ branch2 — FTD single, one ISP ═══════════════════════
   - name: ftd-3
@@ -501,10 +729,135 @@ vms:
         - task: linux/configure_network_interfaces
           vars: {lab_interface: eth1, lab_ip: 192.168.20.50, lab_netmask: 255.255.255.0, lab_gateway: 192.168.20.1}
 
-  # ═══════════ branch3 — FortiGate, one ISP (placeholder until built) ═══════════
-  # - name: fgt-2
-  #     template: <fortigate template>
-  #     interfaces: eth1 isp-f (203.0.113.10/29), eth2 br3-fw-sw (192.168.30.1/24)
+  # ═══════════════ branch3 — FortiGate (single ISP) + switch + debian, vlan30 ═══════════════
+  # One FortiGate (no HA). Mirrors branch1's br1<->br3 design from the other side: dual
+  # route-based IPsec back to br1's two WANs + eBGP (AS 65130) with weighted failover.
+  # port1 mgmt, port2 WAN (isp-f), port3 LAN trunk carrying vlan30.
+  #   net0  -> port1  Management  (platform mgmt IP)
+  #   eth1  -> port2  WAN   isp-f  203.0.113.10/29  (vyos .9)
+  #   eth2  -> port3  LAN trunk    vlan30 -> 192.168.30.1/24 on the vlan30 subif
+  - name: fgt-3
+    depends_on: [vyos-1]
+    template: fortigate-fgt-2        # build: lab template build fortigate fgt-3 --source ./fortios.qcow2 (or reuse any fortigate-* template)
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: false
+    interfaces:
+      - {name: eth1, type: vnet, network: isp-f}      # port2 WAN
+      - {name: eth2, type: vnet, network: br3-fw-sw}  # port3 LAN trunk (vlan30)
+    ansible:
+      connection:
+        type: httpapi
+        network_os: fortinet.fortios.fortios
+        user: vagrant
+        password: vagrant
+      gather_facts: false
+      become: false
+      vars:
+        ansible_httpapi_use_ssl: true
+        ansible_httpapi_validate_certs: false
+        ansible_httpapi_port: 443
+      tasks:
+        - task: fortigate/initial_setup
+          vars: {fgt_hostname: fgt-3}
+        # LAN30 (local); the S2S policies use "all" on the tunnel side, so no br1 object needed.
+        - task: fortigate/create_network_addresses
+          vars:
+            network_addresses:
+              - {name: "LAN30-192.168.30.0/24", subnet: "192.168.30.0 255.255.255.0"}
+        - task: fortigate/configure_interfaces
+          vars:
+            interfaces:
+              # WAN from the isp-f /29 (vyos .9 is the gateway). Avoid '<'/'>' (httpapi XSS filter).
+              - {name: port2, ip: "203.0.113.10 255.255.255.248", description: "WAN to ISP3 (vyos .9)", alias: WAN, role: wan}
+              # LAN as a trunk: port3 is the tagged parent (left unaddressed), vlan30 subif is the gateway.
+              - {name: vlan30, interface: port3, vlanid: 30, ip: "192.168.30.1 255.255.255.0", description: "LAN vlan30", alias: LAN30, role: lan}
+        # Route-based IPsec back to br1's two WANs (BGP over APIPA transit IPs); PSK "vagrant".
+        - task: fortigate/configure_ipsec_phase1
+          vars:
+            ipsec_psk: vagrant
+            ipsec_tunnels:
+              - {name: BR1-VPN1, interface: port2, remote_gw: 192.0.2.10,  tunnel_ip: "169.254.10.2 255.255.255.255", tunnel_remote_ip: "169.254.10.1 255.255.255.255"}
+              - {name: BR1-VPN2, interface: port2, remote_gw: 203.0.113.2, tunnel_ip: "169.254.11.2 255.255.255.255", tunnel_remote_ip: "169.254.11.1 255.255.255.255"}
+        - task: fortigate/configure_ipsec_phase2
+          vars:
+            ipsec_phase2:
+              - {name: BR1-VPN1, phase1: BR1-VPN1, auto_negotiate: enable}
+              - {name: BR1-VPN2, phase1: BR1-VPN2, auto_negotiate: enable}
+        # Single WAN: plain default route out port2 (vyos .9), no SD-WAN.
+        - task: fortigate/configure_routing
+          vars:
+            static_routes:
+              - {seq_num: 1, dst: "0.0.0.0 0.0.0.0", gateway: 203.0.113.9, device: port2}
+        # BGP filters: br3-bgp-out advertises the local LAN, br1-bgp-in accepts br1's LAN.
+        - task: fortigate/configure_prefix_lists
+          vars:
+            prefix_lists:
+              - name: br3-bgp-out
+                rule:
+                  - {id: 1, action: permit, prefix: "192.168.30.0 255.255.255.0"}
+              - name: br1-bgp-in
+                rule:
+                  - {id: 1, action: permit, prefix: "192.168.10.0 255.255.255.0"}
+        - task: fortigate/configure_route_maps
+          vars:
+            route_maps:
+              - name: br3-bgp-out
+                rule:
+                  - {id: 1, action: permit, match_ip_address: br3-bgp-out}
+              - name: br1-bgp-in
+                rule:
+                  - {id: 1, action: permit, match_ip_address: br1-bgp-in}
+        # eBGP: AS 65130 (br3) peers to br1 (AS 65110) over both tunnels; weight picks primary.
+        - task: fortigate/configure_bgp
+          vars:
+            bgp_config:
+              as: "65130"
+              router_id: 192.168.30.1
+              neighbor:
+                - {ip: 169.254.10.1, remote_as: "65110", weight: 200, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out}
+                - {ip: 169.254.11.1, remote_as: "65110", weight: 100, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out}
+              network:
+                - {id: 1, prefix: "192.168.30.0 255.255.255.0"}
+        # LAN -> internet (out port2, NAT) + both S2S directions between LAN and the tunnels.
+        - task: fortigate/configure_policies
+          vars:
+            firewall_policies:
+              - policyid: 1
+                name: allow-internet
+                srcintf: [{name: vlan30}]
+                dstintf: [{name: port2}]
+                srcaddr: [{name: "LAN30-192.168.30.0/24"}]
+                dstaddr: [{name: all}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+                nat: enable
+              - policyid: 2
+                name: allow-s2s
+                srcintf: [{name: vlan30}]
+                dstintf: [{name: BR1-VPN1}, {name: BR1-VPN2}]
+                srcaddr: [{name: "LAN30-192.168.30.0/24"}]
+                dstaddr: [{name: all}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+              - policyid: 3
+                name: s2s-allow
+                srcintf: [{name: BR1-VPN1}, {name: BR1-VPN2}]
+                dstintf: [{name: vlan30}]
+                srcaddr: [{name: all}]
+                dstaddr: [{name: "LAN30-192.168.30.0/24"}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+        # Pin port1 (mgmt) to its static platform IP, out of the build's vrf 1 into vrf 0.
+        - task: fortigate/configure_mgmt_interface
+
   - name: sw-br3
     template: CumulusVXCommunity/cumulus-vx
     clone_mode: linked
@@ -512,8 +865,8 @@ vms:
     memory: 4096
     qemu_agent: false
     interfaces:
-      - {name: eth1, type: vnet, network: br3-fw-sw}
-      - {name: eth2, type: vnet, network: br3-sw-host}
+      - {name: eth1, type: vnet, network: br3-fw-sw}     # swp1 trunk 30 -> fgt-3 LAN (tagged vlan30 subif)
+      - {name: eth2, type: vnet, network: br3-sw-host}   # swp2 access 30 -> deb-br3
     ansible:
       connection: {type: ssh, user: vagrant, password: vagrant, password_reset: true}
       gather_facts: false
@@ -521,10 +874,15 @@ vms:
       tasks:
         - task: cumulus/set_hostname
           vars: {hostname: sw-br3}
+        # swp1 is a trunk: the FortiGate LAN rides a tagged vlan30 subinterface (an access
+        # port would drop it); swp2 stays access for the plain debian host.
+        - task: cumulus/configure_trunk_ports
+          vars:
+            trunk_ports:
+              - {port: swp1, vlans: [30], description: "*** fgt-3 LAN trunk (vlan30) ***"}
         - task: cumulus/configure_access_ports
           vars:
             access_ports:
-              - {port: swp1, vlan: 30, description: "*** fgt-2 inside ***"}
               - {port: swp2, vlan: 30, description: "*** deb-br3 ***"}
         - task: cumulus/save_config
 
@@ -544,4 +902,4 @@ vms:
         - task: linux/set_hostname
           vars: {hostname: deb-br3}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: eth1, lab_ip: 192.168.30.50, lab_netmask: 255.255.255.0, lab_gateway: 192.168.30.1}
+          vars: {lab_interface: eth1, lab_ip: 192.168.30.50, lab_netmask: 255.255.255.0, lab_gateway: 192.168.30.1, lab_dns: 8.8.8.8}

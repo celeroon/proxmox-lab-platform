@@ -1,0 +1,14 @@
+---
+# Create IPv4 prefix-lists. Var: prefix_lists (list), each {name, rule:[{id, action, prefix}]}
+# where prefix is "network mask" (e.g. "192.168.10.0 255.255.255.0").
+
+- name: Configure prefix-lists
+  fortinet.fortios.fortios_router_prefix_list:
+    vdom: "{{ vdom | default('root') }}"
+    state: "present"
+    router_prefix_list: "{{ item }}"
+  loop: "{{ prefix_lists | default([]) }}"
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

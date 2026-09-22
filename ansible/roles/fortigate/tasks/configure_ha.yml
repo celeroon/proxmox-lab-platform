@@ -1,0 +1,44 @@
+---
+# Task: form/join a FortiGate FGCP HA cluster (active-passive). Set the SAME group_name,
+# password and hbdev on every member; the higher-priority unit becomes primary and its
+# config syncs to the rest. port1 is the reserved per-unit management interface (ha_mgmt),
+# so each unit stays reachable on its own mgmt IP (and manageable by ansible) after the
+# cluster forms. Run configure_mgmt_interface first so port1 already has its static IP.
+#
+# Variables:
+#   ha_group_name:     cluster group name, identical on all members (default br1-ha)
+#   ha_password:       cluster password, identical on all members (REQUIRED)
+#   ha_mode:           a-p (active-passive, default) or a-a
+#   ha_priority:       higher = primary (default 128; e.g. 200 on primary, 100 on secondary)
+#   ha_override:       'enable' lets the highest priority always reclaim primary (default disable)
+#   ha_hbdev_interface: heartbeat interface name (default port5) — must match on all members
+#   ha_hbdev_priority:  heartbeat interface priority (default 50)
+#   ha_hbdev:           advanced override — full [intf, prio, ...] list, e.g. two links
+#                       ["port5","50","port6","50"]; when set it wins over the two vars above.
+#                       (FortiOS needs the priority element, else hbdev is silently cleared.)
+#   ha_session_pickup: keep sessions across failover (default enable)
+#   ha_mgmt_interface: reserved per-unit mgmt interface (default port1)
+#   ha_mgmt_gateway:   default gateway for the reserved mgmt interface (default {{ gateway_ip }})
+#   ha_mgmt_dst:       default-route destination for the reserved mgmt (default "0.0.0.0 0.0.0.0")
+
+- name: Configure FGCP HA
+  fortinet.fortios.fortios_system_ha:
+    vdom: "{{ vdom | default('root') }}"
+    system_ha:
+      group_name: "{{ ha_group_name | default('br1-ha') }}"
+      password: "{{ ha_password }}"
+      mode: "{{ ha_mode | default('a-p') }}"
+      priority: "{{ ha_priority | default(128) }}"
+      override: "{{ ha_override | default('disable') }}"
+      hbdev: "{{ ha_hbdev | default([ha_hbdev_interface | default('port5'), ha_hbdev_priority | default('50')]) }}"
+      session_pickup: "{{ ha_session_pickup | default('enable') }}"
+      ha_mgmt_status: "enable"
+      ha_mgmt_interfaces:
+        - id: 1
+          interface: "{{ ha_mgmt_interface | default('port1') }}"
+          dst: "{{ ha_mgmt_dst | default('0.0.0.0 0.0.0.0') }}"
+          gateway: "{{ ha_mgmt_gateway | default(gateway_ip) }}"
+  register: result
+  until: result is success
+  retries: 5
+  delay: 10

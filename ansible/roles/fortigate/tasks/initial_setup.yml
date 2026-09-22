@@ -1,10 +1,12 @@
 ---
 # Task: Initial setup for FortiGate (wait for readiness, set hostname, timezone)
 # Variables:
-#   fgt1_hostname: Hostname for the FortiGate device
+#   fgt_hostname: Hostname for the FortiGate device (fgt1_hostname accepted as a legacy alias)
 
 - name: Wait for FortiGate to be ready
-  wait_for:
+  # httpapi has no shell on the device — run the reachability probe from the controller.
+  delegate_to: localhost
+  ansible.builtin.wait_for:
     host: "{{ ansible_host }}"
     port: 443
     delay: 15
@@ -15,18 +17,18 @@
   until: result is success
 
 - name: Set hostname
-  fortios_system_global:
+  fortinet.fortios.fortios_system_global:
     vdom: "{{ vdom | default('root') }}"
     system_global:
-      hostname: "{{ fgt1_hostname }}"
+      hostname: "{{ fgt_hostname | default(fgt1_hostname) }}"
   register: result
   until: result is success
   retries: 10
   delay: 15
-  when: fgt1_hostname is defined
+  when: (fgt_hostname is defined) or (fgt1_hostname is defined)
 
 - name: Set timezone
-  fortios_system_global:
+  fortinet.fortios.fortios_system_global:
     vdom: "{{ vdom | default('root') }}"
     system_global:
       timezone: "{{ timezone | default('26') }}"

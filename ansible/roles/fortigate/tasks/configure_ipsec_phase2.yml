@@ -1,32 +1,23 @@
 ---
-# Task: Configure IPsec Phase 2 (IPsec) on FortiGate
-# Call once per traffic selector (src/dst subnet pair).
-# Variables:
-#   vpn_name:        Phase 1 tunnel name this phase 2 belongs to
-#   phase2_name:     Unique name for this phase 2 entry
-#   src_name:        FortiGate address object for local subnet
-#   dst_name:        FortiGate address object for remote subnet
-#   proposal:        IPsec proposal (default: des-sha1)
-#   dhgrp:           PFS DH group (default: 2)
-#   keylifeseconds:  Phase 2 key lifetime in seconds (default: 3600)
+# IPsec phase2-interfaces. Var: ipsec_phase2 (list), each:
+#   {name, phase1, proposal?(des-sha1), auto_negotiate?(disable), src_name?, dst_name?}
+# Selectors default to 0.0.0.0/0 <-> 0.0.0.0/0; pass src_name/dst_name for named objects.
 
-- name: Configure IPsec Phase 2 {{ phase2_name }}
+- name: Configure IPsec phase2-interfaces
   fortinet.fortios.fortios_vpn_ipsec_phase2_interface:
     vdom: "{{ vdom | default('root') }}"
     state: "present"
     vpn_ipsec_phase2_interface:
-      name: "{{ phase2_name }}"
-      phase1name: "{{ vpn_name }}"
-      proposal: "{{ proposal | default('des-sha1') }}"
-      dhgrp: "{{ dhgrp | default('2') }}"
-      auto_negotiate: "{{ auto_negotiate | default('enable') }}"
-      src_addr_type: "name"
-      dst_addr_type: "name"
-      src_name: "{{ src_name }}"
-      dst_name: "{{ dst_name }}"
-      keylife_type: "seconds"
-      keylifeseconds: "{{ keylifeseconds | default(3600) }}"
+      name: "{{ item.name }}"
+      phase1name: "{{ item.phase1 }}"
+      proposal: "{{ item.proposal | default('des-sha1') }}"
+      auto_negotiate: "{{ item.auto_negotiate | default('disable') }}"
+      src_addr_type: "{{ 'name' if item.src_name is defined else omit }}"
+      dst_addr_type: "{{ 'name' if item.dst_name is defined else omit }}"
+      src_name: "{{ item.src_name | default(omit) }}"
+      dst_name: "{{ item.dst_name | default(omit) }}"
+  loop: "{{ ipsec_phase2 | default([]) }}"
+  register: result
+  until: result is success
   retries: 5
   delay: 10
-  until: result is success
-  register: result
