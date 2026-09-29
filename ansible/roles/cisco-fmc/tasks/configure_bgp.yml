@@ -1,0 +1,198 @@
+---
+# Enable BGP on an FTD (AS + router-id) and create the IPv4 BGP process with neighbors
+# and advertised networks via FMC. Idempotent: general settings are PUT only when the AS
+# differs, and the BGP process is POSTed only if one does not already exist (it is a
+# per-device singleton, so we do not overwrite a working BGP).
+#
+# Required:
+#   fmc_host      - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   ftd_device    - managed device name (e.g. ftd-1)
+#   bgp_as        - local AS (e.g. "65100")
+#   bgp_neighbors - list of {ip, remote_as, weight, keepalive, holdtime, route_map_in, route_map_out}
+#   bgp_networks  - list of network-object names to advertise
+# Optional: bgp_router_id (default AUTOMATIC); fmc_user/fmc_pass (default admin / {{ fmc_admin_password }})
+
+- name: Configure FTD BGP
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+    _rbase: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id | default('') }}/routing"
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Resolve device, route-maps, networks
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/{{ item }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: [ "devices/devicerecords", "object/routemaps", "object/networks", ]
+      register: _bgplk
+
+    - name: Map ids
+      ansible.builtin.set_fact:
+        _dev_id: "{{ (_bgplk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _rmmap: "{{ dict(_bgplk.results[1].json.get('items', []) | map(attribute='name') | zip(_bgplk.results[1].json.get('items', []) | map(attribute='id'))) }}"
+        _nmap: "{{ dict(_bgplk.results[2].json.get('items', []) | map(attribute='name') | zip(_bgplk.results[2].json.get('items', []) | map(attribute='id'))) }}"
+
+    - name: Get BGP general settings and existing BGP process
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/{{ item }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: [ "bgpgeneralsettings", "bgp", ]
+      register: _bgpstate
+
+    # bgpgeneralsettings does NOT exist until something creates it — the collection comes back
+    # empty on a device that has never had BGP enabled, and the old single PUT then died on
+    # `| first` with "No first item, sequence was empty". POST creates it (verified: 201).
+    - name: Enable BGP (create general settings) when absent
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/bgpgeneralsettings"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "BGPGeneralSettings"
+          asNumber: "{{ bgp_as | string }}"
+          routerId: "{{ bgp_router_id | default('AUTOMATIC') }}"
+        status_code: [200, 201]
+        validate_certs: no
+      delegate_to: localhost
+      when: (_bgpstate.results[0].json.get('items', []) | length) == 0
+
+    - name: Update BGP general settings when the AS differs
+      vars:
+        _cur_bgp: "{{ (_bgpstate.results[0].json.get('items', []) + [{}]) | first }}"
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/bgpgeneralsettings/{{ _cur_bgp.id }}"
+        method: PUT
+        headers: "{{ _hdr }}"
+        body_format: json
+        # Same 422 trap as configure_physical_interfaces: strip the read-only fields FMC
+        # returns on GET but rejects on PUT.
+        body: >-
+          {{ _cur_bgp
+             | dict2items | rejectattr('key', 'in', ['metadata', 'links']) | items2dict
+             | combine({'asNumber': bgp_as | string, 'routerId': bgp_router_id | default('AUTOMATIC')}) }}
+        status_code: [200, 201]
+        validate_certs: no
+      delegate_to: localhost
+      when:
+        - _cur_bgp.id is defined
+        - _cur_bgp.get('asNumber', '') | string != (bgp_as | string)
+
+    # neighborAdvanced is absent from the CREATE body on purpose: FMCv 10.0 rejects any
+    # self-built neighborAdvanced on POST with "An internal error occurred.", and on PUT it
+    # demands neighborHops and then rejects the block anyway. Weight is applied afterwards
+    # instead, by mutating the object FMC built itself - see the two tasks after the create.
+    - name: Assemble BGP process body
+      ansible.builtin.set_fact:
+        _bgp_body: >-
+          {%- set ns = namespace(nb=[], nw=[]) -%}
+          {%- for n in bgp_neighbors -%}
+            {%- set _ = ns.nb.append({
+              'type': 'neighboripv4', 'ipv4Address': n.ip, 'remoteAs': n.remote_as | string,
+              'neighborGeneral': {'shutdown': false, 'fallOverBFD': 'NONE', 'enableAddress': true, 'asOverride': false, 'type': 'neighborgeneral'},
+
+              'neighborTimers': {'keepAliveInterval': n.keepalive | default(60), 'holdTime': n.holdtime | default(180), 'minimumHoldTime': 0, 'type': 'neighbortimers'},
+              'neighborFiltering': {'neighborRouteMap': [
+                  {'filterUpdateAction': 'IN', 'routeMap': {'type': 'RouteMap', 'id': _rmmap[n.route_map_in]}, 'type': 'neighborroutemap'},
+                  {'filterUpdateAction': 'OUT', 'routeMap': {'type': 'RouteMap', 'id': _rmmap[n.route_map_out]}, 'type': 'neighborroutemap'}]}
+            }) -%}
+          {%- endfor -%}
+          {%- for w in bgp_networks -%}
+            {%- set _ = ns.nw.append({'ipv4Address': {'type': 'Network', 'id': _nmap[w]}}) -%}
+          {%- endfor -%}
+          {{ {'type': 'bgp', 'name': 'bgp', 'addressFamilyIPv4':
+              {'type': 'afipv4', 'neighbors': ns.nb, 'networks': ns.nw}} | to_json }}
+
+    - name: Create the BGP process if none exists
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/bgp"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body: "{{ _bgp_body | from_json }}"
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      when: (_bgpstate.results[1].json.get('items', []) | length) == 0
+
+    # Per-neighbor WEIGHT, applied as a read-modify-write on FMC's OWN object.
+    # Building neighborAdvanced by hand never works; letting FMC create the BGP process first
+    # and only changing neighborWeight inside the structure it returns does (verified: 200,
+    # weights 200/100 readable back). maximumPaths must be dropped or FMC answers 500
+    # "MaximumPaths is deprecated, use ebgp and ibgp instead" - it returns a field it refuses.
+    # Fresh token: FMC caps concurrent API tokens and invalidates the oldest, so a token taken
+    # at the start of a long role can be dead by the end of it - this write failed with
+    # 401 "Access token invalid." one second after the GET above succeeded on the same token.
+    - name: Refresh the FMC token before the weight write
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth_w
+      until: fmc_auth_w is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Re-read the BGP process so FMC's own defaults are preserved
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/bgp?expanded=true&limit=10"
+        method: GET
+        headers: { X-auth-access-token: "{{ fmc_auth_w.x_auth_access_token }}" }
+        validate_certs: no
+      delegate_to: localhost
+      register: _bgpread
+
+    - name: Apply per-neighbor BGP weight
+      vars:
+        _bgpobj: "{{ (_bgpread.json.get('items', []) + [{}]) | first }}"
+        _wmap: "{{ dict(bgp_neighbors | map(attribute='ip') | zip(bgp_neighbors | map(attribute='weight', default=0))) }}"
+        _wbody: >-
+          {%- set o = _bgpobj | dict2items | rejectattr('key', 'in', ['links', 'metadata']) | items2dict -%}
+          {%- set af = o.addressFamilyIPv4 | dict2items | rejectattr('key', 'in', ['maximumPaths']) | items2dict -%}
+          {%- set ns = namespace(nb=[]) -%}
+          {%- for n in af.neighbors | default([]) -%}
+            {%- set nn = n | dict2items | rejectattr('key', 'in', ['links', 'metadata']) | items2dict -%}
+            {%- set adv = (nn.neighborAdvanced | default({})) | combine({'neighborWeight': _wmap.get(nn.ipv4Address, 0)}) -%}
+            {%- set _ = ns.nb.append(nn | combine({'neighborAdvanced': adv})) -%}
+          {%- endfor -%}
+          {{ o | combine({'addressFamilyIPv4': af | combine({'neighbors': ns.nb})}) | to_json }}
+      ansible.builtin.uri:
+        url: "{{ _rbase }}/bgp/{{ _bgpobj.id }}"
+        method: PUT
+        headers: { X-auth-access-token: "{{ fmc_auth_w.x_auth_access_token }}" }
+        body_format: json
+        body: "{{ _wbody | from_json }}"
+        status_code: [200, 201]
+        validate_certs: no
+      delegate_to: localhost
+      when:
+        - _bgpobj.id is defined
+        - (_bgpobj.addressFamilyIPv4.neighbors | default([])) | length > 0

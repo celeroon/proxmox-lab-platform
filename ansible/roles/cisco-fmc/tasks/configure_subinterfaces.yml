@@ -1,0 +1,86 @@
+---
+# Create FTD sub-interfaces (VLAN subifs) via FMC. Idempotent: skips any whose
+# ifname already exists. Resolves the device id and security-zone ids by name.
+# Runs from the controller (uri + delegate_to: localhost) -> VM uses connection: local.
+#
+# Required:
+#   fmc_host      - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   ftd_device    - managed device name (e.g. ftd-1)
+#   subinterfaces - list of {interface, sub_id, vlan, ifname, ip, netmask, zone}
+#                   e.g. {interface: Ethernet0/1, sub_id: 100, vlan: 100,
+#                         ifname: SERVERS, ip: 192.168.100.1, netmask: 24, zone: SERVERS_ZONE}
+# Optional: fmc_user/fmc_pass (default admin / {{ fmc_admin_password }})
+
+- name: Configure FTD sub-interfaces
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Resolve device id and security zones
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/{{ item }}?limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: [ "devices/devicerecords", "object/securityzones", ]
+      register: _lookup
+
+    - name: Map ids
+      ansible.builtin.set_fact:
+        _dev_id: "{{ (_lookup.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _zmap: "{{ dict(_lookup.results[1].json.get('items', []) | map(attribute='name') | zip(_lookup.results[1].json.get('items', []) | map(attribute='id'))) }}"
+
+    - name: List existing sub-interfaces
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id }}/subinterfaces?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: fmc_subs
+
+    - name: Create missing sub-interfaces
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id }}/subinterfaces"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "SubInterface"
+          name: "{{ item.interface }}"
+          subIntfId: "{{ item.sub_id }}"
+          vlanId: "{{ item.vlan }}"
+          ifname: "{{ item.ifname }}"
+          enabled: true
+          MTU: "{{ item.mtu | default(1500) }}"
+          ipv4:
+            static:
+              address: "{{ item.ip }}"
+              netmask: "{{ item.netmask }}"
+          securityZone:
+            id: "{{ _zmap[item.zone] }}"
+            type: "SecurityZone"
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ subinterfaces | default([]) }}"
+      when: item.ifname not in (fmc_subs.json.get('items', []) | selectattr('ifname', 'defined') | map(attribute='ifname') | list)

@@ -11,8 +11,8 @@
 # The FTD side is driven with sshpass because clish accepts a single command
 # argument over ssh and returns rc=0 (verified against FTDv 10.0).
 #
-# Idempotent: re-running skips the FTD side once a manager is configured, and
-# skips the FMC side once a device of the same name exists.
+# Idempotent: re-running skips the FTD side once a manager pointing at this FMC is
+# configured, and skips the FMC side once a device of the same name exists.
 #
 # Required:
 #   fmc_host        - FMC mgmt IP. In a scenario use the injected {{ fmc_1_ip }}.
@@ -93,17 +93,36 @@
       # the arbiter here — 124 (timeout) can still mean the manager was configured — so
       # the confirm task below decides.
       failed_when: false
-      when: "'Managed locally' in ftd_mgr.stdout"
+      # Guard on the FMC host, not on "Managed locally": `show managers` has THREE states —
+      # "Managed locally." (FDM), "No managers configured." (nothing at all, which is where a
+      # half-finished add leaves the box), and a real manager block listing "Host : <fmc>".
+      # Keying on the FDM string skipped the add in the middle state and left the FTD orphaned.
+      when: fmc_host not in ftd_mgr.stdout
 
     # Confirm the manager actually took rather than trusting console wording, which
-    # differs between a first add and a re-add.
+    # differs between a first add and a re-add. Assert the FMC host is PRESENT: the old
+    # check only rejected "Managed locally", so "No managers configured." — an add that
+    # deleted the local manager and then died — sailed through as success, and the play
+    # went on to register a device that would never dial home.
     - name: Confirm the FTD now has a manager
       ansible.builtin.shell:
         cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'show managers'"
       delegate_to: localhost
       register: ftd_mgr2
       changed_when: false
-      failed_when: "'Managed locally' in ftd_mgr2.stdout"
+      failed_when: false
+      until: fmc_host in (ftd_mgr2.stdout | default(''))
+      retries: "{{ ftd_confirm_retries | default(6) }}"
+      delay: "{{ ftd_confirm_delay | default(10) }}"
+
+    - name: Fail when the manager did not take
+      ansible.builtin.fail:
+        msg: >-
+          `configure manager add {{ fmc_host }}` did not take on {{ _ftd_host }} —
+          `show managers` still reports "{{ ftd_mgr2.stdout | default('') | trim }}".
+          A bare "No managers configured." means the local manager was removed but the
+          remote add never completed; re-running this role adds it.
+      when: fmc_host not in (ftd_mgr2.stdout | default(''))
 
     # ── FMC: authenticate ────────────────────────────────────────────────────
     # Tokens are short-lived, so this runs immediately before the calls that use
@@ -155,10 +174,14 @@
       register: acp_new
       when: _acp_name not in (acp_list.json.get('items', []) | map(attribute='name') | list)
 
+    # Test `is not skipped`, NOT `is changed`: the uri module hardcodes changed=False and only
+    # flips it when `dest:` writes a file, so a successful POST still reports ok/not-changed.
+    # `is changed` made this always fall through to acp_list — the listing from BEFORE the
+    # create — which on a fresh FMC is empty, so `first` raised "sequence was empty".
     - name: Settle on the policy id
       ansible.builtin.set_fact:
         _acp_id: >-
-          {{ acp_new.json.id if acp_new is changed
+          {{ acp_new.json.id if acp_new is not skipped
              else (acp_list.json.get('items', []) | selectattr('name', 'equalto', _acp_name)
                    | map(attribute='id') | first) }}
 
@@ -172,6 +195,50 @@
         validate_certs: no
       delegate_to: localhost
       register: dev_list
+
+    # Destroying an FTD VM does NOT remove its FMC device record, and FMC keeps reporting the
+    # orphan as health=green / isConnected=true for a long while. Registration takes BOTH sides,
+    # so an FTD that was not already pointing at this FMC cannot be the owner of an existing
+    # record of its name — that record is a leftover. Left in place it made the add skip, and
+    # the wait below then saw the STALE record's sw_version and passed instantly: a false
+    # success for a device that was never actually registered.
+    - name: Decide whether an existing device record is stale
+      ansible.builtin.set_fact:
+        _dev_rec: >-
+          {{ (dev_list.json.get('items', []) | selectattr('name', 'equalto', _dev_name) | list + [{}]) | first }}
+        _ftd_was_managed: "{{ fmc_host in ftd_mgr.stdout }}"
+
+    - name: Remove the stale device record
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_rec.id }}"
+        method: DELETE
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+        status_code: [200, 202, 204]
+      delegate_to: localhost
+      when:
+        - _dev_rec.id is defined
+        - not (_ftd_was_managed | bool)
+
+    - name: Wait for the stale record to disappear
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dev_recheck
+      until: >-
+        {{ dev_recheck.status | default(-1) == 200 and
+           (dev_recheck.get('json', {}).get('items', [])
+            | selectattr('name', 'equalto', _dev_name) | list | length) == 0 }}
+      retries: "{{ ftd_stale_retries | default(20) }}"
+      delay: "{{ ftd_stale_delay | default(15) }}"
+      when:
+        - _dev_rec.id is defined
+        - not (_ftd_was_managed | bool)
 
     - name: Add the device to FMC
       uri:
@@ -190,7 +257,8 @@
         validate_certs: no
         status_code: [200, 201, 202]
       delegate_to: localhost
-      when: _dev_name not in (dev_list.json.get('items', []) | map(attribute='name') | list)
+      # Any stale record was deleted above, so "record exists" now means a genuine pairing.
+      when: not (_dev_rec.id is defined and (_ftd_was_managed | bool))
 
     # Registration is asynchronous — the POST returns a task id, and the device
     # only appears once the sftunnel is up. sw_version is populated from the
@@ -204,8 +272,12 @@
         validate_certs: no
       delegate_to: localhost
       register: dev_check
+      # .get('json', {}) not .json: a transient GET failure (timeout, 500, FMC busy under
+      # registration load) returns a result with no 'json' key at all, and `.json` then raises
+      # inside the until expression — which aborts the play instead of retrying, defeating the
+      # retries below. `.get` is a plain dict method, so it is always safe to call.
       until: >-
-        dev_check.json.get('items', [])
+        dev_check.get('json', {}).get('items', [])
         | selectattr('name', 'equalto', _dev_name)
         | selectattr('sw_version', 'defined')
         | list | length > 0

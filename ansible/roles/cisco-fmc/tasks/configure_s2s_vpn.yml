@@ -1,0 +1,236 @@
+---
+# Create route-based (VTI) site-to-site VPN topologies via FMC, end to end: the
+# point-to-point IKEv2 topology, its two endpoints (local FTD HA-pair bound to the VTI +
+# the extranet branch peer), and the IKE (PSK + policy) and IPsec (proposal) settings.
+# Idempotent: a topology and its endpoints/settings are built only if the topology name
+# does not already exist (existing topologies are skipped whole).
+# The 422 "VPN supports only routed mode interfaces" is NOT about deployment state, despite
+# how it reads: it means the TOPOLOGY was created policy-based. Verified against FMCv 10.0
+# with fully deployed VTIs — the identical endpoint POST is 422 when the topology has
+# routeBased false and 201 when true. See the create-topology task below.
+#
+# NOT idempotent after a partial failure: the guard below is "topology name does not exist",
+# so a topology created in a failed run is skipped forever and never gets its endpoints. Such
+# a topology has to be deleted before re-running. Repairing it in place is the real fix.
+#
+# Required:
+#   fmc_host    - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   ftd_device  - a managed device in the HA pair (e.g. ftd-1), used to find the HA pair + VTIs
+#   s2s_vpns    - list of {name, local_vti, peer_name, peer_ip}
+# Optional: s2s_psk (default vagrant), ike_policy (default DES-SHA-SHA-LATEST),
+#           ipsec_proposal (default DES_SHA-1); fmc_user/fmc_pass
+- name: Configure FTD site-to-site VPN (VTI)
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+    _pbase: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/ftds2svpns"
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Resolve HA pair, device, topologies, ike policy, ipsec proposal
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/{{ item }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop:
+        - "devicehapairs/ftddevicehapairs"
+        - "devices/devicerecords"
+        - "policy/ftds2svpns"
+        - "object/ikev2policies"
+        - "object/ikev2ipsecproposals"
+      register: _s2slk
+
+    - name: Map ids
+      ansible.builtin.set_fact:
+        _ha: "{{ (_s2slk.results[0].json.get('items', []) | first) | default({}) }}"
+        _dev_id: "{{ (_s2slk.results[1].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _existing_s2s: "{{ _s2slk.results[2].json.get('items', []) | selectattr('name','defined') | map(attribute='name') | list }}"
+        _s2smap: "{{ dict(_s2slk.results[2].json.get('items', []) | selectattr('name','defined') | map(attribute='name')
+                     | zip(_s2slk.results[2].json.get('items', []) | selectattr('name','defined') | list)) }}"
+        _ikepol_id: "{{ (_s2slk.results[3].json.get('items', []) | selectattr('name','equalto', ike_policy | default('DES-SHA-SHA-LATEST')) | first).id }}"
+        _prop_id: "{{ (_s2slk.results[4].json.get('items', []) | selectattr('name','equalto', ipsec_proposal | default('DES_SHA-1')) | first).id }}"
+
+    - name: Map device VTIs (ifname -> id)
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id }}/virtualtunnelinterfaces?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: _vtis
+
+    - name: Build VTI map
+      ansible.builtin.set_fact:
+        _vtimap: "{{ dict(_vtis.json.get('items', []) | selectattr('ifname','defined') | map(attribute='ifname')
+                     | zip(_vtis.json.get('items', []) | selectattr('ifname','defined') | map(attribute='id'))) }}"
+
+    # Convergence, not just creation. Everything below keys off _new (topologies created by
+    # THIS run), so a topology left half-built by an interrupted run — policy-based, or missing
+    # its endpoints — was skipped forever and silently reported success while doing nothing.
+    # Any existing topology of ours that is not complete is torn down here so it gets rebuilt.
+    - name: Count endpoints on existing topologies of ours
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ _s2smap[item.name].id }}/endpoints?limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ s2s_vpns | default([]) | selectattr('name', 'in', _existing_s2s) | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _epcount
+
+    - name: Delete incomplete topologies so they are rebuilt
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ _s2smap[item.item.name].id }}"
+        method: DELETE
+        headers: "{{ _hdr }}"
+        validate_certs: no
+        status_code: [200, 202, 204]
+      delegate_to: localhost
+      loop: "{{ _epcount.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }
+      when: >-
+        (item.get('json', {}).get('items', []) | length) < 2
+        or not (_s2smap[item.item.name].get('routeBased', false) | bool)
+      register: _s2sdel
+
+    - name: Re-read topologies after the cleanup
+      ansible.builtin.uri:
+        url: "{{ _pbase }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: _s2srelist
+      when: _s2sdel.changed | default(false) or (_s2sdel.results | default([]) | rejectattr('skipped', 'defined') | list | length) > 0
+
+    - name: Refresh the existing-topology list
+      ansible.builtin.set_fact:
+        _existing_s2s: "{{ _s2srelist.json.get('items', []) | selectattr('name','defined') | map(attribute='name') | list }}"
+      when: _s2srelist is not skipped
+
+    - name: Create missing S2S topologies
+      ansible.builtin.uri:
+        url: "{{ _pbase }}"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        # routeBased: true is REQUIRED for a VTI topology. Without it FMC treats the topology
+        # as policy-based and rejects the VTI endpoint with 422 "Unsupported or Invalid value
+        # for endpoint interface. VPN supports only routed mode interfaces." — which reads like
+        # an interface problem but is really a property of the topology. Verified against
+        # FMCv 10.0: identical endpoint POST is 422 with routeBased false, 201 with it true.
+        body: { type: "FTDS2SVpn", name: "{{ item.name }}", topologyType: "POINT_TO_POINT", ikeV2Enabled: true, ikeV1Enabled: false, routeBased: true }
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ s2s_vpns | default([]) }}"
+      loop_control: { label: "{{ item.name }}" }
+      when: item.name not in _existing_s2s
+      register: _new
+
+    - name: Add local (HA + VTI) endpoint
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ item.json.id }}/endpoints"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "EndPoint"
+          peerType: "PEER"
+          extranet: false
+          connectionType: "BIDIRECTIONAL"
+          sendTunnelInterfaceIpToPeer: true
+          allowIncomingIKEv2Routes: true
+          enableNatTraversal: true
+          name: "{{ _ha.name }}"
+          # id alone is not enough: FMC rejects a nameless reference with 400 "Node name is
+          # empty, too long, or too short". The interface type is VTIInterface, as FMC itself
+          # reports it on the object — not "VTI".
+          device: { type: "DeviceHAPair", id: "{{ _ha.id }}", name: "{{ _ha.name }}" }
+          interface: { type: "VTIInterface", id: "{{ _vtimap[item.item.local_vti] }}", name: "{{ item.item.local_vti }}" }
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _new.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }
+
+    # IKEv2 settings MUST be set before the extranet endpoint is added. FMC defaults a new
+    # topology to automatic PSK, and rejects the extranet POST with "Automatic preshared key
+    # generation is not supported if one or more endpoint nodes are Extranet". Putting the
+    # manual PSK in place first is the whole fix — the extranet body itself was always fine.
+    - name: Set IKEv2 (PSK + policy) on new topologies
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ item.json.id }}/ikesettings/{{ item.json.ikeSettings.id }}"
+        method: PUT
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "IkeSetting"
+          ikeV2Settings:
+            authenticationType: "MANUAL_PRE_SHARED_KEY"
+            manualPreSharedKey: "{{ s2s_psk | default('vagrant') }}"
+            policies: [ { type: "IKEv2Policy", id: "{{ _ikepol_id }}" } ]
+        status_code: [200, 201]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _new.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }
+
+    - name: Add extranet (branch peer) endpoint
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ item.json.id }}/endpoints"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "EndPoint"
+          peerType: "PEER"
+          extranet: true
+          connectionType: "ORIGINATE_ONLY"
+          allowIncomingIKEv2Routes: true
+          enableNatTraversal: true
+          name: "{{ item.item.peer_name }}"
+          extranetInfo: { name: "Extranet", ipAddress: "{{ item.item.peer_ip }}", isDynamicIP: false }
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _new.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }
+
+    - name: Set IPsec proposal on new topologies
+      ansible.builtin.uri:
+        url: "{{ _pbase }}/{{ item.json.id }}/ipsecsettings/{{ item.json.ipsecSettings.id }}"
+        method: PUT
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "IPSecSetting"
+          ikeV2Mode: "TUNNEL"
+          cryptoMapType: "STATIC"
+          lifetimeSeconds: 28800
+          perfectForwardSecrecy: { enabled: false }
+          ikeV2IpsecProposal: [ { type: "IKEv2IPsecProposal", id: "{{ _prop_id }}" } ]
+        status_code: [200, 201]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _new.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }

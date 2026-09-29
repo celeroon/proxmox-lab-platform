@@ -1094,7 +1094,11 @@ def _generate_vm_playbook(
         # FMCv smart-licensing: the role skips itself when the token is empty, so this is
         # inert for every scenario that does not use it. Password is the one the FTD/FMC
         # packer build bakes in; a scenario can override either via task vars.
-        "fmc_token": get_settings().fmc_smart_token,
+        # The SSM token goes through VERBATIM. The %0A/%3D in a pasted token are part of the
+        # string SSM validates, not encoding to undo — decoding them makes Cisco answer "The
+        # token '...' is not valid" (seen in the FMC's /var/log/smart_agent.log, while the GUI
+        # succeeds with the same token pasted raw). Only trim real whitespace from the .env value.
+        "fmc_token": get_settings().fmc_smart_token.strip(),
         "fmc_admin_password": "SuperPassword123$",
     }
     # Also a real play var, not only a {{ vm_mgmt_ip }} substitution into task vars:

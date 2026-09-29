@@ -1,0 +1,84 @@
+---
+# One deployment attempt: re-read the deployable set, then POST it.
+#
+# This exists as a separate file because the device list and version stamp MUST be rebuilt on
+# every attempt. FMC validates the request against its CURRENT deployable set and rejects a
+# stale one with "The device list in Request does not match the deployable devices" — which is
+# easy to hit because FMC auto-deploys a freshly registered FTD while we are retrying, so a
+# device that was deployable when we built the list is DEPLOYED by the time the POST lands.
+# A single uri task with `until` cannot do this: it would re-send the same body every retry.
+#
+# Included in a loop by deploy_pending.yml; sets dep_req for the caller.
+
+- name: Pause between deployment attempts
+  ansible.builtin.pause:
+    seconds: "{{ deploy_post_delay | default(30) }}"
+  when:
+    - not (_dep_done | default(false))
+    - item | int > 0
+
+- name: Re-read the deployable set for this attempt
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: dep_now
+
+  when: not (_dep_done | default(false))
+- name: Select targets for this attempt
+  ansible.builtin.set_fact:
+    _targets_now: >-
+      {{ (dep_now.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list)
+         if (deploy_all | default(false) | bool)
+         else (dep_now.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true)
+               | selectattr('name', 'in', _dep_names) | list) }}
+
+  when: not (_dep_done | default(false))
+- name: Request the deployment
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deploymentrequests"
+    method: POST
+    headers:
+      X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+    body_format: json
+    body:
+      type: DeploymentRequest
+      version: "{{ _targets_now | map(attribute='version') | map('int') | max | string }}"
+      forceDeploy: "{{ deploy_force | default(false) | bool }}"
+      ignoreWarning: "{{ deploy_ignore_warning | default(true) | bool }}"
+      deviceList: "{{ _targets_now | map(attribute='id') | list }}"
+    validate_certs: no
+    status_code: [200, 201, 202, 400, 500]
+  delegate_to: localhost
+  register: dep_try
+  failed_when: false
+  when:
+    - not (_dep_done | default(false))
+    - _targets_now | length > 0
+
+- name: Keep this attempt's result
+  ansible.builtin.set_fact:
+    dep_req: "{{ dep_try }}"
+  when:
+    - not (_dep_done | default(false))
+    - dep_try is not skipped
+
+# Nothing deployable any more: FMC finished the work while we were retrying. Synthesise the
+# same no-op result the caller recognises, so it reports success instead of a stale failure.
+- name: Note that nothing is deployable any more
+  ansible.builtin.set_fact:
+    dep_req: "{{ {'status': 500, 'json': {'error': {'messages': [{'description': 'There are no devices for deployment.'}]}}} }}"
+  when:
+    - not (_dep_done | default(false))
+    - _targets_now | length == 0
+
+- name: Mark the deployment attempt loop finished
+  ansible.builtin.set_fact:
+    _dep_done: true
+  when: >-
+    not (_dep_done | default(false))
+    and ((_targets_now | length == 0)
+         or (dep_try.status | default(-1) in [200, 201, 202]))

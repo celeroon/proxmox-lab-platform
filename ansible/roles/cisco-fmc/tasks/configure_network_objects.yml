@@ -1,0 +1,60 @@
+---
+# Create FMC network (host/subnet) objects. Idempotent: lists existing objects and
+# POSTs only the ones that are missing, so a re-run is a no-op. Runs from the
+# controller (uri + delegate_to: localhost), so the owning VM uses connection: local.
+#
+# Required:
+#   fmc_host          - FMC mgmt IP (use {{ fmc_1_ip }} in a scenario)
+#   network_objects   - list of {name, value}; value is a subnet or host IP, e.g.
+#                       {name: "BR1-192.168.10.0-24", value: "192.168.10.0/24"}
+# Optional:
+#   fmc_user/fmc_pass - API creds (default: admin / {{ fmc_admin_password }})
+
+- name: Create FMC network objects
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: List existing network objects
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ fmc_auth.domain_uuid }}/object/networks?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: fmc_nets
+
+    - name: Create missing network objects
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ fmc_auth.domain_uuid }}/object/networks"
+        method: POST
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          value: "{{ item.value }}"
+          type: "Network"
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ network_objects | default([]) }}"
+      when: item.name not in (fmc_nets.json.get('items', []) | map(attribute='name') | list)
+      register: fmc_net_create

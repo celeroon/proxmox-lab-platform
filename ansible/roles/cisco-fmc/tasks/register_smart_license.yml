@@ -9,13 +9,18 @@
 # response header key `x_auth_access_token` — ansible's uri module normalises response
 # headers to snake_case, so `fmc_auth['x-auth-access-token']` raises "object of type 'dict'
 # has no attribute". GET smartlicenses returns 200 with items[0].regStatus (UNREGISTERED
-# before registering). The POST that actually registers is NOT exercised here — it creates a
-# product instance in SSM, so it stays unverified until a real deploy runs it. Schema
-# confirmed against /opt/lab/fmc-smartlicense-test.sh: registrationType=REGISTER, not regStatus.
+# before registering). The register POST returns 201 with regStatus=RESERVATION_IN_PROGRESS and
+# is only a queue — the real outcome comes back from Cisco asynchronously ~2s later, and a
+# rejection silently reverts regStatus to UNREGISTERED. Schema confirmed against
+# /opt/lab/fmc-smartlicense-test.sh: registrationType=REGISTER, not regStatus.
 #
 # Required to run:
 #   fmc_token - SSM registration token (from Settings.fmc_smart_token / .env FMC_SMART_TOKEN;
 #               pass via extra_vars — never commit). Empty = registration skipped.
+#               Must arrive VERBATIM, %0A/%3D and all. Do not URL-decode it: SSM then
+#               answers "The token '...' is not valid" while the POST still returns 201,
+#               so this role just polls out its retries. The real verdict is only in the
+#               FMC's /var/log/smart_agent.log (SAEVT_REGISTER_STATUS), not in the API.
 # Optional vars:
 #   fmc_host  - FMC mgmt IP (default: the VM's mgmt IP {{ vm_mgmt_ip }})
 #   fmc_port  - API port (default: 443)
@@ -40,6 +45,27 @@
       retries: 40          # FMC API can take 30-40m after firstboot to come up
       delay: 60
 
+    # Idempotency: if the FMC is already REGISTERED (e.g. a manual GUI override, or a prior
+    # run), do NOT POST another register — a re-register would churn the working registration
+    # (SSM override -> transient RESERVATION_IN_PROGRESS/UNREGISTERED). Only register when needed.
+    - name: Check current smart-license status
+      uri:
+        url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ fmc_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: fmc_lic_pre
+
+    # Read the 'items' KEY with .get: fmc_lic_pre.json['items'] silently resolves to the
+    # dict.items METHOD whenever FMC omits the key, and the failure is then the baffling
+    # "'method' object is not iterable". Appending a fallback before |first also avoids
+    # indexing [0] into an empty list.
+    - name: Note the current registration status
+      ansible.builtin.set_fact:
+        _pre_reg: "{{ (fmc_lic_pre.json.get('items', []) | map(attribute='regStatus') | list + ['UNKNOWN']) | first }}"
+
     - name: Register the FMC with Smart Software Manager
       uri:
         url: "https://{{ fmc_host | default(vm_mgmt_ip) }}:{{ fmc_port | default(443) }}/api/fmc_platform/v1/license/smartlicenses"
@@ -50,10 +76,16 @@
         body:
           registrationType: REGISTER
           token: "{{ fmc_token }}"
-          force: false
+          # force = "override the existing registered instance". On a rebuild the FMC VM keeps
+          # its UUID, so SSM still has it registered from before; without override SSM rejects
+          # the re-registration. (GUI: "Override the Existing Registered Management Center
+          # Instance".) NB: an API override against a stale SSM instance may not complete — the
+          # GUI override / removing the old instance in the SSM portal is the reliable path.
+          force: true
         validate_certs: no
         status_code: [200, 201]
       delegate_to: localhost
+      when: _pre_reg != "REGISTERED"
 
     - name: Wait until the smart license reports REGISTERED
       uri:
@@ -64,6 +96,22 @@
         validate_certs: no
       delegate_to: localhost
       register: fmc_lic
-      until: fmc_lic.json['items'][0].regStatus == "REGISTERED"
+      until: fmc_lic.get('json', {}).get('items', []) | selectattr('regStatus', 'equalto', 'REGISTERED') | list | length > 0
       retries: 20
       delay: 15
+      when: _pre_reg != "REGISTERED"
+      # Registration failing MUST NOT abort the deploy — the FMC/FTD run fully in eval mode
+      # (BGP, VPN, NAT, ACL all work unlicensed). If the SSM override can't complete it just
+      # stays UNREGISTERED and we carry on.
+      ignore_errors: yes
+
+    - name: Report smart-license registration result
+      vars:
+        _reg: >-
+          {{ ((fmc_lic.get('json', {}).get('items', []) | map(attribute='regStatus') | list
+               if (fmc_lic is defined and fmc_lic is not skipped) else []) + [_pre_reg]) | first }}
+      ansible.builtin.debug:
+        msg: >-
+          Smart license regStatus={{ _reg }}.
+          {{ '(registered)' if _reg == 'REGISTERED'
+             else '(NOT registered — continuing in eval mode; BGP/VPN/NAT/ACL all work unlicensed. The REST API never says why: read SAEVT_REGISTER_STATUS in the FMC /var/log/smart_agent.log for Cisco verbatim reason.)' }}

@@ -230,6 +230,10 @@ vms:
         - task: cisco-fmc/deploy_pending
           vars:
             fmc_host: "{{ fmc_1_ip }}"
+            # deploy_all, not just this VM: create_ha_pair below waits for BOTH peers to be
+            # clean, and registering ftd-2 leaves ftd-1 dirty again. Defaulting to ftd-2 only
+            # meant nobody ever pushed ftd-1, so that wait could only ever time out.
+            deploy_all: true
         # HA runs on the SECONDARY: by now both units are registered, deployed and
         # green, which is what formation needs. Single link — Ethernet0/3 carries both
         # failover and state (vnic5 = hq-failover). Skips if the pair already exists.
@@ -244,6 +248,117 @@ vms:
             ha_active_ip: 192.168.255.1
             ha_standby_ip: 192.168.255.2
             ha_netmask: 255.255.255.252
+        # ─── HQ FTD data-plane, driven over the FMC REST API (all idempotent GET-then-create,
+        # run after HA forms). Order: zones -> objects -> physical ifaces/routes -> subifs/VTIs ->
+        # prefix-lists/route-maps -> NAT/ACL -> S2S -> BGP -> push. BGP create-path + S2S endpoint
+        # attach are only skip-tested here; validate them on the first fresh FTD rebuild.
+        - task: cisco-fmc/configure_security_zones
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            security_zones:
+              - {name: OUTSIDE_ISP1_ZONE}
+              - {name: OUTSIDE_ISP2_ZONE}
+              - {name: INSIDE_ZONE}
+              - {name: SERVERS_ZONE}
+              - {name: WAN1_BR1_VTI_1_ZONE}
+              - {name: WAN2_BR1_VTI_1_ZONE}
+        - task: cisco-fmc/configure_network_objects
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            network_objects:
+              - {name: "BR1-192.168.10.0-24", value: "192.168.10.0/24"}
+              - {name: "SERVERS-192.168.100.0-24", value: "192.168.100.0/24"}
+              - {name: "USERS-192.168.200.0-24", value: "192.168.200.0/24"}
+        - task: cisco-fmc/configure_physical_interfaces
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            phy_interfaces:
+              # Zones matter: the NAT rule and the access rules below reference
+              # OUTSIDE_ISP1_ZONE, and a zone with no interface in it matches nothing —
+              # the policy deploys clean and silently drops the traffic it should permit.
+              - {name: Ethernet0/0, ifname: ISP1, ip: 192.0.2.2, netmask: 29, zone: OUTSIDE_ISP1_ZONE}
+              - {name: Ethernet0/2, ifname: ISP2, ip: 198.51.100.2, netmask: 29, zone: OUTSIDE_ISP2_ZONE}
+              # Trunk parent for the SERVERS sub-interface (vnic3, the trunk to sw-hq). It
+              # carries no address, but FMC leaves a physical interface enabled:false and does
+              # NOT enable it when a sub-interface is added — so without this the VLAN is down.
+              - {name: Ethernet0/1}
+        - task: cisco-fmc/configure_static_routes
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            static_routes:
+              - {interface: ISP1, networks: [any-ipv4], gateway: 192.0.2.1, metric: 1}
+              - {interface: ISP2, networks: [any-ipv4], gateway: 198.51.100.1, metric: 10}
+        - task: cisco-fmc/configure_subinterfaces
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            subinterfaces:
+              - {interface: Ethernet0/1, sub_id: 100, vlan: 100, ifname: SERVERS, ip: 192.168.100.1, netmask: 24, zone: SERVERS_ZONE}
+        - task: cisco-fmc/configure_vtis
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            vtis:
+              - {ifname: WAN1_BR1_vti_1, tunnel_id: 1, ip: 169.254.2.1, netmask: 30, source: Ethernet0/0, zone: WAN1_BR1_VTI_1_ZONE}
+              - {ifname: WAN2_BR1_vti_1, tunnel_id: 2, ip: 169.254.3.1, netmask: 30, source: Ethernet0/2, zone: WAN2_BR1_VTI_1_ZONE}
+        # Push the interfaces/VTIs FIRST — a VTI must be deployed before it can be used as
+        # an S2S VPN endpoint (FMC rejects an undeployed VTI with "only routed mode interfaces").
+        - task: cisco-fmc/deploy_pending
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            deploy_all: true
+        - task: cisco-fmc/configure_prefix_lists
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            prefix_lists:
+              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.10.0/24"}]}
+              - {name: HQ_BGP_OUT, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.100.0/24"}, {sequence: 20, action: PERMIT, ipAddress: "192.168.200.0/24"}]}
+        - task: cisco-fmc/configure_route_maps
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            route_maps:
+              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_IN}]}
+              - {name: HQ_BGP_PRI_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
+              - {name: HQ_BGP_SEC_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
+        - task: cisco-fmc/configure_nat
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            nat_policy: HQ-NAT
+            auto_nat_rules:
+              - {original_network: "SERVERS-192.168.100.0-24", source_zone: SERVERS_ZONE, dest_zone: OUTSIDE_ISP1_ZONE, nat_type: DYNAMIC, interface_pat: true, dns: true}
+        - task: cisco-fmc/configure_access_rules
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            access_policy: lab-acp
+            access_rules:
+              - {name: SERVERS-INTERNET-ALLOW, action: ALLOW, src_zones: [SERVERS_ZONE], dst_zones: [OUTSIDE_ISP1_ZONE], src_nets: ["SERVERS-192.168.100.0-24"], dst_nets: []}
+              - {name: SERVERS-BR1, action: ALLOW, src_zones: [SERVERS_ZONE], dst_zones: [], src_nets: ["SERVERS-192.168.100.0-24"], dst_nets: ["BR1-192.168.10.0-24"]}
+              - {name: BR1-SERVERS, action: ALLOW, src_zones: [], dst_zones: [SERVERS_ZONE], src_nets: ["BR1-192.168.10.0-24"], dst_nets: ["SERVERS-192.168.100.0-24"]}
+        - task: cisco-fmc/configure_s2s_vpn
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            s2s_vpns:
+              - {name: VTI-BR1-WAN1, local_vti: WAN1_BR1_vti_1, peer_name: BR1, peer_ip: 192.0.2.10}
+              - {name: VTI-BR1-WAN2, local_vti: WAN2_BR1_vti_1, peer_name: BR1, peer_ip: 203.0.113.2}
+        - task: cisco-fmc/configure_bgp
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            bgp_as: "65100"
+            bgp_router_id: AUTOMATIC
+            bgp_neighbors:
+              - {ip: 169.254.2.2, remote_as: 65110, weight: 200, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_PRI_OUT}
+              - {ip: 169.254.3.2, remote_as: 65110, weight: 100, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_SEC_OUT}
+            bgp_networks: ["SERVERS-192.168.100.0-24", "USERS-192.168.200.0-24"]
+        # Push everything above to the HA pair.
+        - task: cisco-fmc/deploy_pending
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            deploy_all: true
 
   - name: sw-hq
     # The HQ switch sits behind the firewall pair — bring it up once both FTDs are in.
@@ -300,7 +415,7 @@ vms:
         - task: linux/set_hostname
           vars: {hostname: ubuntu-hq}
         - task: linux/configure_network_interfaces
-          vars: {lab_interface: ens19, lab_ip: 192.168.100.50, lab_prefix: 24, lab_gateway: 192.168.100.1}
+          vars: {lab_interface: ens19, lab_ip: 192.168.100.50, lab_prefix: 24, lab_gateway: 192.168.100.1, lab_dns: 8.8.8.8}
 
   # Windows client in the users VLAN. GPT/EFI image, so it needs ovmf + q35 + TPM 2.0;
   # vga:virtio avoids the Bochs fallback that pins the desktop to firmware resolution.
@@ -466,6 +581,7 @@ vms:
               - {name: "LAN10-192.168.10.0/24", subnet: "192.168.10.0 255.255.255.0"}
               - {name: "HQ-SERVERS-192.168.100.0/24", subnet: "192.168.100.0 255.255.255.0"}
               - {name: "HQ-USERS-192.168.200.0/24", subnet: "192.168.200.0 255.255.255.0"}
+              - {name: "BR3-192.168.30.0/24", subnet: "192.168.30.0 255.255.255.0"}
         - task: fortigate/configure_interfaces
           vars:
             interfaces:
@@ -483,8 +599,10 @@ vms:
             ipsec_tunnels:
               - {name: BR3-VPN1, interface: port2, remote_gw: 203.0.113.10, tunnel_ip: "169.254.10.1 255.255.255.255", tunnel_remote_ip: "169.254.10.2 255.255.255.255"}
               - {name: BR3-VPN2, interface: port3, remote_gw: 203.0.113.10, tunnel_ip: "169.254.11.1 255.255.255.255", tunnel_remote_ip: "169.254.11.2 255.255.255.255"}
-              - {name: HQ-VPN1,  interface: port2, remote_gw: 192.0.2.2}
-              - {name: HQ-VPN2,  interface: port3, remote_gw: 198.51.100.2}
+              - {name: HQ-VPN1,  interface: port2, remote_gw: 192.0.2.2,
+                 tunnel_ip: "169.254.2.2 255.255.255.255", tunnel_remote_ip: "169.254.2.1 255.255.255.252"}
+              - {name: HQ-VPN2,  interface: port3, remote_gw: 198.51.100.2,
+                 tunnel_ip: "169.254.3.2 255.255.255.255", tunnel_remote_ip: "169.254.3.1 255.255.255.252"}
         - task: fortigate/configure_ipsec_phase2
           vars:
             ipsec_phase2:
@@ -550,11 +668,14 @@ vms:
             bgp_config:
               as: "65110"
               router_id: 192.168.10.1
+              # link_down_failover + low hold/keepalive (15/5) so a dead WAN tunnel is
+              # withdrawn in seconds instead of waiting out the 180s default hold.
               neighbor:
-                - {ip: 169.254.10.2, remote_as: "65130", weight: 200, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out}
-                - {ip: 169.254.11.2, remote_as: "65130", weight: 100, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out}
-                - {ip: 169.254.1.1,  remote_as: "65100", weight: 200, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out}
-                - {ip: 169.254.2.1,  remote_as: "65100", weight: 100, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out}
+                - {ip: 169.254.10.2, remote_as: "65130", weight: 200, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
+                - {ip: 169.254.11.2, remote_as: "65130", weight: 100, soft_reconfiguration: enable, route_map_in: br3-bgp-in, route_map_out: br1-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
+                # Must match the FTD's VTI addresses (WAN1 169.254.2.1, WAN2 169.254.3.1).
+                - {ip: 169.254.2.1,  remote_as: "65100", weight: 200, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
+                - {ip: 169.254.3.1,  remote_as: "65100", weight: 100, soft_reconfiguration: enable, route_map_in: hq-bgp-in,  route_map_out: br1-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
               network:
                 - {id: 1, prefix: "192.168.10.0 255.255.255.0"}
         # LAN -> internet (via SD-WAN, NAT), and both S2S directions between LAN and the tunnels.
@@ -576,8 +697,8 @@ vms:
                 name: allow-s2s
                 srcintf: [{name: vlan10}]
                 dstintf: [{name: BR3-VPN1}, {name: BR3-VPN2}, {name: HQ-VPN1}, {name: HQ-VPN2}]
-                srcaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}]
-                dstaddr: [{name: "LAN10-192.168.10.0/24"}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
+                dstaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}, {name: "BR3-192.168.30.0/24"}]
                 action: accept
                 schedule: always
                 service: [{name: ALL}]
@@ -586,8 +707,8 @@ vms:
                 name: s2s-allow
                 srcintf: [{name: BR3-VPN1}, {name: BR3-VPN2}, {name: HQ-VPN1}, {name: HQ-VPN2}]
                 dstintf: [{name: vlan10}]
-                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
-                dstaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}, {name: "HQ-SERVERS-192.168.100.0/24"}, {name: "HQ-USERS-192.168.200.0/24"}, {name: "BR3-192.168.30.0/24"}]
+                dstaddr: [{name: "LAN10-192.168.10.0/24"}]
                 action: accept
                 schedule: always
                 service: [{name: ALL}]
@@ -657,6 +778,11 @@ vms:
 
   # ═══════════════════════ branch2 — FTD single, one ISP ═══════════════════════
   - name: ftd-3
+    # After ftd-2, not unordered: this registers to {{ fmc_1_ip }}, so it must not start
+    # before fmc-1 exists. Sequencing it behind ftd-2 also keeps it clear of the HA pair's
+    # deploy_all gate, which waits for EVERY device to leave DEPLOYMENT_IN_PROGRESS — a
+    # concurrent ftd-3 registration would make ftd-2 wait out ftd-3's ~11min auto-deploy.
+    depends_on: [ftd-2]
     template: cisco-ftd-3
     clone_mode: full
     ssh_timeout: 1800     # FTDv first boot runs the setup wizard; 300s default is far too short
@@ -815,9 +941,10 @@ vms:
             bgp_config:
               as: "65130"
               router_id: 192.168.30.1
+              # link_down_failover + low hold/keepalive (15/5) for fast WAN-tunnel failover.
               neighbor:
-                - {ip: 169.254.10.1, remote_as: "65110", weight: 200, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out}
-                - {ip: 169.254.11.1, remote_as: "65110", weight: 100, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out}
+                - {ip: 169.254.10.1, remote_as: "65110", weight: 200, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
+                - {ip: 169.254.11.1, remote_as: "65110", weight: 100, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
               network:
                 - {id: 1, prefix: "192.168.30.0 255.255.255.0"}
         # LAN -> internet (out port2, NAT) + both S2S directions between LAN and the tunnels.

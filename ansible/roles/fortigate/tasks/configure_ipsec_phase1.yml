@@ -1,8 +1,11 @@
 ---
 # Route-based IPsec phase1-interfaces (IKEv2). Var: ipsec_tunnels (list), each:
 #   {name, interface, remote_gw, psk?, net_device?(disable), proposal?(des-sha1),
-#    tunnel_ip?, tunnel_remote_ip?}   (ipsec_psk supplies psk when per-tunnel psk omitted)
+#    tunnel_ip?, tunnel_remote_ip?, dpd?, dpd_retryinterval?, dpd_retrycount?}
+#   (ipsec_psk supplies psk when per-tunnel psk omitted)
 # tunnel_ip/tunnel_remote_ip assign the APIPA transit IPs a BGP-over-tunnel peer needs.
+# DPD defaults to on-idle with a 5s x 3 retry so a dead peer is detected in ~15s (fast
+# VPN/BGP failover); pair with BGP link_down_failover + low hold timers on the neighbors.
 
 - name: Configure IPsec phase1-interfaces
   fortinet.fortios.fortios_vpn_ipsec_phase1_interface:
@@ -18,6 +21,9 @@
       proposal: "{{ item.proposal | default('des-sha1') }}"
       remote_gw: "{{ item.remote_gw }}"
       psksecret: "{{ item.psk | default(ipsec_psk) }}"
+      dpd: "{{ item.dpd | default('on-idle') }}"
+      dpd_retryinterval: "{{ item.dpd_retryinterval | default('5') }}"
+      dpd_retrycount: "{{ item.dpd_retrycount | default(3) }}"
   loop: "{{ ipsec_tunnels | default([]) }}"
   register: result
   until: result is success

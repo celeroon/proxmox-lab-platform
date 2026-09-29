@@ -26,6 +26,16 @@
     _fmc_user: "{{ fmc_user | default('admin') }}"
     _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
     _dev_name: "{{ deploy_device | default(vm_name) | default(inventory_hostname) }}"
+    # FMC's wording when a half-built VPN topology makes it refuse the whole deployment.
+    _dep_vpn_blocked: >-
+      {{ (_targets | default([]) | length > 0)
+         and (dep_req.status | default(-1) not in [200, 201, 202])
+         and ('Invalid Site to Site VPN' in (dep_req.get('json', {}) | to_json)
+              or 'Incomplete endpoint configuration' in (dep_req.get('json', {}) | to_json)) }}
+    # True only when the POST actually queued a job; the no-op path has no task id to poll.
+    _dep_queued: >-
+      {{ (_targets | default([]) | length > 0)
+         and (dep_req.status | default(-1) in [200, 201, 202]) }}
   block:
 
     - name: Get an FMC auth token
@@ -42,6 +52,97 @@
       until: dep_auth is succeeded
       retries: 10
       delay: 30
+
+    # Never request a deployment while FMC is already mid-deploy on the device. FMC AUTO-deploys
+    # a freshly registered FTD and that takes ~11 minutes (measured, FMCv 10.0). Pushing into
+    # that window failed with a bare "Deployment failed. Correct configuration error(s)" even
+    # though policy validation itself reported errorList => [] and maxErrorStatus => WARNING —
+    # the DEVICE was not ready (its detection engine had no SRUinfo yet). The run that waited
+    # succeeded; the run that pushed at ~90s after registration failed in 91s.
+    - name: Find the HA pair this device belongs to, if any
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/devicehapairs/ftddevicehapairs?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_ha
+
+    # Names this deployment may appear under. FMC lists an HA pair under the PAIR's name and
+    # never under its members, so filtering on the device name alone silently matched nothing
+    # and every per-device deploy became a no-op the moment HA existed.
+    - name: Note the names this device can appear under
+      ansible.builtin.set_fact:
+        _dep_names: >-
+          {{ [_dev_name] + (dep_ha.get('json', {}).get('items', [])
+             | selectattr('primary.name', 'defined')
+             | selectattr('primary.name', 'equalto', _dev_name) | map(attribute='name') | list)
+             + (dep_ha.get('json', {}).get('items', [])
+             | selectattr('secondary.name', 'defined')
+             | selectattr('secondary.name', 'equalto', _dev_name) | map(attribute='name') | list) }}
+
+    # FMC needs a moment to notice config written by the tasks before this one. Checking too
+    # soon reports "nothing pending" and skips the push — which is how the VTIs went undeployed
+    # and configure_s2s_vpn then failed with "VPN supports only routed mode interfaces".
+    # If nothing shows up within the grace window the device really is clean.
+    - name: Give FMC time to notice new config
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_appear
+      until: >-
+        {{ dep_appear.status | default(-1) == 200
+           and (dep_appear.get('json', {}).get('items', []) | length) > 0 }}
+      retries: "{{ deploy_appear_retries | default(6) }}"
+      delay: "{{ deploy_appear_delay | default(15) }}"
+      failed_when: false
+
+    # Re-register the auth var so every task after this uses a FRESH token. FMC tokens live
+    # ~30 min and are invalidated when the concurrent-token cap is hit (a GUI login does it),
+    # and the waits below can each run 10-20 min - a token taken at the top of the role is
+    # routinely dead by the time they finish. Seen as: 401 "Access token invalid." on a poll
+    # whose previous iteration succeeded.
+    - name: Refresh the FMC token before the deployment gates
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: dep_auth
+      until: dep_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Wait until no target device is mid-deployment
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/devices/devicerecords?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_devstat
+      until: >-
+        {{ dep_devstat.status | default(-1) == 200 and
+           ((dep_devstat.get('json', {}).get('items', [])
+             | selectattr('deploymentStatus', 'equalto', 'DEPLOYMENT_IN_PROGRESS')
+             | list | length) == 0
+            if (deploy_all | default(false) | bool)
+            else (dep_devstat.get('json', {}).get('items', [])
+                  | selectattr('name', 'equalto', _dev_name)
+                  | selectattr('deploymentStatus', 'equalto', 'DEPLOYMENT_IN_PROGRESS')
+                  | list | length) == 0) }}
+      retries: "{{ deploy_ready_retries | default(60) }}"
+      delay: "{{ deploy_ready_delay | default(20) }}"
 
     # FMC lists a device here only while it has undeployed changes, so an absent
     # entry is the normal "already deployed" case, not an error.
@@ -60,11 +161,15 @@
         validate_certs: no
       delegate_to: localhost
       register: dep_list
+      # The status guard is load-bearing: this is an "empty list == settled" test, so a failed
+      # GET would otherwise report settled and skip the wait entirely — which is how a dirty
+      # unit used to slip through and make HA formation fail with "One or both Peers are dirty".
       until: >-
-        {{ (dep_list.json.get('items', []) | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0
-           if (deploy_all | default(false) | bool)
-           else (dep_list.json.get('items', []) | selectattr('name', 'equalto', _dev_name)
-                 | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0 }}
+        {{ dep_list.status | default(-1) == 200 and
+           ((dep_list.get('json', {}).get('items', []) | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0
+            if (deploy_all | default(false) | bool)
+            else (dep_list.get('json', {}).get('items', []) | selectattr('name', 'in', _dep_names)
+                  | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0) }}
       retries: "{{ deploy_settle_retries | default(30) }}"
       delay: "{{ deploy_settle_delay | default(20) }}"
 
@@ -74,7 +179,7 @@
           {{ (dep_list.json.get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list)
              if (deploy_all | default(false) | bool)
              else (dep_list.json.get('items', []) | selectattr('canBeDeployed', 'equalto', true)
-                   | selectattr('name', 'equalto', _dev_name) | list) }}
+                   | selectattr('name', 'in', _dep_names) | list) }}
 
     - name: Report that nothing is pending
       ansible.builtin.debug:
@@ -83,7 +188,90 @@
 
     # version stamps WHICH pending config is being pushed; FMC rejects a stale one.
     # With several devices the newest stamp covers them all.
-    - name: Request the deployment
+    # Retry as an INCLUDE, not a uri `until`: the device list and version must be rebuilt on
+    # every attempt. FMC validates the request against its current deployable set, and it
+    # auto-deploys a freshly registered FTD while we retry - so a list built once goes stale
+    # and every retry is rejected with "The device list in Request does not match the
+    # deployable devices". See _deploy_attempt.yml.
+    - name: Request the deployment, rebuilding the device list each attempt
+      ansible.builtin.include_tasks: _deploy_attempt.yml
+      loop: "{{ range(0, (deploy_post_retries | default(10) | int) + 1) | list }}"
+      loop_control: { label: "attempt {{ item + 1 }}" }
+      when:
+        - _targets | length > 0
+        - not (_dep_done | default(false))
+
+    # Self-heal the one failure that deadlocks every future deploy. A VPN topology left with a
+    # single endpoint by an interrupted run makes FMC refuse EVERY deployment on the device -
+    # including config that has nothing to do with VPN - so the next run cannot get far enough
+    # to repair it and the lab is stuck until someone deletes the topology in FMC by hand.
+    # FMC names the offending topologies in the rejection, so find the incomplete ones, drop
+    # them, and try again. configure_s2s_vpn rebuilds them from scratch later in the run.
+    - name: List VPN topologies when the deployment was refused over an incomplete VPN
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/policy/ftds2svpns?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_vpns
+      when: _dep_vpn_blocked
+
+    - name: Count endpoints on each topology
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/policy/ftds2svpns/{{ item.id }}/endpoints?limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ dep_vpns.get('json', {}).get('items', []) if _dep_vpn_blocked else [] }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: dep_vpn_eps
+
+    - name: Delete the incomplete VPN topologies that block deployment
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/policy/ftds2svpns/{{ item.item.id }}"
+        method: DELETE
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+        status_code: [200, 202, 204]
+      delegate_to: localhost
+      loop: "{{ dep_vpn_eps.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.name }}" }
+      when: (item.get('json', {}).get('items', []) | length) < 2
+      register: dep_vpn_fixed
+
+    # Deleting a topology bumps the config version, so the stamp captured in _targets is now
+    # stale and FMC rejects the deploy with "Policy ... was altered since ... the version was
+    # fetched from the API". Re-read deployabledevices and use the CURRENT stamp.
+    - name: Re-read pending devices after the VPN cleanup
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+        method: GET
+        headers:
+          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: dep_list2
+      until: >-
+        {{ dep_list2.status | default(-1) == 200
+           and (dep_list2.get('json', {}).get('items', [])
+                | rejectattr('canBeDeployed', 'equalto', true) | list | length) == 0 }}
+      retries: "{{ deploy_settle_retries | default(30) }}"
+      delay: "{{ deploy_settle_delay | default(20) }}"
+      failed_when: false
+      when: (dep_vpn_fixed.results | default([]) | rejectattr('skipped', 'defined') | list | length) > 0
+
+    - name: Re-request the deployment after clearing the incomplete VPNs
+      vars:
+        _targets2: >-
+          {{ dep_list2.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true)
+             | list if (deploy_all | default(false) | bool)
+             else (dep_list2.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true)
+                   | selectattr('name', 'in', _dep_names) | list) }}
       uri:
         url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deploymentrequests"
         method: POST
@@ -92,18 +280,74 @@
         body_format: json
         body:
           type: DeploymentRequest
-          version: "{{ _targets | map(attribute='version') | map('int') | max | string }}"
+          version: "{{ _targets2 | map(attribute='version') | map('int') | max | string }}"
           forceDeploy: "{{ deploy_force | default(false) | bool }}"
           ignoreWarning: "{{ deploy_ignore_warning | default(true) | bool }}"
-          deviceList: "{{ _targets | map(attribute='id') | list }}"
+          deviceList: "{{ _targets2 | map(attribute='id') | list }}"
         validate_certs: no
-        status_code: [200, 201, 202]
+        status_code: [200, 201, 202, 400, 500]
       delegate_to: localhost
-      register: dep_req
-      when: _targets | length > 0
+      register: dep_req_retry
+      until: >-
+        dep_req_retry.status | default(-1) in [200, 201, 202]
+        or 'no devices for deployment' in (dep_req_retry.get('json', {}) | to_json)
+      retries: "{{ deploy_post_retries | default(10) }}"
+      delay: "{{ deploy_post_delay | default(30) }}"
+      failed_when: false
+      when:
+        - (dep_vpn_fixed.results | default([]) | rejectattr('skipped', 'defined') | list | length) > 0
+        - (dep_list2.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list | length) > 0
+
+    - name: Use the retried deployment request as the result
+      ansible.builtin.set_fact:
+        dep_req: "{{ dep_req_retry }}"
+      when: dep_req_retry is defined and dep_req_retry is not skipped
+
+    - name: Report that FMC had nothing left to deploy
+      ansible.builtin.debug:
+        msg: >-
+          FMC reports no devices pending - its own auto-deploy completed while the request was
+          being retried, so the config this role wanted pushed is already on the device.
+      when:
+        - _targets | length > 0
+        - dep_req.status | default(-1) not in [200, 201, 202]
+        - "'no devices for deployment' in (dep_req.get('json', {}) | to_json)"
+
+    # Anything else that outlives the retries is a real rejection — surface FMC's own wording
+    # rather than letting the next task fail on a missing dep_req.json.metadata.
+    - name: Fail when the deployment could not be requested
+      ansible.builtin.fail:
+        msg: >-
+          FMC refused the deployment request (HTTP {{ dep_req.status | default('?') }}):
+          {{ dep_req.get('json', {}).get('error', {}).get('messages', [{}])
+             | map(attribute='description') | join('; ') | default('no message', true) }}
+      when:
+        - _targets | length > 0
+        - dep_req.status | default(-1) not in [200, 201, 202]
+        - "'no devices for deployment' not in (dep_req.get('json', {}) | to_json)"
 
     # The POST only queues the job. Status goes Deploying -> Deployed, and passes
     # through PARTIALLY_SUCCEEDED mid-push, which is progress and not a failure.
+    # Re-register the auth var so every task after this uses a FRESH token. FMC tokens live
+    # ~30 min and are invalidated when the concurrent-token cap is hit (a GUI login does it),
+    # and the waits below can each run 10-20 min - a token taken at the top of the role is
+    # routinely dead by the time they finish. Seen as: 401 "Access token invalid." on a poll
+    # whose previous iteration succeeded.
+    - name: Refresh the FMC token before polling the deployment job
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: dep_auth
+      until: dep_auth is succeeded
+      retries: 10
+      delay: 30
+
     - name: Wait for the deployment to finish
       uri:
         url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/job/taskstatuses/{{ dep_req.json.metadata.task.id }}"
@@ -113,19 +357,19 @@
         validate_certs: no
       delegate_to: localhost
       register: dep_task
-      until: dep_task.json.status | default('') in ['Deployed', 'Completed', 'Failed']
+      until: dep_task.get('json', {}).get('status', '') in ['Deployed', 'Completed', 'Failed']
       retries: "{{ deploy_retries | default(60) }}"
       delay: "{{ deploy_delay | default(20) }}"
-      when: _targets | length > 0
+      when: _dep_queued
 
     - name: Fail when the deployment did not succeed
       ansible.builtin.fail:
         msg: "FMC deployment finished as '{{ dep_task.json.status }}': {{ dep_task.json.message | default('no message') }}"
       when:
-        - _targets | length > 0
-        - dep_task.json.status not in ['Deployed', 'Completed']
+        - _dep_queued
+        - dep_task.get('json', {}).get('status', '') not in ['Deployed', 'Completed']
 
     - name: Report the deployment result
       ansible.builtin.debug:
-        msg: "Deployed {{ _targets | map(attribute='name') | join(', ') }} - {{ dep_task.json.message | default('') }}"
-      when: _targets | length > 0
+        msg: "Deployed {{ _targets | map(attribute='name') | join(', ') }} - {{ dep_task.get('json', {}).get('message', '') }}"
+      when: _dep_queued

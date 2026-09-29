@@ -1,0 +1,74 @@
+---
+# Create FMC route-maps. Idempotent (skips existing by name). Each entry matches an
+# IPv4 prefix-list (resolved to its UUID by name), mirroring the HQ_BGP_* maps.
+# Required:
+#   fmc_host    - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   route_maps  - list of {name, entries:[{sequence, action, prefix_list}]}
+#                 e.g. {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_IN}]}
+# Optional: fmc_user/fmc_pass (default admin / {{ fmc_admin_password }})
+
+- name: Create FMC route-maps
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: List existing prefix-lists and route-maps
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/object/{{ item }}?limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: [ "ipv4prefixlists", "routemaps", ]
+      register: _rmlk
+
+    - name: Build route-map bodies (resolve prefix-list ids)
+      ansible.builtin.set_fact:
+        _pfxmap: "{{ dict(_rmlk.results[0].json.get('items', []) | map(attribute='name') | zip(_rmlk.results[0].json.get('items', []) | map(attribute='id'))) }}"
+        _existing_rm: "{{ _rmlk.results[1].json.get('items', []) | selectattr('name','defined') | map(attribute='name') | list }}"
+
+    - name: Assemble route-map create bodies
+      ansible.builtin.set_fact:
+        _rm_bodies: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for rm in route_maps -%}
+            {%- set entries = [] -%}
+            {%- for e in rm.entries -%}
+              {%- set _ = entries.append({'sequence': e.sequence, 'action': e.action,
+                    'ipv4PrefixListAddresses': [{'type': 'IPV4PrefixList', 'id': _pfxmap[e.prefix_list]}]}) -%}
+            {%- endfor -%}
+            {%- set _ = ns.out.append({'type': 'RouteMap', 'name': rm.name, 'entries': entries}) -%}
+          {%- endfor -%}
+          {{ ns.out | to_json }}
+
+    - name: Create missing route-maps
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/object/routemaps"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body: "{{ item }}"
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _rm_bodies | from_json }}"
+      loop_control: { label: "{{ item.name }}" }
+      when: item.name not in _existing_rm

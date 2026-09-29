@@ -1,0 +1,156 @@
+---
+# Create an FTD NAT policy, assign it to the device, and add auto-NAT rules via FMC.
+# Idempotent: the policy is created only if absent, the device assignment only if
+# missing, and each auto-NAT rule only if no rule with the same
+# original-network + source-zone + dest-zone already exists (auto rules have no name).
+#
+# Required:
+#   fmc_host       - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   ftd_device     - managed device name (e.g. ftd-1)
+#   nat_policy     - NAT policy name (e.g. HQ-NAT)
+#   auto_nat_rules - list of {original_network, source_zone, dest_zone,
+#                    nat_type(DYNAMIC), interface_pat(true), dns(true)}
+# Optional: fmc_user/fmc_pass (default admin / {{ fmc_admin_password }})
+
+- name: Configure FTD NAT
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Resolve device, zones, networks, nat policies
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/{{ item }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop:
+        - "devices/devicerecords"
+        - "object/securityzones"
+        - "object/networks"
+        - "policy/ftdnatpolicies"
+        - "devicehapairs/ftddevicehapairs"
+      register: _natlk
+
+    - name: Map ids
+      ansible.builtin.set_fact:
+        _dev_id: "{{ (_natlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _zmap: "{{ dict(_natlk.results[1].json.get('items', []) | map(attribute='name') | zip(_natlk.results[1].json.get('items', []) | map(attribute='id'))) }}"
+        _nmap: "{{ dict(_natlk.results[2].json.get('items', []) | map(attribute='name') | zip(_natlk.results[2].json.get('items', []) | map(attribute='id'))) }}"
+        _natpols: "{{ dict(_natlk.results[3].json.get('items', []) | selectattr('name','defined') | map(attribute='name') | zip(_natlk.results[3].json.get('items', []) | selectattr('name','defined') | map(attribute='id'))) }}"
+        # The HA pair this device belongs to, if any — see the assignment task below.
+        _ha: >-
+          {{ (_natlk.results[4].json.get('items', [])
+              | selectattr('primary.name', 'defined') | selectattr('primary.name', 'equalto', ftd_device) | list
+              + _natlk.results[4].json.get('items', [])
+              | selectattr('secondary.name', 'defined') | selectattr('secondary.name', 'equalto', ftd_device) | list
+              + [{}]) | first }}
+
+    - name: Create NAT policy if missing
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/ftdnatpolicies"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body: { type: "FTDNatPolicy", name: "{{ nat_policy }}" }
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      when: nat_policy not in _natpols
+      register: _natnew
+
+    - name: Resolve NAT policy id
+      ansible.builtin.set_fact:
+        _nat_id: "{{ _natpols[nat_policy] if nat_policy in _natpols else _natnew.json.id }}"
+
+    - name: Get policy assignments
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/assignment/policyassignments?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: _asg
+
+    # Assign only when the policy has NO assignment yet, keyed off "policy already assigned?"
+    # rather than a specific device id (avoids a 406 re-assign).
+    #
+    # The target must be the HA CONTAINER once a pair exists, not the member device record —
+    # FMC itself records the access policy as targets=[hq-ftd-ha:DeviceHAPair]. Targeting the
+    # member is what the comment here always said, but the body sent type: Device anyway.
+    - name: Assign NAT policy to the device if the policy is unassigned
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/assignment/policyassignments"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "PolicyAssignment"
+          policy: { type: "FTDNatPolicy", id: "{{ _nat_id }}" }
+          targets: >-
+            {{ [{'type': 'DeviceHAPair', 'id': _ha.id}] if _ha.id is defined
+               else [{'type': 'Device', 'id': _dev_id}] }}
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      when: _nat_id not in (_asg.json.get('items', []) | selectattr('policy','defined') | map(attribute='policy.id') | list)
+
+    - name: List existing auto-NAT rules
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/ftdnatpolicies/{{ _nat_id }}/autonatrules?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: _autonat
+
+    - name: Signatures of existing auto-NAT rules (orig|srcZone|dstZone)
+      ansible.builtin.set_fact:
+        _nat_sigs: >-
+          {%- set ns = namespace(s=[]) -%}
+          {%- for r in _autonat.json.get('items', []) -%}
+            {%- set _ = ns.s.append(
+                 (r.originalNetwork.name if r.originalNetwork is defined else '') ~ '|' ~
+                 (r.sourceInterface.name if r.sourceInterface is defined else '') ~ '|' ~
+                 (r.destinationInterface.name if r.destinationInterface is defined else '')) -%}
+          {%- endfor -%}
+          {{ ns.s | to_json }}
+
+    - name: Create missing auto-NAT rules
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/policy/ftdnatpolicies/{{ _nat_id }}/autonatrules"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body:
+          type: "FTDAutoNatRule"
+          natType: "{{ item.nat_type | default('DYNAMIC') }}"
+          interfaceInTranslatedNetwork: "{{ item.interface_pat | default(true) }}"
+          dns: "{{ item.dns | default(true) }}"
+          originalNetwork: { type: "Network", id: "{{ _nmap[item.original_network] }}" }
+          sourceInterface: { type: "SecurityZone", id: "{{ _zmap[item.source_zone] }}" }
+          destinationInterface: { type: "SecurityZone", id: "{{ _zmap[item.dest_zone] }}" }
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ auto_nat_rules | default([]) }}"
+      loop_control: { label: "{{ item.original_network }}" }
+      when: (item.original_network ~ '|' ~ item.source_zone ~ '|' ~ item.dest_zone) not in (_nat_sigs | from_json)

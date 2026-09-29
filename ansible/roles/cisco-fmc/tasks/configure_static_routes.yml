@@ -1,0 +1,104 @@
+---
+# Create FTD IPv4 static routes via FMC. Idempotent: skips a route when one with the
+# same interface + gateway already exists. Gateway is a literal host IP; the destination
+# networks are resolved from network/host/group objects by name.
+#
+# Required:
+#   fmc_host      - FMC mgmt IP ({{ fmc_1_ip }} in a scenario)
+#   ftd_device    - managed device name (e.g. ftd-1)
+#   static_routes - list of {interface, networks:[names], gateway, metric}
+#                   e.g. {interface: ISP1, networks: [any-ipv4], gateway: 192.0.2.1, metric: 1}
+# Optional: fmc_user/fmc_pass (default admin / {{ fmc_admin_password }})
+
+- name: Configure FTD static routes
+  vars:
+    _fmc_user: "{{ fmc_user | default('admin') }}"
+    _fmc_pass: "{{ fmc_pass | default(fmc_admin_password) }}"
+    _dom: "{{ fmc_auth.domain_uuid | default('') }}"
+    _hdr: { X-auth-access-token: "{{ fmc_auth.x_auth_access_token | default('') }}" }
+  block:
+
+    - name: Get an FMC auth token
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Resolve device, networks, hosts, groups
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/{{ item }}?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      loop: [ "devices/devicerecords", "object/networks", "object/hosts", "object/networkgroups", ]
+      register: _srlk
+
+    - name: Map device id and object refs (name -> {id,type})
+      ansible.builtin.set_fact:
+        _dev_id: "{{ (_srlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _objmap: >-
+          {%- set m = {} -%}
+          {%- for res in _srlk.results[1:] -%}
+            {%- for o in res.json.get('items', []) -%}
+              {%- set _ = m.update({o.name: {'id': o.id, 'type': o.type}}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ m | to_json }}
+
+    - name: List existing static routes
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id }}/routing/ipv4staticroutes?expanded=true&limit=1000"
+        method: GET
+        headers: "{{ _hdr }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: _sroutes
+
+    - name: Signatures of existing static routes (interface|gateway)
+      ansible.builtin.set_fact:
+        _sr_sigs: >-
+          {%- set ns = namespace(s=[]) -%}
+          {%- for r in _sroutes.json.get('items', []) -%}
+            {%- set gw = (r.gateway.literal.value if (r.gateway is defined and r.gateway.literal is defined)
+                          else (r.gateway.object.name if (r.gateway is defined and r.gateway.object is defined) else '')) -%}
+            {%- set _ = ns.s.append((r.interfaceName | default('')) ~ '|' ~ gw) -%}
+          {%- endfor -%}
+          {{ ns.s | to_json }}
+
+    - name: Assemble static-route bodies
+      ansible.builtin.set_fact:
+        _sr_bodies: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- set om = _objmap | from_json -%}
+          {%- for r in static_routes -%}
+            {%- set nets = [] -%}
+            {%- for n in r.networks -%}{%- set _ = nets.append({'type': om[n].type, 'id': om[n].id, 'name': n}) -%}{%- endfor -%}
+            {%- set _ = ns.out.append({'type': 'IPv4StaticRoute', 'interfaceName': r.interface,
+                 'selectedNetworks': nets, 'metricValue': r.metric | default(1), 'isTunneled': false,
+                 'gateway': {'literal': {'type': 'Host', 'value': r.gateway}}, '_sig': r.interface ~ '|' ~ r.gateway}) -%}
+          {%- endfor -%}
+          {{ ns.out | to_json }}
+
+    - name: Create missing static routes
+      ansible.builtin.uri:
+        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords/{{ _dev_id }}/routing/ipv4staticroutes"
+        method: POST
+        headers: "{{ _hdr }}"
+        body_format: json
+        body: "{{ item | dict2items | rejectattr('key','equalto','_sig') | items2dict }}"
+        status_code: [201, 200]
+        validate_certs: no
+      delegate_to: localhost
+      loop: "{{ _sr_bodies | from_json }}"
+      loop_control: { label: "{{ item.interfaceName }}" }
+      when: item._sig not in (_sr_sigs | from_json)
