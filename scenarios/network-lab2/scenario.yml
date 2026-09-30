@@ -354,11 +354,11 @@ vms:
               - {ip: 169.254.2.2, remote_as: 65110, weight: 200, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_PRI_OUT}
               - {ip: 169.254.3.2, remote_as: 65110, weight: 100, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_SEC_OUT}
             bgp_networks: ["SERVERS-192.168.100.0-24", "USERS-192.168.200.0-24"]
-        # Push everything above to the HA pair.
-        - task: cisco-fmc/deploy_pending
-          vars:
-            fmc_host: "{{ fmc_1_ip }}"
-            deploy_all: true
+        # NO final deploy_pending on purpose — the config written by the roles above
+        # (BGP, NAT, ACL, S2S) is left PENDING in FMC and pushed by hand from the GUI
+        # (Deploy > Deploy All). Until that push nothing above is live on the firewall:
+        # `show bgp summary` on the FTD reports "% BGP not active" while FMC already
+        # shows the full BGP config.
 
   - name: sw-hq
     # The HQ switch sits behind the firewall pair — bring it up once both FTDs are in.

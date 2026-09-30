@@ -45,7 +45,7 @@
 
     - name: Map device id and object refs (name -> {id,type})
       ansible.builtin.set_fact:
-        _dev_id: "{{ (_srlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _dev_id: "{{ ((_srlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | list + [{}]) | first).get('id', '') }}"
         _objmap: >-
           {%- set m = {} -%}
           {%- for res in _srlk.results[1:] -%}
@@ -54,6 +54,14 @@
             {%- endfor -%}
           {%- endfor -%}
           {{ m | to_json }}
+
+    - name: Fail when the managed device is not registered
+      ansible.builtin.fail:
+        msg: >-
+          Device '{{ ftd_device }}' is not registered in FMC (looked up for this role).
+          Register it first - without it every id below resolves to nothing and the
+          failure surfaces later as an unrelated 'sequence was empty'.
+      when: not _dev_id
 
     - name: List existing static routes
       ansible.builtin.uri:

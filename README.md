@@ -14,29 +14,40 @@ Successor to [lab-platform](https://github.com/celeroon/lab-platform), a libvirt
 - Management VM: Debian 12 or 13, static IP, SSH accessible
 - Proxmox API token for `root@pam` (privilege separation disabled)
 - SDN `labmgmt` zone with the built-in `pve` IPAM plugin
-- Jumbo frames between Proxmox nodes — see **VNet MTU** below
+- Jumbo frames on the node NICs, bridges and switch, set manually — see **VNet MTU** below
 
 ---
 
 ### VNet MTU
 
-VNets are VXLAN-backed, so 50 bytes go to encapsulation and guests see 1450. That is the
-default and needs no configuration. **Only Cisco FTDv cares** — its DPDK ports refuse
-anything under 1500 and the appliance reboot-loops without it.
+VNets are VXLAN-backed, so guests see 1450. Only Cisco FTDv needs more — its DPDK ports
+refuse anything under 1500.
 
-| your setup | `SDN_MTU` in `.env` |
-|---|---|
-| no FTDv | leave unset (1450) |
-| FTDv, single Proxmox node | `1500` |
-| FTDv, Proxmox cluster | `1500`, and the underlay must carry 1550 |
+On a **single Proxmox node** nothing is encapsulated, so raising the zone MTU to 1500 costs
+nothing. On a **Proxmox cluster** VXLAN adds 50 bytes on the wire, so the underlay must carry
+9000 *before* the zone goes to 1500 — otherwise cross-node traffic dies silently, small pings
+included. This is manual, on every node and on the physical switch:
 
-On a single node nothing is ever encapsulated onto the wire — VM-to-VM is bridged locally —
-so 1500 costs nothing. On a cluster a 1500-byte guest frame becomes 1550 once encapsulated,
-so the node NICs, their bridges and the switch between them have to carry that much. Without
-it FTDv still starts, but cross-node full-size frames get fragmented.
+```
+# /etc/network/interfaces — parent first, a VLAN cannot exceed its bridge
+auto nic1
+iface nic1 inet manual
+    mtu 9000
 
-Changing the MTU needs a full VM **stop/start**, not a reboot: `host_mtu` is set on the
-virtio device when QEMU creates it.
+auto vmbr0
+iface vmbr0 inet static
+    bridge-ports nic1
+    mtu 9000
+
+auto vmbr0.41
+iface vmbr0.41 inet static
+    address 172.24.41.101/24
+    mtu 9000
+```
+
+Apply with `ifreload -a`, one node at a time (`vmbr0` carries corosync), and verify with
+`ping -M do -s 8972 <other-node>`. Changing a guest's MTU needs a VM **stop/start**, not a
+reboot.
 
 ## Setup
 

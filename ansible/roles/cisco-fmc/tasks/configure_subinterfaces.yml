@@ -46,8 +46,16 @@
 
     - name: Map ids
       ansible.builtin.set_fact:
-        _dev_id: "{{ (_lookup.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _dev_id: "{{ ((_lookup.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | list + [{}]) | first).get('id', '') }}"
         _zmap: "{{ dict(_lookup.results[1].json.get('items', []) | map(attribute='name') | zip(_lookup.results[1].json.get('items', []) | map(attribute='id'))) }}"
+
+    - name: Fail when the managed device is not registered
+      ansible.builtin.fail:
+        msg: >-
+          Device '{{ ftd_device }}' is not registered in FMC (looked up for this role).
+          Register it first - without it every id below resolves to nothing and the
+          failure surfaces later as an unrelated 'sequence was empty'.
+      when: not _dev_id
 
     - name: List existing sub-interfaces
       ansible.builtin.uri:

@@ -1,0 +1,80 @@
+---
+# One poll of the deployment job, with the same 401 handling as _deploy_attempt.yml.
+#
+# A plain `uri` task with `until` cannot survive this wait: a deployment takes up to 20 minutes,
+# an FMC token lives ~30 and is invalidated sooner when the concurrent-token cap is hit, so the
+# poll goes blind with 401 "Access token invalid." on a job that actually succeeded. Re-auth
+# happens ONLY on a 401 — minting a token per poll would exhaust the cap instead.
+#
+# Included in a loop by deploy_pending.yml; sets dep_task for the caller.
+
+- name: Pause between deployment polls
+  ansible.builtin.wait_for:
+    timeout: "{{ deploy_delay | default(20) }}"
+  delegate_to: localhost
+  when:
+    - not (_dep_poll_done | default(false))
+    - item | int > 0
+
+- name: Poll the deployment job
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/job/taskstatuses/{{ dep_req.json.metadata.task.id }}"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+    validate_certs: no
+    status_code: [200, 401]
+  delegate_to: localhost
+  register: dep_poll
+  failed_when: false
+  when: not (_dep_poll_done | default(false))
+
+- name: Re-authenticate after a rejected token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+    method: POST
+    user: "{{ _fmc_user }}"
+    password: "{{ _fmc_pass }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 204]
+  delegate_to: localhost
+  register: dep_auth_p
+  until: dep_auth_p is succeeded
+  retries: 5
+  delay: 20
+  when:
+    - not (_dep_poll_done | default(false))
+    - dep_poll.status | default(-1) == 401
+
+# Promote only when it ran: a skipped task still registers, and assigning that straight into
+# dep_auth would wipe the working token on every poll that did not need a re-auth.
+- name: Adopt the new token
+  ansible.builtin.set_fact:
+    dep_auth: "{{ dep_auth_p }}"
+  when:
+    - not (_dep_poll_done | default(false))
+    - dep_auth_p is not skipped
+    - dep_auth_p.x_auth_access_token is defined
+
+- name: Poll again with the new token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/job/taskstatuses/{{ dep_req.json.metadata.task.id }}"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: dep_poll2
+  failed_when: false
+  when:
+    - not (_dep_poll_done | default(false))
+    - dep_poll.status | default(-1) == 401
+
+- name: Record this poll's result
+  vars:
+    _p: "{{ dep_poll2 if (dep_poll.status | default(-1) == 401) else dep_poll }}"
+  ansible.builtin.set_fact:
+    dep_task: "{{ _p }}"
+    _dep_poll_done: "{{ _p.get('json', {}).get('status', '') in ['Deployed', 'Completed', 'Failed'] }}"
+  when: not (_dep_poll_done | default(false))

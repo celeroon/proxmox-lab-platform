@@ -152,6 +152,23 @@
     # "nothing pending" leaves the unit dirty, and a later HA attempt is refused with
     # "One or both Peers are dirty". So wait for it to settle: either the entry goes
     # away (clean) or canBeDeployed flips true (ready to push).
+    # Fresh token: this wait can run 10 minutes and an FMC token lives ~30, so a token taken
+    # earlier in the role expires partway and the poll dies on 401 for a healthy system.
+    - name: Refresh the FMC token before the readiness wait
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: dep_auth
+      until: dep_auth is succeeded
+      retries: 10
+      delay: 30
+
     - name: Wait until the device is ready to deploy, or already clean
       uri:
         url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
@@ -195,7 +212,11 @@
     # deployable devices". See _deploy_attempt.yml.
     - name: Request the deployment, rebuilding the device list each attempt
       ansible.builtin.include_tasks: _deploy_attempt.yml
-      loop: "{{ range(0, (deploy_post_retries | default(10) | int) + 1) | list }}"
+      # 30 x 30s = 15 min. A freshly deployed FMC installs its LSP (Snort rule package) in the
+      # background and REFUSES every deployment until it finishes - "LSP installation is
+      # currently in progress. Try again after the installation is complete." That runs 10-20
+      # minutes on a new FMC, so a short budget fails a deploy that only needed to wait.
+      loop: "{{ range(0, (deploy_post_retries | default(30) | int) + 1) | list }}"
       loop_control: { label: "attempt {{ item + 1 }}" }
       when:
         - _targets | length > 0
@@ -247,6 +268,23 @@
     # Deleting a topology bumps the config version, so the stamp captured in _targets is now
     # stale and FMC rejects the deploy with "Policy ... was altered since ... the version was
     # fetched from the API". Re-read deployabledevices and use the CURRENT stamp.
+    # Fresh token: this wait can run 10 minutes and an FMC token lives ~30, so a token taken
+    # earlier in the role expires partway and the poll dies on 401 for a healthy system.
+    - name: Refresh the FMC token before the post-cleanup re-read
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: dep_auth
+      until: dep_auth is succeeded
+      retries: 10
+      delay: 30
+
     - name: Re-read pending devices after the VPN cleanup
       uri:
         url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
@@ -348,23 +386,22 @@
       retries: 10
       delay: 30
 
+    # Include loop, not a uri `until`: a 20-minute poll outlives an FMC token, and a plain
+    # until-loop cannot re-authenticate between retries — it went blind with 401 on a job that
+    # had actually succeeded. See _deploy_wait.yml.
     - name: Wait for the deployment to finish
-      uri:
-        url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/job/taskstatuses/{{ dep_req.json.metadata.task.id }}"
-        method: GET
-        headers:
-          X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
-        validate_certs: no
-      delegate_to: localhost
-      register: dep_task
-      until: dep_task.get('json', {}).get('status', '') in ['Deployed', 'Completed', 'Failed']
-      retries: "{{ deploy_retries | default(60) }}"
-      delay: "{{ deploy_delay | default(20) }}"
-      when: _dep_queued
+      ansible.builtin.include_tasks: _deploy_wait.yml
+      loop: "{{ range(0, (deploy_retries | default(60) | int) + 1) | list }}"
+      loop_control: { label: "poll {{ item + 1 }}" }
+      when:
+        - _dep_queued
+        - not (_dep_poll_done | default(false))
 
     - name: Fail when the deployment did not succeed
       ansible.builtin.fail:
-        msg: "FMC deployment finished as '{{ dep_task.json.status }}': {{ dep_task.json.message | default('no message') }}"
+        msg: >-
+          FMC deployment finished as '{{ dep_task.get('json', {}).get('status', 'unknown') }}':
+          {{ dep_task.get('json', {}).get('message', 'no message') }}
       when:
         - _dep_queued
         - dep_task.get('json', {}).get('status', '') not in ['Deployed', 'Completed']

@@ -1,23 +1,71 @@
 ---
-# One deployment attempt: re-read the deployable set, then POST it.
+# One deployment attempt: read the deployable set, then POST it.
 #
-# This exists as a separate file because the device list and version stamp MUST be rebuilt on
-# every attempt. FMC validates the request against its CURRENT deployable set and rejects a
-# stale one with "The device list in Request does not match the deployable devices" — which is
-# easy to hit because FMC auto-deploys a freshly registered FTD while we are retrying, so a
-# device that was deployable when we built the list is DEPLOYED by the time the POST lands.
-# A single uri task with `until` cannot do this: it would re-send the same body every retry.
+# Separate file because the device list and version stamp MUST be rebuilt on every attempt.
+# FMC validates the request against its CURRENT deployable set and rejects a stale one with
+# "The device list in Request does not match the deployable devices" — easy to hit because FMC
+# auto-deploys a freshly registered FTD while we retry. A single uri task with `until` cannot
+# do this: it re-sends the same body every retry.
+#
+# Token handling: re-authenticate ONLY on a 401, never pre-emptively. FMC caps concurrent
+# tokens (~10/user) and refusing that cap matters here — this loop can run 30 attempts, and
+# minting a token each time exhausts the cap, after which FMC rejects the token requests
+# themselves and invalidates ones still in use.
 #
 # Included in a loop by deploy_pending.yml; sets dep_req for the caller.
 
 - name: Pause between deployment attempts
-  ansible.builtin.pause:
-    seconds: "{{ deploy_post_delay | default(30) }}"
+  ansible.builtin.wait_for:
+    timeout: "{{ deploy_post_delay | default(30) }}"
+  delegate_to: localhost
   when:
     - not (_dep_done | default(false))
     - item | int > 0
 
-- name: Re-read the deployable set for this attempt
+- name: Read the deployable set
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
+    validate_certs: no
+    status_code: [200, 401]
+  delegate_to: localhost
+  register: dep_read
+  failed_when: false
+  when: not (_dep_done | default(false))
+
+# Only now, and only because the token was actually rejected.
+- name: Re-authenticate after a rejected token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+    method: POST
+    user: "{{ _fmc_user }}"
+    password: "{{ _fmc_pass }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 204]
+  delegate_to: localhost
+  register: dep_auth_new
+  until: dep_auth_new is succeeded
+  retries: 5
+  delay: 20
+  when:
+    - not (_dep_done | default(false))
+    - dep_read.status | default(-1) == 401
+
+# Promote only when it ran. Registering straight into dep_auth destroys the working token on
+# every attempt that does NOT need a re-auth, because a skipped task still registers
+# {skipped: true} - the next task then fails with "dict has no attribute x_auth_access_token".
+- name: Adopt the new token
+  ansible.builtin.set_fact:
+    dep_auth: "{{ dep_auth_new }}"
+  when:
+    - not (_dep_done | default(false))
+    - dep_auth_new is not skipped
+    - dep_auth_new.x_auth_access_token is defined
+
+- name: Read the deployable set again with the new token
   uri:
     url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
     method: GET
@@ -25,18 +73,23 @@
       X-auth-access-token: "{{ dep_auth.x_auth_access_token }}"
     validate_certs: no
   delegate_to: localhost
-  register: dep_now
+  register: dep_read2
+  failed_when: false
+  when:
+    - not (_dep_done | default(false))
+    - dep_read.status | default(-1) == 401
 
-  when: not (_dep_done | default(false))
 - name: Select targets for this attempt
+  vars:
+    _src: "{{ dep_read2 if (dep_read.status | default(-1) == 401) else dep_read }}"
   ansible.builtin.set_fact:
     _targets_now: >-
-      {{ (dep_now.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list)
+      {{ (_src.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true) | list)
          if (deploy_all | default(false) | bool)
-         else (dep_now.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true)
+         else (_src.get('json', {}).get('items', []) | selectattr('canBeDeployed', 'equalto', true)
                | selectattr('name', 'in', _dep_names) | list) }}
-
   when: not (_dep_done | default(false))
+
 - name: Request the deployment
   uri:
     url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ dep_auth.domain_uuid }}/deployment/deploymentrequests"
@@ -51,7 +104,7 @@
       ignoreWarning: "{{ deploy_ignore_warning | default(true) | bool }}"
       deviceList: "{{ _targets_now | map(attribute='id') | list }}"
     validate_certs: no
-    status_code: [200, 201, 202, 400, 500]
+    status_code: [200, 201, 202, 400, 401, 500]
   delegate_to: localhost
   register: dep_try
   failed_when: false
@@ -59,6 +112,8 @@
     - not (_dep_done | default(false))
     - _targets_now | length > 0
 
+# A skipped task still registers, so short-circuited iterations would otherwise overwrite a
+# successful result with {skipped: true}. Promote it only when the POST actually ran.
 - name: Keep this attempt's result
   ansible.builtin.set_fact:
     dep_req: "{{ dep_try }}"
@@ -66,8 +121,7 @@
     - not (_dep_done | default(false))
     - dep_try is not skipped
 
-# Nothing deployable any more: FMC finished the work while we were retrying. Synthesise the
-# same no-op result the caller recognises, so it reports success instead of a stale failure.
+# FMC finished the work while we were retrying: synthesise the no-op the caller recognises.
 - name: Note that nothing is deployable any more
   ansible.builtin.set_fact:
     dep_req: "{{ {'status': 500, 'json': {'error': {'messages': [{'description': 'There are no devices for deployment.'}]}}} }}"

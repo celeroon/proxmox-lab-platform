@@ -61,12 +61,20 @@
     - name: Map ids
       ansible.builtin.set_fact:
         _ha: "{{ (_s2slk.results[0].json.get('items', []) | first) | default({}) }}"
-        _dev_id: "{{ (_s2slk.results[1].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _dev_id: "{{ ((_s2slk.results[1].json.get('items', []) | selectattr('name','equalto', ftd_device) | list + [{}]) | first).get('id', '') }}"
         _existing_s2s: "{{ _s2slk.results[2].json.get('items', []) | selectattr('name','defined') | map(attribute='name') | list }}"
         _s2smap: "{{ dict(_s2slk.results[2].json.get('items', []) | selectattr('name','defined') | map(attribute='name')
                      | zip(_s2slk.results[2].json.get('items', []) | selectattr('name','defined') | list)) }}"
         _ikepol_id: "{{ (_s2slk.results[3].json.get('items', []) | selectattr('name','equalto', ike_policy | default('DES-SHA-SHA-LATEST')) | first).id }}"
         _prop_id: "{{ (_s2slk.results[4].json.get('items', []) | selectattr('name','equalto', ipsec_proposal | default('DES_SHA-1')) | first).id }}"
+
+    - name: Fail when the managed device is not registered
+      ansible.builtin.fail:
+        msg: >-
+          Device '{{ ftd_device }}' is not registered in FMC (looked up for this role).
+          Register it first - without it every id below resolves to nothing and the
+          failure surfaces later as an unrelated 'sequence was empty'.
+      when: not _dev_id
 
     - name: Map device VTIs (ifname -> id)
       ansible.builtin.uri:

@@ -1,0 +1,90 @@
+---
+# One poll of HA formation, with 401 handling. Same reasoning as _deploy_wait.yml: formation
+# takes 10-20 minutes (the secondary reboots), the budget is 30, and an FMC token does not
+# survive that — op 391 failed here with 401 "Access token invalid." on a pair that had
+# already reached Active/Standby, reporting configStatus=absent because the read came back
+# empty. Re-auth only on 401; minting a token per poll would exhaust FMC's concurrent cap.
+#
+# Polls the OBSERVABLE pair state, not the POST's task id: FMC's task-status vocabulary for
+# this job does not match ['SUCCESS','Deployed','Completed'], so the old poll span its whole
+# budget on a healthy pair. metadata.* is absent early in formation, hence the .get() chain —
+# a dotted selectattr raises and kills the condition instead of simply retrying.
+#
+# Included in a loop by create_ha_pair.yml; sets ha_task and _ha_done for the caller.
+
+- name: Pause between HA formation polls
+  ansible.builtin.wait_for:
+    timeout: "{{ ha_delay | default(30) }}"
+  delegate_to: localhost
+  when:
+    - not (_ha_done | default(false))
+    - item | int > 0
+
+- name: Poll the HA pair state
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devicehapairs/ftddevicehapairs?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+    validate_certs: no
+    status_code: [200, 401]
+  delegate_to: localhost
+  register: ha_poll
+  failed_when: false
+  when: not (_ha_done | default(false))
+
+- name: Re-authenticate after a rejected token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+    method: POST
+    user: "{{ _fmc_user }}"
+    password: "{{ _fmc_pass }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 204]
+  delegate_to: localhost
+  register: ha_auth_p
+  until: ha_auth_p is succeeded
+  retries: 5
+  delay: 20
+  when:
+    - not (_ha_done | default(false))
+    - ha_poll.status | default(-1) == 401
+
+# Promote only when it ran — a skipped task still registers, and assigning that into ha_auth
+# would wipe the working token on every poll that did not need a re-auth.
+- name: Adopt the new token
+  ansible.builtin.set_fact:
+    ha_auth: "{{ ha_auth_p }}"
+  when:
+    - not (_ha_done | default(false))
+    - ha_auth_p is not skipped
+    - ha_auth_p.x_auth_access_token is defined
+
+- name: Poll again with the new token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devicehapairs/ftddevicehapairs?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: ha_poll2
+  failed_when: false
+  when:
+    - not (_ha_done | default(false))
+    - ha_poll.status | default(-1) == 401
+
+- name: Record this poll's result
+  vars:
+    _p: "{{ ha_poll2 if (ha_poll.status | default(-1) == 401) else ha_poll }}"
+    _m: >-
+      {{ ((_p.get('json', {}).get('items', [])
+           | selectattr('name', 'equalto', _ha_name) | list + [{}]) | first).get('metadata', {}) }}
+  ansible.builtin.set_fact:
+    ha_task: "{{ _p }}"
+    _ha_done: >-
+      {{ _m.get('configStatus', '') == 'HEALTHY_CONFIG'
+         and ([_m.get('primaryStatus', {}).get('currentStatus', ''),
+               _m.get('secondaryStatus', {}).get('currentStatus', '')] | sort) == ['Active', 'Standby'] }}
+  when: not (_ha_done | default(false))

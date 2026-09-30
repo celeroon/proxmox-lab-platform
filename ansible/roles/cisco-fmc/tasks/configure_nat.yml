@@ -52,7 +52,7 @@
 
     - name: Map ids
       ansible.builtin.set_fact:
-        _dev_id: "{{ (_natlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | first).id }}"
+        _dev_id: "{{ ((_natlk.results[0].json.get('items', []) | selectattr('name','equalto', ftd_device) | list + [{}]) | first).get('id', '') }}"
         _zmap: "{{ dict(_natlk.results[1].json.get('items', []) | map(attribute='name') | zip(_natlk.results[1].json.get('items', []) | map(attribute='id'))) }}"
         _nmap: "{{ dict(_natlk.results[2].json.get('items', []) | map(attribute='name') | zip(_natlk.results[2].json.get('items', []) | map(attribute='id'))) }}"
         _natpols: "{{ dict(_natlk.results[3].json.get('items', []) | selectattr('name','defined') | map(attribute='name') | zip(_natlk.results[3].json.get('items', []) | selectattr('name','defined') | map(attribute='id'))) }}"
@@ -63,6 +63,14 @@
               + _natlk.results[4].json.get('items', [])
               | selectattr('secondary.name', 'defined') | selectattr('secondary.name', 'equalto', ftd_device) | list
               + [{}]) | first }}
+
+    - name: Fail when the managed device is not registered
+      ansible.builtin.fail:
+        msg: >-
+          Device '{{ ftd_device }}' is not registered in FMC (looked up for this role).
+          Register it first - without it every id below resolves to nothing and the
+          failure surfaces later as an unrelated 'sequence was empty'.
+      when: not _dev_id
 
     - name: Create NAT policy if missing
       ansible.builtin.uri:

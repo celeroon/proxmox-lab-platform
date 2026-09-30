@@ -1119,6 +1119,11 @@ def _generate_vm_playbook(
         "gather_facts": ansible_section.get("gather_facts", False),
         "become": ansible_section.get("become", False),
         "vars": play_vars,
+        # uri defaults to a 30s read timeout, and FMC regularly takes longer than that while
+        # it is deploying policy or installing its LSP — a single slow call then aborts the
+        # whole deploy with "Connection failure: The read operation timed out". 120s costs
+        # nothing when FMC is responsive and absorbs the slow periods.
+        "module_defaults": {"ansible.builtin.uri": {"timeout": 120}},
         "tasks": tasks,
     }
     playbook_path.write_text(yaml.dump([play], default_flow_style=False, sort_keys=False))

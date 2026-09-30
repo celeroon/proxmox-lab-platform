@@ -1,0 +1,114 @@
+---
+# One iteration of "make both HA peers clean". FMC refuses to pair units with undeployed
+# config — verified: POST ftddevicehapairs returns 400 "Primary and Secondary devices are not
+# compatible. One or both Peers are dirty," — so this role cannot simply WAIT for clean peers.
+# Nothing else is guaranteed to push their config: deploy_pending runs earlier in the scenario
+# but can legitimately conclude "nothing pending" while FMC has not yet listed the devices,
+# leaving them dirty forever and this role deadlocked until its retries run out.
+#
+# So: read the deployable set, and if a peer is on it, deploy it. Re-reading every iteration
+# also keeps the device list and version stamp fresh, which FMC validates strictly.
+# Re-auth only on 401 (FMC caps concurrent tokens).
+#
+# Included in a loop by create_ha_pair.yml; sets _ha_clean_done for the caller.
+
+- name: Pause between peer-clean checks
+  ansible.builtin.wait_for:
+    timeout: "{{ ha_clean_delay | default(20) }}"
+  delegate_to: localhost
+  when:
+    - not (_ha_clean_done | default(false))
+    - item | int > 0
+
+- name: Read the deployable set
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+    validate_certs: no
+    status_code: [200, 401]
+  delegate_to: localhost
+  register: hc_read
+  failed_when: false
+  when: not (_ha_clean_done | default(false))
+
+- name: Re-authenticate after a rejected token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+    method: POST
+    user: "{{ _fmc_user }}"
+    password: "{{ _fmc_pass }}"
+    force_basic_auth: yes
+    validate_certs: no
+    status_code: [200, 204]
+  delegate_to: localhost
+  register: hc_auth
+  until: hc_auth is succeeded
+  retries: 5
+  delay: 20
+  when:
+    - not (_ha_clean_done | default(false))
+    - hc_read.status | default(-1) == 401
+
+- name: Adopt the new token
+  ansible.builtin.set_fact:
+    ha_auth: "{{ hc_auth }}"
+  when:
+    - not (_ha_clean_done | default(false))
+    - hc_auth is not skipped
+    - hc_auth.x_auth_access_token is defined
+
+- name: Read the deployable set again with the new token
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/deployment/deployabledevices?expanded=true&limit=1000"
+    method: GET
+    headers:
+      X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: hc_read2
+  failed_when: false
+  when:
+    - not (_ha_clean_done | default(false))
+    - hc_read.status | default(-1) == 401
+
+# Peers still carrying undeployed config, by the names FMC lists them under. Before the pair
+# exists FMC lists the MEMBERS; afterwards it lists the pair, which is why both are matched.
+- name: Note which peers are still dirty
+  vars:
+    _src: "{{ hc_read2 if (hc_read.status | default(-1) == 401) else hc_read }}"
+  ansible.builtin.set_fact:
+    _ha_dirty: >-
+      {{ _src.get('json', {}).get('items', [])
+         | selectattr('name', 'in', [ha_primary, _secondary, _ha_name]) | list }}
+  when: not (_ha_clean_done | default(false))
+
+- name: Deploy the dirty peers
+  uri:
+    url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/deployment/deploymentrequests"
+    method: POST
+    headers:
+      X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
+    body_format: json
+    body:
+      type: DeploymentRequest
+      version: "{{ _ha_dirty | selectattr('canBeDeployed', 'equalto', true) | map(attribute='version') | map('int') | max | string }}"
+      forceDeploy: false
+      ignoreWarning: true
+      deviceList: "{{ _ha_dirty | selectattr('canBeDeployed', 'equalto', true) | map(attribute='id') | list }}"
+    validate_certs: no
+    status_code: [200, 201, 202, 400, 401, 500]
+  delegate_to: localhost
+  register: hc_push
+  failed_when: false
+  when:
+    - not (_ha_clean_done | default(false))
+    - (_ha_dirty | selectattr('canBeDeployed', 'equalto', true) | list | length) > 0
+
+- name: Mark the peers clean
+  ansible.builtin.set_fact:
+    _ha_clean_done: true
+  when:
+    - not (_ha_clean_done | default(false))
+    - _ha_dirty | length == 0

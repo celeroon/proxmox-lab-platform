@@ -145,115 +145,25 @@
               FMC names FTDv interfaces Ethernet0/x, not GigabitEthernet0/x.
           when: not _if_id
 
-        # Authoritative readiness gate: devicerecords.deploymentStatus, which goes
-        # DEPLOYMENT_IN_PROGRESS -> DEPLOYED. FMC AUTO-deploys a freshly registered FTD and that
-        # takes ~11 minutes (measured, FMCv 10.0). The deployabledevices check below cannot stand
-        # alone for it: for the first seconds after registration FMC does not list the device
-        # there AT ALL, so "absent == clean" passes in that gap and HA forms against a unit that
-        # is mid-deploy. Requiring BOTH peers present and DEPLOYED closes the gap — an absent
-        # device can no longer be mistaken for a clean one.
-        # Re-register the auth var so every task after this uses a FRESH token. FMC tokens live
-        # ~30 min and are invalidated when the concurrent-token cap is hit (a GUI login does it),
-        # and the waits below can each run 10-20 min - a token taken at the top of the role is
-        # routinely dead by the time they finish. Seen as: 401 "Access token invalid." on a poll
-        # whose previous iteration succeeded.
-        - name: Refresh the FMC token before the readiness gates
-          uri:
-                url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
-                method: POST
-                user: "{{ _fmc_user }}"
-                password: "{{ _fmc_pass }}"
-                force_basic_auth: yes
-                validate_certs: no
-                status_code: [200, 204]
-          delegate_to: localhost
-          register: ha_auth
-          until: ha_auth is succeeded
-          retries: 10
-          delay: 30
+        # Make the peers clean, do not merely wait for them. FMC refuses to pair units with
+        # undeployed config (verified: 400 "Primary and Secondary devices are not compatible.
+        # One or both Peers are dirty,"), and nothing else reliably pushes it — deploy_pending
+        # runs earlier but can conclude "nothing pending" while FMC has not yet listed the
+        # devices. Waiting then deadlocks: op 401 span its full budget with both peers stuck
+        # at DEPLOYMENT_PENDING because no deploy was ever going to happen. See _ha_clean.yml.
+        - name: Ensure both peers have no undeployed config
+          ansible.builtin.include_tasks: _ha_clean.yml
+          loop: "{{ range(0, (ha_clean_retries | default(60) | int) + 1) | list }}"
+          loop_control: { label: "check {{ item + 1 }}" }
+          when: not (_ha_clean_done | default(false))
 
-        - name: Wait until both peers report DEPLOYED
-          uri:
-            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devices/devicerecords?expanded=true&limit=1000"
-            method: GET
-            headers:
-              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
-            validate_certs: no
-          delegate_to: localhost
-          register: ha_depstat
-          until: >-
-            {{ ha_depstat.status | default(-1) == 200 and
-               (ha_depstat.get('json', {}).get('items', [])
-                | selectattr('name', 'in', [ha_primary, _secondary])
-                | selectattr('deploymentStatus', 'equalto', 'DEPLOYED')
-                | list | length) == 2 }}
-          retries: "{{ ha_ready_retries | default(60) }}"
-          delay: "{{ ha_ready_delay | default(20) }}"
-          failed_when: false
-
-        - name: Fail when a peer never reached DEPLOYED
-          vars:
-            _seen: >-
-              {{ ha_depstat.get('json', {}).get('items', [])
-                 | selectattr('name', 'in', [ha_primary, _secondary])
-                 | map(attribute='name') | list }}
-            _stat: >-
-              {{ ha_depstat.get('json', {}).get('items', [])
-                 | selectattr('name', 'in', [ha_primary, _secondary])
-                 | map(attribute='deploymentStatus') | list }}
+        - name: Fail when the peers could not be made clean
           ansible.builtin.fail:
             msg: >-
-              Peers not both DEPLOYED after {{ ha_ready_retries | default(60) }} checks.
-              Expected [{{ ha_primary }}, {{ _secondary }}], saw {{ _seen }} with status {{ _stat }}.
-              FMC auto-deploys a newly registered FTD for ~11 min; raise ha_ready_retries if it
-              is merely slow. A peer missing entirely is not registered.
-          when: >-
-            ha_depstat.status | default(-1) != 200 or
-            (ha_depstat.get('json', {}).get('items', [])
-             | selectattr('name', 'in', [ha_primary, _secondary])
-             | selectattr('deploymentStatus', 'equalto', 'DEPLOYED')
-             | list | length) != 2
-
-        # Belt and braces after the gate above: FMC refuses to pair units with undeployed
-        # config ("One or both Peers are dirty, One or both peer deployment is in progress").
-        - name: Wait until neither peer has pending config
-          uri:
-            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/deployment/deployabledevices?limit=1000"
-            method: GET
-            headers:
-              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
-            validate_certs: no
-          delegate_to: localhost
-          register: ha_pending
-          # Status guard: "empty list == both peers clean", so a failed GET must not read as
-          # clean and let HA form against a device that still has pending config.
-          until: >-
-            {{ ha_pending.status | default(-1) == 200 and
-               (ha_pending.get('json', {}).get('items', [])
-                | selectattr('name', 'in', [ha_primary, _secondary])
-                | list | length) == 0 }}
-          retries: "{{ ha_clean_retries | default(30) }}"
-          delay: "{{ ha_clean_delay | default(20) }}"
-          failed_when: false
-
-        # Nothing in this role pushes policy, so a peer that stays dirty never resolves on its
-        # own — say which one and what to do, instead of timing out into a raw uri dump.
-        - name: Fail when a peer still has pending config
-          vars:
-            _dirty: >-
-              {{ ha_pending.get('json', {}).get('items', [])
-                 | selectattr('name', 'in', [ha_primary, _secondary])
-                 | map(attribute='name') | list }}
-          ansible.builtin.fail:
-            msg: >-
-              Still pending after {{ ha_clean_retries | default(30) }} checks: {{ _dirty }}.
-              FMC refuses to pair dirty units. Run cisco-fmc/deploy_pending with
-              deploy_all: true before this task — deploying only the secondary leaves the
-              primary dirty, and this wait can then never clear.
-          when: >-
-            ha_pending.status | default(-1) != 200 or
-            (ha_pending.get('json', {}).get('items', [])
-             | selectattr('name', 'in', [ha_primary, _secondary]) | list | length) > 0
+              HA peers still have undeployed config after {{ ha_clean_retries | default(60) }}
+              checks: {{ _ha_dirty | default([]) | map(attribute='name') | list }}. FMC will not
+              pair dirty units. Deploy them from the FMC GUI and re-run.
+          when: not (_ha_clean_done | default(false))
 
         - name: Request HA formation
           uri:
@@ -338,30 +248,15 @@
           retries: 10
           delay: 30
 
+        # Include loop, not a uri `until`: formation takes 10-20 minutes and the token does
+        # not survive it — op 391 reported "never reached Active/Standby ... configStatus=absent"
+        # purely because the poll got 401 on a pair that was already healthy. See _ha_wait.yml.
         - name: Wait for HA formation to finish
-          uri:
-            url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ ha_auth.domain_uuid }}/devicehapairs/ftddevicehapairs?expanded=true&limit=1000"
-            method: GET
-            headers:
-              X-auth-access-token: "{{ ha_auth.x_auth_access_token }}"
-            validate_certs: no
-          delegate_to: localhost
-          register: ha_task
-          vars:
-            _m: >-
-              {{ ((ha_task.get('json', {}).get('items', [])
-                   | selectattr('name', 'equalto', _ha_name) | list + [{}]) | first).get('metadata', {}) }}
-          until: >-
-            {{ ha_task.status | default(-1) == 200
-               and _m.get('configStatus', '') == 'HEALTHY_CONFIG'
-               and ([_m.get('primaryStatus', {}).get('currentStatus', ''),
-                     _m.get('secondaryStatus', {}).get('currentStatus', '')] | sort) == ['Active', 'Standby'] }}
-          retries: "{{ ha_retries | default(60) }}"
-          delay: "{{ ha_delay | default(30) }}"
-          failed_when: false
+          ansible.builtin.include_tasks: _ha_wait.yml
+          loop: "{{ range(0, (ha_retries | default(60) | int) + 1) | list }}"
+          loop_control: { label: "poll {{ item + 1 }}" }
+          when: not (_ha_done | default(false))
 
-        # NB the auth token above is ~30 min old by the end of a full retry budget; a 401 here
-        # shows up as status != 200 and is reported rather than silently retried forever.
         - name: Fail when HA formation did not succeed
           vars:
             _m: >-
@@ -373,11 +268,7 @@
               {{ ha_task.status | default('?') }}): configStatus={{ _m.get('configStatus', 'absent') }},
               primary={{ _m.get('primaryStatus', {}).get('currentStatus', 'absent') }},
               secondary={{ _m.get('secondaryStatus', {}).get('currentStatus', 'absent') }}
-          when: >-
-            ha_task.status | default(-1) != 200
-            or _m.get('configStatus', '') != 'HEALTHY_CONFIG'
-            or ([_m.get('primaryStatus', {}).get('currentStatus', ''),
-                 _m.get('secondaryStatus', {}).get('currentStatus', '')] | sort) != ['Active', 'Standby']
+          when: not (_ha_done | default(false))
 
         - name: Report the result
           ansible.builtin.debug:

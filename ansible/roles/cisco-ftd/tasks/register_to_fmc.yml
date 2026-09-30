@@ -263,6 +263,23 @@
     # Registration is asynchronous — the POST returns a task id, and the device
     # only appears once the sftunnel is up. sw_version is populated from the
     # device itself, so it is the signal that the tunnel actually formed.
+    # Fresh token: this wait can run 10 minutes and an FMC token lives ~30, so a token taken
+    # earlier in the role expires partway and the poll dies on 401 for a healthy system.
+    - name: Refresh the FMC token before the registration wait
+      uri:
+        url: "https://{{ fmc_host }}/api/fmc_platform/v1/auth/generatetoken"
+        method: POST
+        user: "{{ _fmc_user }}"
+        password: "{{ _fmc_pass }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 204]
+      delegate_to: localhost
+      register: fmc_auth
+      until: fmc_auth is succeeded
+      retries: 10
+      delay: 30
+
     - name: Wait for the device to finish registering
       uri:
         url: "https://{{ fmc_host }}/api/fmc_config/v1/domain/{{ _dom }}/devices/devicerecords?expanded=true&limit=1000"
