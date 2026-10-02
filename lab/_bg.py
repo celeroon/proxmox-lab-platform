@@ -152,6 +152,15 @@ def _detonate(op_id: int, deployment_name: str, username: str,
     )
 
 
+def _apply_phase(op_id: int, deployment_name: str, username: str,
+                 phase: str = "", only_vm: str = "") -> None:
+    from lab.deploy import DeployEngine
+    DeployEngine().apply_phase(
+        deployment_name, username, phase=phase, only_vm=only_vm,
+        log_fn=lambda msg: _log(op_id, msg),
+    )
+
+
 def _ct_template_fetch(op_id: int, name: str) -> None:
     from lab.config import get_settings
     from lab.proxmox import ProxmoxClient
@@ -189,6 +198,7 @@ _TASKS: dict[str, Callable[..., None]] = {
     "snapshot_rollback": _snapshot_rollback,
     "snapshot_delete": _snapshot_delete,
     "detonate": _detonate,
+    "apply_phase": _apply_phase,
     "_noop": _noop,
 }
 

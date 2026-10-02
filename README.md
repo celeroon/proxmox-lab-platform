@@ -234,6 +234,74 @@ Extra `lab detonate` flags — `--revert vm[,vm]` (roll back only these victims)
 (seconds to wait after rollback for agent check-in / clock resync, default 90) — are documented
 per scenario, e.g. [`scenarios/art-topology-a1/README.md`](scenarios/art-topology-a1/README.md).
 
+### Phased deploys (partial topology)
+
+A deploy builds only the **baseline** — every task with no `phase:` marker. Tasks marked
+`phase: <name>` are held back and applied later with `lab apply`. Use it to keep a lab's
+basic topology quick and reliable to stand up, and layer the slow or failure-prone config
+(tunnels, dynamic routing) on top only when you need it.
+
+Phase names are free-form. `detonate` is the one reserved by convention — it is what
+[`lab detonate`](#snapshots-detonation-range) runs, with snapshot rollback and reporting.
+`lab apply` is additive config only: no rollback, no settle, no report.
+
+```yaml
+# scenario.yml — unmarked tasks are the baseline, marked ones are overlays
+tasks:
+  - task: cisco-fmc/configure_nat            # baseline: runs on `lab deploy start`
+  - task: cisco-fmc/configure_access_rules   # baseline
+  - task: cisco-fmc/configure_vtis
+    phase: s2s                               # held back for `lab apply --phase s2s`
+  - task: cisco-fmc/configure_bgp
+    phase: bgp                               # held back for `lab apply --phase bgp`
+```
+
+```bash
+lab deploy start <deployment> --user <user>                      # baseline only
+lab apply <deployment> --user <user> --phase s2s                 # add one overlay
+lab apply <deployment> --user <user> --phase bgp                 # add another
+lab apply <deployment> --user <user> --phase s2s --vm fgt-1      # one VM (comma-separated)
+```
+
+`--phase` is required; `--vm` and `--user` are optional. Phases run across VMs in scenario
+order, and tasks within a phase in file order. Re-running a phase is safe — the roles are
+idempotent.
+
+**Phases are independent by design — nothing enforces an order between them.** If one overlay
+depends on another, that is yours to sequence. Applying a phase whose prerequisite is missing
+fails at the device, not at the CLI.
+
+#### Worked example — [`network-lab2`](scenarios/network-lab2/scenario.yml)
+
+The HQ firewall pair (`ftd-2`) and the branch FortiGates (`fgt-1`, `fgt-3`) each split three ways:
+
+| phase | `ftd-2` | `fgt-1` / `fgt-3` |
+|---|---|---|
+| *baseline* | registration, HA pair, zones, objects, interfaces, static routes, NAT, ACLs | initial setup, addresses, interfaces, SD-WAN, routing, internet policy, mgmt, HA |
+| `s2s` | VTIs, deploy, S2S VPN topologies | IPsec phase1/phase2, VPN policies |
+| `bgp` | prefix lists, route maps, BGP | prefix lists, route maps, BGP |
+
+```bash
+lab deploy start network-lab2 --user <user>            # routed topology, internet access, no VPN
+lab apply network-lab2 --user <user> --phase s2s       # tunnels HQ <-> BR1
+lab apply network-lab2 --user <user> --phase bgp       # eBGP over the tunnels
+```
+
+Here `bgp` **requires** `s2s` first — the BGP neighbours live on the tunnel interfaces.
+
+Two scenario-specific notes, both load-bearing:
+
+- FortiGate firewall policies are split across two `configure_policies` calls, because the VPN
+  policies reference tunnel interfaces that `configure_ipsec_phase1` creates and FortiOS rejects
+  a policy whose interface does not exist. This works because the role is `state: present`
+  looped per `policyid`, so a second call with a different subset adds rather than replaces.
+- SD-WAN stays in the baseline on `fgt-1` — its static default route points at the
+  `virtual-wan-link` zone, so deferring it would leave the baseline with no default route.
+
+This scenario ends each phase **without** a final `cisco-fmc/deploy_pending`: the config is
+left pending in FMC and pushed by hand (Deploy > Deploy All). Until that push nothing is live
+on the firewall.
+
 ---
 
 ## Scenarios

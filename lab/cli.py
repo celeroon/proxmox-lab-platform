@@ -1296,6 +1296,22 @@ def snapshot_list(
 
 # ── detonate (run tests against a deployed range) ───────────────────────────────
 
+@app.command("apply", hidden=not _caller_is_admin)
+def apply_phase(
+    deployment: str = typer.Argument(..., help="Deployment name."),
+    phase: str = typer.Option(..., "--phase", help="Scenario phase to apply (e.g. s2s, bgp)."),
+    vm: str = typer.Option("", "--vm", help="Comma-separated VMs to limit to (default: all VMs in the phase)."),
+    user: str = typer.Option("", "--user", help="Target username (admin only)."),
+):
+    """Apply a named scenario phase on top of an already-deployed baseline (admin only).
+
+    A deploy builds the baseline — every task with no `phase:` marker. This layers one
+    named phase on top, e.g. `lab apply network-lab2 --phase s2s`. Additive config only:
+    no snapshot rollback and no report (use `lab detonate` for an attack run).
+    """
+    _spawn_range_op("apply_phase", deployment, user, extra=[phase, vm])
+
+
 @app.command("detonate", hidden=not _caller_is_admin)
 def detonate(
     deployment: str = typer.Argument(..., help="Deployment name."),

@@ -182,6 +182,9 @@ vms:
       gather_facts: false
       become: false
       tasks:
+        # Name the appliance before it registers, so FMC records the real hostname
+        # and the HA pair is built from correctly named peers.
+        - task: cisco-ftd/set_hostname
         - task: cisco-ftd/register_to_fmc
           vars:
             fmc_host: "{{ fmc_1_ip }}"
@@ -219,6 +222,9 @@ vms:
       gather_facts: false
       become: false
       tasks:
+        # Name the appliance before it registers, so FMC records the real hostname
+        # and the HA pair is built from correctly named peers.
+        - task: cisco-ftd/set_hostname
         - task: cisco-ftd/register_to_fmc
           vars:
             fmc_host: "{{ fmc_1_ip }}"
@@ -296,32 +302,9 @@ vms:
             ftd_device: ftd-1
             subinterfaces:
               - {interface: Ethernet0/1, sub_id: 100, vlan: 100, ifname: SERVERS, ip: 192.168.100.1, netmask: 24, zone: SERVERS_ZONE}
-        - task: cisco-fmc/configure_vtis
-          vars:
-            fmc_host: "{{ fmc_1_ip }}"
-            ftd_device: ftd-1
-            vtis:
-              - {ifname: WAN1_BR1_vti_1, tunnel_id: 1, ip: 169.254.2.1, netmask: 30, source: Ethernet0/0, zone: WAN1_BR1_VTI_1_ZONE}
-              - {ifname: WAN2_BR1_vti_1, tunnel_id: 2, ip: 169.254.3.1, netmask: 30, source: Ethernet0/2, zone: WAN2_BR1_VTI_1_ZONE}
-        # Push the interfaces/VTIs FIRST — a VTI must be deployed before it can be used as
-        # an S2S VPN endpoint (FMC rejects an undeployed VTI with "only routed mode interfaces").
-        - task: cisco-fmc/deploy_pending
-          vars:
-            fmc_host: "{{ fmc_1_ip }}"
-            deploy_all: true
-        - task: cisco-fmc/configure_prefix_lists
-          vars:
-            fmc_host: "{{ fmc_1_ip }}"
-            prefix_lists:
-              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.10.0/24"}]}
-              - {name: HQ_BGP_OUT, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.100.0/24"}, {sequence: 20, action: PERMIT, ipAddress: "192.168.200.0/24"}]}
-        - task: cisco-fmc/configure_route_maps
-          vars:
-            fmc_host: "{{ fmc_1_ip }}"
-            route_maps:
-              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_IN}]}
-              - {name: HQ_BGP_PRI_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
-              - {name: HQ_BGP_SEC_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
+        # ── baseline ends here ────────────────────────────────────────────────
+        # Everything above is the basic topology: registration, HA, zones, objects,
+        # interfaces, routes, NAT and ACLs. `lab deploy start` runs exactly this.
         - task: cisco-fmc/configure_nat
           vars:
             fmc_host: "{{ fmc_1_ip }}"
@@ -337,14 +320,55 @@ vms:
               - {name: SERVERS-INTERNET-ALLOW, action: ALLOW, src_zones: [SERVERS_ZONE], dst_zones: [OUTSIDE_ISP1_ZONE], src_nets: ["SERVERS-192.168.100.0-24"], dst_nets: []}
               - {name: SERVERS-BR1, action: ALLOW, src_zones: [SERVERS_ZONE], dst_zones: [], src_nets: ["SERVERS-192.168.100.0-24"], dst_nets: ["BR1-192.168.10.0-24"]}
               - {name: BR1-SERVERS, action: ALLOW, src_zones: [], dst_zones: [SERVERS_ZONE], src_nets: ["BR1-192.168.10.0-24"], dst_nets: ["SERVERS-192.168.100.0-24"]}
+
+        # ── phase: s2s ────────────────────────────────── lab apply --phase s2s ──
+        # Tunnel interfaces + the IKEv2/IPsec topologies to BR1. Additive on top of
+        # the baseline; nothing above depends on any of it.
+        - task: cisco-fmc/configure_vtis
+          phase: s2s
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            ftd_device: ftd-1
+            vtis:
+              - {ifname: WAN1_BR1_vti_1, tunnel_id: 1, ip: 169.254.2.1, netmask: 30, source: Ethernet0/0, zone: WAN1_BR1_VTI_1_ZONE}
+              - {ifname: WAN2_BR1_vti_1, tunnel_id: 2, ip: 169.254.3.1, netmask: 30, source: Ethernet0/2, zone: WAN2_BR1_VTI_1_ZONE}
+        # Push the VTIs BEFORE building the topology — a VTI must be deployed before it
+        # can be used as an S2S endpoint (FMC rejects an undeployed one with "only routed
+        # mode interfaces"). This mid-phase deploy is required, not cosmetic.
+        - task: cisco-fmc/deploy_pending
+          phase: s2s
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            deploy_all: true
         - task: cisco-fmc/configure_s2s_vpn
+          phase: s2s
           vars:
             fmc_host: "{{ fmc_1_ip }}"
             ftd_device: ftd-1
             s2s_vpns:
               - {name: VTI-BR1-WAN1, local_vti: WAN1_BR1_vti_1, peer_name: BR1, peer_ip: 192.0.2.10}
               - {name: VTI-BR1-WAN2, local_vti: WAN2_BR1_vti_1, peer_name: BR1, peer_ip: 203.0.113.2}
+
+        # ── phase: bgp ────────────────────────────────── lab apply --phase bgp ──
+        # eBGP over the VTIs. REQUIRES phase s2s first: the neighbours 169.254.2.2 /
+        # 169.254.3.2 are only reachable once the tunnels exist.
+        - task: cisco-fmc/configure_prefix_lists
+          phase: bgp
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            prefix_lists:
+              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.10.0/24"}]}
+              - {name: HQ_BGP_OUT, entries: [{sequence: 10, action: PERMIT, ipAddress: "192.168.100.0/24"}, {sequence: 20, action: PERMIT, ipAddress: "192.168.200.0/24"}]}
+        - task: cisco-fmc/configure_route_maps
+          phase: bgp
+          vars:
+            fmc_host: "{{ fmc_1_ip }}"
+            route_maps:
+              - {name: HQ_BGP_IN, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_IN}]}
+              - {name: HQ_BGP_PRI_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
+              - {name: HQ_BGP_SEC_OUT, entries: [{sequence: 10, action: PERMIT, prefix_list: HQ_BGP_OUT}]}
         - task: cisco-fmc/configure_bgp
+          phase: bgp
           vars:
             fmc_host: "{{ fmc_1_ip }}"
             ftd_device: ftd-1
@@ -354,11 +378,10 @@ vms:
               - {ip: 169.254.2.2, remote_as: 65110, weight: 200, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_PRI_OUT}
               - {ip: 169.254.3.2, remote_as: 65110, weight: 100, keepalive: 5, holdtime: 15, route_map_in: HQ_BGP_IN, route_map_out: HQ_BGP_SEC_OUT}
             bgp_networks: ["SERVERS-192.168.100.0-24", "USERS-192.168.200.0-24"]
-        # NO final deploy_pending on purpose — the config written by the roles above
-        # (BGP, NAT, ACL, S2S) is left PENDING in FMC and pushed by hand from the GUI
-        # (Deploy > Deploy All). Until that push nothing above is live on the firewall:
-        # `show bgp summary` on the FTD reports "% BGP not active" while FMC already
-        # shows the full BGP config.
+        # NO final deploy_pending in any phase, on purpose — config written by the roles
+        # above is left PENDING in FMC and pushed by hand (Deploy > Deploy All). Until
+        # that push nothing is live: `show bgp summary` reports "% BGP not active" while
+        # FMC already shows the full config.
 
   - name: sw-hq
     # The HQ switch sits behind the firewall pair — bring it up once both FTDs are in.
@@ -594,6 +617,7 @@ vms:
         # Route-based IPsec: dual tunnels to br3 (one per WAN, BGP over APIPA transit IPs)
         # plus dual tunnels to HQ. PSK "vagrant" on all four.
         - task: fortigate/configure_ipsec_phase1
+          phase: s2s
           vars:
             ipsec_psk: vagrant
             ipsec_tunnels:
@@ -604,6 +628,7 @@ vms:
               - {name: HQ-VPN2,  interface: port3, remote_gw: 198.51.100.2,
                  tunnel_ip: "169.254.3.2 255.255.255.255", tunnel_remote_ip: "169.254.3.1 255.255.255.252"}
         - task: fortigate/configure_ipsec_phase2
+          phase: s2s
           vars:
             ipsec_phase2:
               - {name: BR3-VPN1, phase1: BR3-VPN1, auto_negotiate: enable}
@@ -637,6 +662,7 @@ vms:
         # BGP filters (bound to the neighbors below): br1-bgp-out advertises the local LAN
         # outbound to all peers, br3-bgp-in accepts br3's LAN, hq-bgp-in accepts HQ's networks.
         - task: fortigate/configure_prefix_lists
+          phase: bgp
           vars:
             prefix_lists:
               - name: br1-bgp-out
@@ -650,6 +676,7 @@ vms:
                   - {id: 1, action: permit, prefix: "192.168.100.0 255.255.255.0"}
                   - {id: 2, action: permit, prefix: "192.168.200.0 255.255.255.0"}
         - task: fortigate/configure_route_maps
+          phase: bgp
           vars:
             route_maps:
               - name: br1-bgp-out
@@ -664,6 +691,7 @@ vms:
         # eBGP: AS 65110 (br1). Peers to br3 (AS 65130) over both BR3 tunnels and to HQ
         # (AS 65100) over both HQ tunnels; weight picks the primary path per peer.
         - task: fortigate/configure_bgp
+          phase: bgp
           vars:
             bgp_config:
               as: "65110"
@@ -679,6 +707,9 @@ vms:
               network:
                 - {id: 1, prefix: "192.168.10.0 255.255.255.0"}
         # LAN -> internet (via SD-WAN, NAT), and both S2S directions between LAN and the tunnels.
+        # Baseline policy only — LAN out to the internet via SD-WAN. The two VPN
+        # policies live in phase s2s because they reference tunnel interfaces that
+        # configure_ipsec_phase1 creates; FortiOS rejects a policy whose intf is absent.
         - task: fortigate/configure_policies
           vars:
             firewall_policies:
@@ -693,6 +724,12 @@ vms:
                 service: [{name: ALL}]
                 logtraffic: all
                 nat: enable
+        # Additive: the role is state:present looped per policyid, so a second call with
+        # a different subset adds rather than replaces.
+        - task: fortigate/configure_policies
+          phase: s2s
+          vars:
+            firewall_policies:
               - policyid: 2
                 name: allow-s2s
                 srcintf: [{name: vlan10}]
@@ -802,6 +839,9 @@ vms:
       gather_facts: false
       become: false
       tasks:
+        # Name the appliance before it registers, so FMC records the real hostname
+        # and the HA pair is built from correctly named peers.
+        - task: cisco-ftd/set_hostname
         - task: cisco-ftd/register_to_fmc
           vars:
             fmc_host: "{{ fmc_1_ip }}"
@@ -901,12 +941,14 @@ vms:
               - {name: vlan30, interface: port3, vlanid: 30, ip: "192.168.30.1 255.255.255.0", description: "LAN vlan30", alias: LAN30, role: lan}
         # Route-based IPsec back to br1's two WANs (BGP over APIPA transit IPs); PSK "vagrant".
         - task: fortigate/configure_ipsec_phase1
+          phase: s2s
           vars:
             ipsec_psk: vagrant
             ipsec_tunnels:
               - {name: BR1-VPN1, interface: port2, remote_gw: 192.0.2.10,  tunnel_ip: "169.254.10.2 255.255.255.255", tunnel_remote_ip: "169.254.10.1 255.255.255.255"}
               - {name: BR1-VPN2, interface: port2, remote_gw: 203.0.113.2, tunnel_ip: "169.254.11.2 255.255.255.255", tunnel_remote_ip: "169.254.11.1 255.255.255.255"}
         - task: fortigate/configure_ipsec_phase2
+          phase: s2s
           vars:
             ipsec_phase2:
               - {name: BR1-VPN1, phase1: BR1-VPN1, auto_negotiate: enable}
@@ -918,6 +960,7 @@ vms:
               - {seq_num: 1, dst: "0.0.0.0 0.0.0.0", gateway: 203.0.113.9, device: port2}
         # BGP filters: br3-bgp-out advertises the local LAN, br1-bgp-in accepts br1's LAN.
         - task: fortigate/configure_prefix_lists
+          phase: bgp
           vars:
             prefix_lists:
               - name: br3-bgp-out
@@ -927,6 +970,7 @@ vms:
                 rule:
                   - {id: 1, action: permit, prefix: "192.168.10.0 255.255.255.0"}
         - task: fortigate/configure_route_maps
+          phase: bgp
           vars:
             route_maps:
               - name: br3-bgp-out
@@ -937,6 +981,7 @@ vms:
                   - {id: 1, action: permit, match_ip_address: br1-bgp-in}
         # eBGP: AS 65130 (br3) peers to br1 (AS 65110) over both tunnels; weight picks primary.
         - task: fortigate/configure_bgp
+          phase: bgp
           vars:
             bgp_config:
               as: "65130"
@@ -947,7 +992,8 @@ vms:
                 - {ip: 169.254.11.1, remote_as: "65110", weight: 100, soft_reconfiguration: enable, route_map_in: br1-bgp-in, route_map_out: br3-bgp-out, link_down_failover: enable, holdtime_timer: 15, keep_alive_timer: 5}
               network:
                 - {id: 1, prefix: "192.168.30.0 255.255.255.0"}
-        # LAN -> internet (out port2, NAT) + both S2S directions between LAN and the tunnels.
+        # Baseline policy only — LAN out to the internet via port2 with NAT. The VPN
+        # policies move to phase s2s: they reference BR1-VPN1/2, created by ipsec_phase1.
         - task: fortigate/configure_policies
           vars:
             firewall_policies:
@@ -962,6 +1008,10 @@ vms:
                 service: [{name: ALL}]
                 logtraffic: all
                 nat: enable
+        - task: fortigate/configure_policies
+          phase: s2s
+          vars:
+            firewall_policies:
               - policyid: 2
                 name: allow-s2s
                 srcintf: [{name: vlan30}]

@@ -1056,20 +1056,19 @@ def _generate_vm_playbook(
     {USER_ID} in vars is substituted with user_id; {{ vm_mgmt_ip }} with vm_ip.
     other_vms injects {name_underscored}_ip play vars for every other deployed VM.
 
-    run_phase splits the task list by the optional per-task `phase:` marker:
-    "provision" (deploy) keeps tasks WITHOUT `phase: detonate`; "detonate"
-    (`lab detonate`) keeps ONLY those with it. extra_vars are merged last into
-    play vars (e.g. the `art_tactic` filter for a detonation run).
+    run_phase splits the task list by the optional per-task `phase:` marker. A task
+    with no marker belongs to the implicit "provision" phase (the baseline topology
+    a deploy builds); a task marked `phase: X` runs ONLY when phase X is requested.
+    Phase names are free-form — "detonate" (`lab detonate`, Atomic Red Team) and
+    "s2s"/"bgp" (`lab apply --phase`, network overlays) are just conventions.
+    extra_vars are merged last into play vars (e.g. `art_tactic`).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     playbook_path = output_dir / f"playbook_{vm_name}.yml"
 
     tasks = []
     for entry in ansible_section.get("tasks") or []:
-        is_detonate = entry.get("phase") == "detonate"
-        if run_phase == "provision" and is_detonate:
-            continue
-        if run_phase == "detonate" and not is_detonate:
+        if (entry.get("phase") or "provision") != run_phase:
             continue
         task_ref = entry["task"]  # e.g. "vyos/set_hostname"
         role, task_name = task_ref.split("/", 1)
@@ -1316,9 +1315,9 @@ def _provision_replica_group(
     # so they take precedence over play vars (same as standalone VM path).
     tasks = []
     for entry in ansible_section.get("tasks") or []:
-        # Replica groups only ever run the provision phase; detonate-phase tasks
-        # (if any) are handled by `lab detonate`, never during deploy.
-        if entry.get("phase") == "detonate":
+        # Replica groups only ever run the provision phase; any phase-marked task
+        # is handled by `lab detonate` / `lab apply`, never during deploy.
+        if entry.get("phase"):
             continue
         task_ref = entry["task"]
         role, task_name = task_ref.split("/", 1)
@@ -1430,6 +1429,29 @@ def _load_deployment_ops(deployment_name: str, username: str):
             rows = {r["name"]: dict(r) for r in cur.fetchall()}
 
     return user_id, deployment_id, spec, rows
+
+
+def _phase_vms(spec: ScenarioSpec, phase: str) -> list:
+    """VMSpecs that have at least one task marked `phase: <phase>`.
+
+    The implicit "provision" phase (tasks with no marker) is deliberately NOT
+    matchable here — that is what a deploy runs, and re-running it from `lab apply`
+    would re-provision the whole topology."""
+    return [
+        vs for vs in spec.vms
+        if any((t or {}).get("phase") == phase for t in (vs.ansible.get("tasks") or []))
+    ]
+
+
+def _scenario_phases(spec: ScenarioSpec) -> list[str]:
+    """Every phase name declared anywhere in the scenario, in first-seen order."""
+    seen: list[str] = []
+    for vs in spec.vms:
+        for t in vs.ansible.get("tasks") or []:
+            ph = (t or {}).get("phase")
+            if ph and ph not in seen:
+                seen.append(ph)
+    return seen
 
 
 def _snapshot_targets(spec: ScenarioSpec, rows: dict, only_vm: str | None = None) -> list:
@@ -3583,6 +3605,56 @@ class DeployEngine:
                     if not _is_already_running_error(exc):
                         raise
 
+    def apply_phase(self, deployment_name, username, phase, only_vm="", log_fn=None):
+        """Apply a named scenario phase to an already-deployed topology.
+
+        A deploy builds the baseline (tasks with no `phase:` marker). This runs one
+        named overlay on top — e.g. `phase: s2s` or `phase: bgp` on network-lab2 —
+        against the live VMs, in scenario VM order so inter-VM ordering is preserved.
+
+        Deliberately NOT a detonation: no snapshot rollback, no settle, no report.
+        Overlays are additive config, not an attack run. Use `lab detonate` for that.
+        """
+        log_fn = log_fn or print
+        _, user_id, _, spec, rows = self._prep_range(deployment_name, username, log_fn)
+
+        known = _scenario_phases(spec)
+        if phase not in known:
+            raise RuntimeError(
+                f"scenario has no tasks marked `phase: {phase}` — "
+                f"declared phases: {', '.join(known) if known else '(none)'}"
+            )
+
+        targets = _phase_vms(spec, phase)
+        if only_vm:
+            wanted = {n.strip() for n in only_vm.split(",") if n.strip()}
+            missing = wanted - {vs.name for vs in targets}
+            if missing:
+                raise RuntimeError(
+                    f"VM(s) {', '.join(sorted(missing))} have no `phase: {phase}` tasks"
+                )
+            targets = [vs for vs in targets if vs.name in wanted]
+
+        other_vms = [(n, r["management_ip"]) for n, r in rows.items() if r.get("management_ip")]
+
+        log_fn(f"applying phase '{phase}' to {len(targets)} VM(s): "
+               f"{', '.join(vs.name for vs in targets)}")
+
+        overall_ok = True
+        for vs in targets:
+            row = rows.get(vs.name)
+            if not row or not row.get("management_ip"):
+                log_fn(f"[{vs.name}] not deployed / no IP — skipping")
+                overall_ok = False
+                continue
+            log_fn(f"[{vs.name}] running phase '{phase}'")
+            ok = _provision_vm(vs.name, row["management_ip"], vs, user_id, log_fn,
+                               other_vms=other_vms, run_phase=phase)
+            overall_ok = overall_ok and ok
+        if not overall_ok:
+            raise RuntimeError(f"phase '{phase}' failed on one or more VMs — see log above")
+        log_fn(f"phase '{phase}' complete for deployment '{deployment_name}'")
+
     def detonate(self, deployment_name, username, tactic="", revert="", settle=90,
                  per_technique=False, log_fn=None):
         """Detonation run: roll back the rollback-flagged victim(s) → wait ready →
@@ -3625,10 +3697,7 @@ class DeployEngine:
             log_fn("no rollback-flagged victims — detonating against current state")
 
         # 3. Detonate VMs = those with any `phase: detonate` task.
-        detonate_specs = [
-            vs for vs in spec.vms
-            if any((t or {}).get("phase") == "detonate" for t in (vs.ansible.get("tasks") or []))
-        ]
+        detonate_specs = _phase_vms(spec, "detonate")
         if not detonate_specs:
             raise RuntimeError("no tasks marked `phase: detonate` in this scenario — nothing to run")
 

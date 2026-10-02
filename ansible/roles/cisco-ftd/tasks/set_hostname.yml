@@ -1,0 +1,85 @@
+---
+# Set the FTD's own hostname via its CLI (`configure network hostname`).
+#
+# Runs from the controller (delegate_to: localhost) over sshpass into clish, so the owning VM
+# should use `connection: {type: local}` — clish answers the platform's `true` readiness probe
+# with "Unknown command" and would hang a type: ssh deploy for the whole ssh_timeout.
+#
+# Unlike `configure manager add` this needs no pty and asks nothing: it returns rc=0 with no
+# output (verified against FTDv 10.0). Idempotent — skipped when the name already matches.
+#
+# Run this BEFORE cisco-ftd/register_to_fmc so FMC records the device under its real hostname,
+# and well before cisco-fmc/create_ha_pair.
+#
+# Optional:
+#   ftd_hostname  - name to set      (default: this VM's name)
+#   ftd_host      - FTD mgmt IP      (default: {{ vm_mgmt_ip }})
+#   ftd_user/pass - CLI creds        (default: admin / {{ fmc_admin_password }})
+
+- name: Set the FTD hostname
+  vars:
+    _ftd_host: "{{ ftd_host | default(vm_mgmt_ip) }}"
+    _ftd_user: "{{ ftd_user | default('admin') }}"
+    _ftd_pass: "{{ ftd_pass | default(fmc_admin_password) }}"
+    _name: "{{ ftd_hostname | default(vm_name) | default(inventory_hostname) }}"
+    _ssh: >-
+      ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=15 -o PreferredAuthentications=password -o PubkeyAuthentication=no
+  block:
+
+    # connection: local means the platform's own readiness gate never ran, so the guest may
+    # not exist yet — a freshly cloned FTDv answers "No route to host" for minutes.
+    - name: Wait for the FTD management interface to answer
+      ansible.builtin.wait_for:
+        host: "{{ _ftd_host }}"
+        port: 22
+        timeout: "{{ ftd_boot_timeout | default(1800) }}"
+        sleep: 10
+      delegate_to: localhost
+
+    # sshd accepts before clish will serve commands, so retry on rc rather than trusting
+    # the open port.
+    - name: Read the current hostname
+      ansible.builtin.shell:
+        cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'show network'"
+      delegate_to: localhost
+      register: ftd_net
+      changed_when: false
+      failed_when: false
+      until: ftd_net.rc == 0
+      retries: 60
+      delay: 15
+
+    - name: Note the current hostname
+      ansible.builtin.set_fact:
+        _cur_name: >-
+          {{ (ftd_net.stdout_lines | default([]) | select('search', '^Hostname') | list + ['']) | first
+             | regex_replace('^Hostname\s*:\s*', '') | trim }}
+
+    - name: Apply the hostname
+      ansible.builtin.shell:
+        cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'configure network hostname {{ _name }}'"
+      delegate_to: localhost
+      register: ftd_sethost
+      changed_when: true
+      failed_when: false
+      when: _cur_name != _name
+
+    - name: Confirm the hostname took
+      ansible.builtin.shell:
+        cmd: "timeout {{ ftd_cli_timeout | default(180) }} sshpass -p '{{ _ftd_pass }}' {{ _ssh }} {{ _ftd_user }}@{{ _ftd_host }} 'show network'"
+      delegate_to: localhost
+      register: ftd_net2
+      changed_when: false
+      failed_when: false
+      until: >-
+        ftd_net2.rc == 0 and
+        ((ftd_net2.stdout_lines | default([]) | select('search', '^Hostname') | list + ['']) | first
+         | regex_replace('^Hostname\s*:\s*', '') | trim) == _name
+      retries: "{{ ftd_hostname_retries | default(12) }}"
+      delay: "{{ ftd_hostname_delay | default(10) }}"
+      when: _cur_name != _name
+
+    - name: Report the hostname
+      ansible.builtin.debug:
+        msg: "FTD hostname is '{{ _name }}'{{ ' (already set)' if _cur_name == _name else ' (was ' ~ _cur_name ~ ')' }}"
