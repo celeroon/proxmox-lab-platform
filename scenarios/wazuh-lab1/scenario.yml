@@ -1,0 +1,348 @@
+version: 1
+name: wazuh-lab1 (Wazuh lab — FortiGate HQ, Cumulus LAN, S2S-ready for an FTD branch)
+description: >-
+  One VyOS acts as the ISP with four uplinks (three RFC 5737 TEST-NETs and one RFC 6598
+  CGNAT range). HQ is a single FortiGate (fgt-1) on the first uplink, with a Cumulus switch
+  behind it carrying the LAN in VLAN 10: a Wazuh host, Ubuntu and Windows endpoints, a
+  Suricata host and one reserved port. fgt-1 already carries a route-based IPsec tunnel to
+  BR1 — a future FTD on the second uplink — which stays down until that firewall exists.
+  The third and fourth uplinks are for BR2 and BR3, future Cisco routers.
+vm_prefix: ""
+
+# Every VM gets the host CPU model (Proxmox defaults to kvm64, which hides AES-NI, AVX and
+# similar flags from the guest). A per-VM cpu_type still overrides this.
+defaults:
+  cpu_type: host
+
+# ─────────────────────────────── addressing ───────────────────────────────
+# ISP uplinks, all /29 — first usable address on vyos, last usable on the firewall:
+#   isp-hq      TEST-NET-1  192.0.2.0/29      vyos .1   fgt-1 .6              (HQ)
+#   isp-br1     TEST-NET-2  198.51.100.8/29   vyos .9   BR1 FTD .14 (future)  (BR1)
+#   isp-br2     TEST-NET-3  203.0.113.0/29    vyos .1   BR2 Cisco .6 (future)  (BR2)
+#   isp-br3     CGNAT       100.64.0.0/29     vyos .1   BR3 Cisco .6 (future)  (BR3)
+#
+# HQ LAN 192.168.10.0/24, VLAN 10 — tagged on the fgt-1 <-> sw-1 trunk, access on every
+# other switch port:
+#   .1          fgt-1 vlan10 (gateway)
+#   .10         wazuh-1
+#   .20         suricata-1
+#   .50         ubuntu-1
+#   .100-.199   fgt-1 DHCP pool (win-1, and whatever lands on the reserved port)
+#
+# S2S HQ <-> BR1: route-based IKEv2, fgt-1 192.0.2.6 <-> BR1 198.51.100.14, transit
+# 169.254.1.1 (fgt-1) / 169.254.1.2 (BR1) /30.
+
+# BR1 LAN — a placeholder until the BR1 FTD is designed. fgt-1 uses it for the BR1-LAN
+# address object and both routes into the tunnel; change it here only.
+x-br1-lan: &br1-lan "192.168.20.0 255.255.255.0"
+
+networks:
+  # ISP uplinks — vyos eth1..eth4
+  - {name: isp-hq, type: vnet}        # 192.0.2.0/29     vyos .1 <-> fgt-1 port2 .6
+  - {name: isp-br1, type: vnet}       # 198.51.100.8/29  vyos .9 <-> BR1 FTD .14 (future)
+  - {name: isp-br2, type: vnet}       # 203.0.113.0/29   vyos .1 <-> BR2 Cisco .6 (future)
+  - {name: isp-br3, type: vnet}       # 100.64.0.0/29    vyos .1 <-> BR3 Cisco .6 (future)
+  # HQ LAN — the firewall trunk, then one vnet per switch port
+  - {name: fgt-sw, type: vnet}        # fgt-1 port3 <-> sw-1 swp1 (trunk, vlan 10 tagged)
+  - {name: sw-wazuh, type: vnet}      # sw-1 swp2 (access 10) -> wazuh-1
+  - {name: sw-ubuntu, type: vnet}     # sw-1 swp3 (access 10) -> ubuntu-1
+  - {name: sw-win, type: vnet}        # sw-1 swp4 (access 10) -> win-1
+  - {name: sw-reserved, type: vnet}   # sw-1 swp5 (access 10) -> reserved for a future VM
+  - {name: sw-suricata, type: vnet}   # sw-1 swp6 (access 10) -> suricata-1
+
+vms:
+  # ═══════════════ ISP — one VyOS carrying all four uplinks ═══════════════
+  - name: vyos-1
+    template: vyos/current
+    clone_mode: linked
+    cpus: 2
+    memory: 2048
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: isp-hq}
+      - {name: eth2, type: vnet, network: isp-br1}
+      - {name: eth3, type: vnet, network: isp-br2}
+      - {name: eth4, type: vnet, network: isp-br3}
+    ansible:
+      connection: {type: network_cli, network_os: vyos, user: vyos, password: vyos}
+      gather_facts: false
+      become: false
+      tasks:
+        - task: vyos/set_hostname
+          vars: {hostname: vyos-1}
+        - task: vyos/configure_interfaces
+          vars:
+            interfaces:
+              - {name: eth1, description: "*** ISP1 -> HQ fgt-1 ***",        address: 192.0.2.1/29}
+              - {name: eth2, description: "*** ISP2 -> BR1 FTD (future) ***", address: 198.51.100.9/29}
+              - {name: eth3, description: "*** ISP3 -> BR2 Cisco (future) ***",  address: 203.0.113.1/29}
+              - {name: eth4, description: "*** CGNAT -> BR3 Cisco (future) ***", address: 100.64.0.1/29}
+        # One rule per range. No LAN rules: each firewall NATs its LAN to its own WAN
+        # address, so vyos only ever sees uplink sources. Uplink-to-uplink traffic (the
+        # HQ <-> BR1 tunnel) is routed between eth1/eth2 and never NATed.
+        - task: vyos/configure_nat
+          vars:
+            nat_rules:
+              - {rule: 100, description: "ISP1 outbound NAT",  source: 192.0.2.0/24,    outbound_interface: eth0, translation: masquerade}
+              - {rule: 110, description: "ISP2 outbound NAT",  source: 198.51.100.0/24, outbound_interface: eth0, translation: masquerade}
+              - {rule: 120, description: "ISP3 outbound NAT",  source: 203.0.113.0/24,  outbound_interface: eth0, translation: masquerade}
+              - {rule: 130, description: "CGNAT outbound NAT", source: 100.64.0.0/10,   outbound_interface: eth0, translation: masquerade}
+        - task: vyos/configure_routing
+          vars:
+            routing:
+              default_route: "10.{USER_ID}.0.1"   # mgmt gateway -> real internet
+
+  # ═══════════════ HQ firewall — FortiGate, single unit, no SD-WAN ═══════════════
+  # FortiGate interface order: port1 is ALWAYS Management (net0, injected by the platform).
+  # The scenario NICs below then map one-per-port starting at port2, in listed order.
+  #   net0  -> port1  Management  (platform mgmt IP)
+  #   eth1  -> port2  WAN  isp-hq  192.0.2.6/29  (vyos .1)
+  #   eth2  -> port3  LAN trunk    vlan10 -> 192.168.10.1/24 on the vlan10 subif
+  - name: fgt-1
+    depends_on: [vyos-1]
+    template: fortigate-fgt-1
+    clone_mode: full
+    cpus: 2
+    memory: 2048
+    qemu_agent: false
+    interfaces:
+      - {name: eth1, type: vnet, network: isp-hq}   # port2 WAN
+      - {name: eth2, type: vnet, network: fgt-sw}   # port3 LAN trunk (vlan10)
+    ansible:
+      # FortiOS is driven over its REST API (fortinet.fortios httpapi), not SSH/CLI. The
+      # SSL/port vars below are not emitted by the inventory builder for httpapi, so they
+      # are set here as play vars; the build already allows https on port1 (mgmt).
+      connection:
+        type: httpapi
+        network_os: fortinet.fortios.fortios
+        user: vagrant
+        password: vagrant
+      gather_facts: false
+      become: false
+      vars:
+        ansible_httpapi_use_ssl: true
+        ansible_httpapi_validate_certs: false
+        ansible_httpapi_port: 443
+      tasks:
+        - task: fortigate/initial_setup
+          vars: {fgt_hostname: fgt-1}
+        - task: fortigate/create_network_addresses
+          vars:
+            network_addresses:
+              - {name: "LAN10-192.168.10.0/24", subnet: "192.168.10.0 255.255.255.0"}
+              - {name: BR1-LAN, subnet: *br1-lan}
+        - task: fortigate/configure_interfaces
+          vars:
+            interfaces:
+              # Descriptions/aliases avoid '<'/'>' (the FortiOS REST API rejects those as
+              # "XSS vulnerability characters", -173).
+              - {name: port2, ip: "192.0.2.6 255.255.255.248", description: "WAN to ISP1 (vyos .1)", alias: WAN, role: wan}
+              # LAN as a trunk: port3 is the tagged parent (left unaddressed), vlan10 subif is the gateway.
+              - {name: vlan10, interface: port3, vlanid: 10, ip: "192.168.10.1 255.255.255.0", description: "LAN vlan10", alias: LAN10, role: lan}
+        # LAN DHCP: gives win-1 its LAN address (there is no generic Windows static-IP task)
+        # and serves whatever lands on the reserved port. The Linux hosts are static, below the pool.
+        - task: fortigate/configure_dhcp
+          vars:
+            dhcp_servers:
+              - id: 1
+                interface: vlan10
+                status: enable
+                lease_time: 86400
+                default_gateway: 192.168.10.1
+                netmask: 255.255.255.0
+                dns_service: specify
+                dns_server1: 8.8.8.8
+                ip_range:
+                  - {id: 1, start_ip: 192.168.10.100, end_ip: 192.168.10.199}
+        # ── S2S to BR1 ── route-based IKEv2 to the future BR1 FTD; down until that FTD exists.
+        # Proposals stay on the role defaults (des-sha1) and the PSK on "vagrant" to match the
+        # FTD side's defaults in cisco-fmc/configure_s2s_vpn.
+        - task: fortigate/configure_ipsec_phase1
+          vars:
+            ipsec_psk: vagrant
+            ipsec_tunnels:
+              - {name: BR1-VPN, interface: port2, remote_gw: 198.51.100.14,
+                 tunnel_ip: "169.254.1.1 255.255.255.255", tunnel_remote_ip: "169.254.1.2 255.255.255.252"}
+        - task: fortigate/configure_ipsec_phase2
+          vars:
+            ipsec_phase2:
+              - {name: BR1-VPN, phase1: BR1-VPN}
+        # Single WAN: plain default route out port2 (vyos .1). BR1 LAN goes into the tunnel,
+        # with a blackhole at distance 254 behind it so that traffic is dropped — not NATed
+        # out to the internet — whenever the tunnel is down.
+        - task: fortigate/configure_routing
+          vars:
+            static_routes:
+              - {seq_num: 1, dst: "0.0.0.0 0.0.0.0", gateway: 192.0.2.1, device: port2}
+              - {seq_num: 2, dst: *br1-lan, device: BR1-VPN}
+              - {seq_num: 3, dst: *br1-lan, blackhole: enable, distance: 254}
+        # LAN -> internet (NAT), and both directions between the LAN and BR1 (no NAT). One call
+        # is enough: configure_ipsec_phase1 above already created BR1-VPN, and FortiOS only
+        # rejects a policy whose interface does not exist yet.
+        - task: fortigate/configure_policies
+          vars:
+            firewall_policies:
+              - policyid: 1
+                name: lan-internet
+                srcintf: [{name: vlan10}]
+                dstintf: [{name: port2}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
+                dstaddr: [{name: all}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+                nat: enable
+              - policyid: 2
+                name: lan-to-br1
+                srcintf: [{name: vlan10}]
+                dstintf: [{name: BR1-VPN}]
+                srcaddr: [{name: "LAN10-192.168.10.0/24"}]
+                dstaddr: [{name: BR1-LAN}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+              - policyid: 3
+                name: br1-to-lan
+                srcintf: [{name: BR1-VPN}]
+                dstintf: [{name: vlan10}]
+                srcaddr: [{name: BR1-LAN}]
+                dstaddr: [{name: "LAN10-192.168.10.0/24"}]
+                action: accept
+                schedule: always
+                service: [{name: ALL}]
+                logtraffic: all
+        # Pin port1 (mgmt) to its static platform IP, out of the build's vrf 1 into vrf 0.
+        - task: fortigate/configure_mgmt_interface
+
+  # ═══════════════ HQ LAN switch — Cumulus, everything in VLAN 10 ═══════════════
+  # Scenario NICs map one-per-port from swp1 (net0 is eth0, management).
+  - name: sw-1
+    depends_on: [fgt-1]
+    template: CumulusCommunity/cumulus-vx
+    clone_mode: linked
+    cpus: 4
+    memory: 5120
+    qemu_agent: false
+    interfaces:
+      - {name: eth1, type: vnet, network: fgt-sw}        # swp1 trunk 10 -> fgt-1 port3
+      - {name: eth2, type: vnet, network: sw-wazuh}      # swp2 access 10 -> wazuh-1
+      - {name: eth3, type: vnet, network: sw-ubuntu}     # swp3 access 10 -> ubuntu-1
+      - {name: eth4, type: vnet, network: sw-win}        # swp4 access 10 -> win-1
+      - {name: eth5, type: vnet, network: sw-reserved}   # swp5 access 10 -> reserved
+      - {name: eth6, type: vnet, network: sw-suricata}   # swp6 access 10 -> suricata-1
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant, password_reset: true}
+      gather_facts: false
+      become: true
+      tasks:
+        - task: cumulus/set_hostname
+          vars: {hostname: sw-1}
+        # swp1 is a trunk: the FortiGate LAN rides a tagged vlan10 subinterface, so the
+        # switch port must accept tagged vlan10 (an access port would drop it).
+        - task: cumulus/configure_trunk_ports
+          vars:
+            trunk_ports:
+              - {port: swp1, vlans: [10], description: "*** fgt-1 LAN trunk (vlan10) ***"}
+        - task: cumulus/configure_access_ports
+          vars:
+            access_ports:
+              - {port: swp2, vlan: 10, description: "*** wazuh-1 ***"}
+              - {port: swp3, vlan: 10, description: "*** ubuntu-1 ***"}
+              - {port: swp4, vlan: 10, description: "*** win-1 ***"}
+              - {port: swp5, vlan: 10, description: "*** reserved ***"}
+              - {port: swp6, vlan: 10, description: "*** suricata-1 ***"}
+        - task: cumulus/save_config
+
+  # ═══════════════ HQ LAN hosts — VLAN 10, gateway fgt-1 ═══════════════
+  # Wazuh host. Addressed only — Wazuh itself is not installed by this scenario.
+  - name: wazuh-1
+    depends_on: [sw-1]
+    template: generic-x64/debian12
+    clone_mode: linked
+    cpus: 8
+    memory: 16384          # Wazuh all-in-one (indexer + server + dashboard) minimum
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: sw-wazuh}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars: {lab_interface: eth1, lab_ip: 192.168.10.10, lab_netmask: 255.255.255.0, lab_gateway: 192.168.10.1, lab_dns: 8.8.8.8}
+
+  # ubuntu-desktop-24.04 names its lab NIC ens19 (the debian generics use eth1).
+  - name: ubuntu-1
+    depends_on: [sw-1]
+    template: joaobrlt/ubuntu-desktop-24.04
+    clone_mode: linked
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: sw-ubuntu}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars: {lab_interface: ens19, lab_ip: 192.168.10.50, lab_prefix: 24, lab_gateway: 192.168.10.1, lab_dns: 8.8.8.8}
+
+  # Windows endpoint. GPT/EFI image, so it needs ovmf + q35 + TPM 2.0; vga:virtio avoids the
+  # Bochs fallback that pins the desktop to firmware resolution. Its LAN address comes from
+  # fgt-1's DHCP pool.
+  - name: win-1
+    depends_on: [sw-1]
+    template: windows-11
+    clone_mode: full
+    cpus: 4
+    memory: 8192
+    qemu_agent: true
+    bios: ovmf
+    efidisk: true
+    tpm: true
+    machine: q35
+    ostype: win11
+    cpu_type: host
+    vga: virtio
+    interfaces:
+      - {name: eth1, type: vnet, network: sw-win}
+    ansible:
+      connection: {type: winrm, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: false
+      tasks:
+        - task: windows/set_hostname
+          vars: {hostname: win-1}
+
+  # Suricata host on its own port. Addressed only — Suricata itself is not installed by this
+  # scenario. swp6 is a plain access port for now; for the sensor to see LAN traffic, sw-1
+  # needs a mirror session onto swp6.
+  - name: suricata-1
+    depends_on: [sw-1]
+    template: generic-x64/debian12
+    clone_mode: linked
+    cpus: 2
+    memory: 4096
+    qemu_agent: true
+    interfaces:
+      - {name: eth1, type: vnet, network: sw-suricata}
+    ansible:
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
+      become: true
+      tasks:
+        - task: linux/set_hostname
+        - task: linux/configure_network_interfaces
+          vars: {lab_interface: eth1, lab_ip: 192.168.10.20, lab_netmask: 255.255.255.0, lab_gateway: 192.168.10.1, lab_dns: 8.8.8.8}
+
+  # Reserved: sw-1 swp5 (network sw-reserved) is wired into VLAN 10 with nothing on it. To use
+  # it, add a VM here with `interfaces: [{name: eth1, type: vnet, network: sw-reserved}]` and
+  # `depends_on: [sw-1]`, then add it to the running lab:
+  #   lab deploy start wazuh-lab1 --user <user> --target <vm-name>
