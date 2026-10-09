@@ -59,6 +59,10 @@ cisco-catalyst-8kv-vagrant-libvirt/
 cisco-ftd-fmc-vagrant-libvirt/
 cisco-iosvl2-vagrant-libvirt/
 fortigate-vagrant-libvirt/
+cisco-nxos9kv-vagrant-libvirt/
 
 test-topology-*/
 *.tar.xz
+
+# test topologies
+scenarios/dc-test/

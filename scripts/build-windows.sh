@@ -102,7 +102,11 @@ echo "template: $WIN_TEMPLATE_NAME (VMID $WIN_VMID)  node=$PROXMOX_NODE  disk=$D
 echo "build-vm=${BUILD_CPUS}vCPU/${BUILD_MEMORY_MB}MB  skip_update=$SKIP_UPDATE  skip_optimize=$SKIP_OPTIMIZE"
 
 # ── clone rgl fresh ───────────────────────────────────────────────────────────
-if [[ -d "$REPO_DIR/.git" ]]; then
+# Validate the clone, do not just look for a .git directory: systemd-tmpfiles ages
+# files out of /tmp but leaves the directory skeleton, so a stale repo still has an
+# (empty) .git and the fetch below dies with "not a git repository". rev-parse is the
+# real check, and a failed one falls through to a fresh clone.
+if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "$REPO_DIR" fetch --all --prune -q && git -C "$REPO_DIR" reset --hard -q origin/HEAD
 else
     rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"

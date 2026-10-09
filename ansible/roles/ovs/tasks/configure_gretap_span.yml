@@ -34,10 +34,20 @@
 # network reaches ~1432 bytes, which the kernel silently drops at the gretap
 # device ("dropped over-mtu packet") well before any IP-level fragmentation could
 # help. Force 1500 explicitly so nothing legitimate gets rejected — any resulting
-# oversized encapsulated packet is fragmented transparently by IP, unlike a
-# gretap-level MTU rejection which just drops the frame with no fallback.
+# oversized encapsulated packet is then fragmented by IP (needs the nopmtudisc task
+# below), unlike a gretap-level MTU rejection which just drops the frame with no fallback.
 - name: Set gretap interface MTU (auto-calculated MTU silently drops real traffic)
   command: ip link set {{ gretap_iface | default('grespan') }} mtu 1500
+  changed_when: false
+
+# A default gretap sets DF on the outer header, so every full-size mirrored frame
+# (outer > 1450) is dropped instead of fragmented — measured 2026-10-08 on wazuh-lab1:
+# 7308 of ~8200 frames of a 10 MB download dropped (tx_dropped), 0 with this set.
+# `ip link set` so it also fixes a tunnel that already exists.
+- name: Disable PMTU discovery on the tunnel (fragment oversized frames, don't drop)
+  command: >
+    ip link set {{ gretap_iface | default('grespan') }} type gretap
+    local {{ gretap_local_ip }} remote {{ gretap_remote_ip }} nopmtudisc ignore-df
   changed_when: false
 
 - name: Bring gretap interface up
@@ -166,6 +176,8 @@
         # See configure_gretap_span.yml's MTU task comment: auto-calculated MTU is too
         # small for real traffic on this network and silently drops it at the tunnel.
         ip link set "$GRETAP" mtu 1500
+        # No DF on the outer header — see the nopmtudisc task in configure_gretap_span.yml.
+        ip link set "$GRETAP" type gretap local "$LOCAL_IP" remote "$REMOTE_IP" nopmtudisc ignore-df
         ip link set "$GRETAP" up
         ovs-vsctl --may-exist add-port "$BRIDGE" "$GRETAP"
 

@@ -4,6 +4,7 @@ collections:
   - name: community.postgresql
   - name: vyos.vyos
   - name: cisco.ios
+  - name: cisco.nxos
   - name: fortinet.fortios
   - name: ansible.windows
   - name: community.windows

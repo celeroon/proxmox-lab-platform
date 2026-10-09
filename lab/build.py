@@ -89,6 +89,22 @@ SUPPORTED_BUILDS: dict[str, dict] = {
         # disk pauses the build VM mid-boot (QEMU werror=stop). Require real headroom.
         "min_free_gb": 60,
     },
+    # Cisco Nexus 9000v switch (NX-OS): same --source flow as cisco-iosvl2 — boots the
+    # supplied qcow2, drives both boots over serial (POAP abort, pin the boot image, reload,
+    # then the lab config), and produces a version-less cisco-nxos9kv.qcow2. The NX-OS
+    # version and the lite/full flavour are derived from the source filename; pass a version
+    # as the second arg to override it and to name the template cisco-nxos9kv-<version>.
+    "cisco-nxos9kv": {
+        "script": "build-cisco-nxos9kv.sh",
+        "requires_source": False,
+        "source_arg": True,
+        "output_dir": "/var/lib/lab-platform/build-work/cisco-nxos9kv-out",
+        "output_file": "cisco-nxos9kv.qcow2",
+        # NX-OS boots EFI off a SATA/AHCI disk — Cisco's documented bus, and the one the
+        # packer build boots it on. On the scsi0 default the firmware finds nothing bootable.
+        "disk_bus": "sata0",
+        "min_free_gb": 12,
+    },
     # Fortinet FortiGate (FortiOS). Same --source flow: clones the packer repo, boots the
     # supplied qcow2, configures it over serial (admin + vagrant/vagrant, SSH key, port1 in
     # VRF 1, self-signed cert), and produces a configured qcow2 imported as fortigate-<version>.

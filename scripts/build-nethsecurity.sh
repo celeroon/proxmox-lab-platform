@@ -15,7 +15,11 @@ REPO_URL="https://github.com/celeroon/nethsecurity-vagrant-libvirt.git"
 HCL_FILE="nethsecurity-no-vagrant.pkr.hcl"
 
 # clone or update packer repo
-if [[ -d "$REPO_DIR/.git" ]]; then
+# Validate the clone, do not just look for a .git directory: systemd-tmpfiles ages
+# files out of /tmp but leaves the directory skeleton, so a stale repo still has an
+# (empty) .git and the fetch below dies with "not a git repository". rev-parse is the
+# real check, and a failed one falls through to a fresh clone.
+if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     echo "updating packer repo"
     git -C "$REPO_DIR" pull --ff-only
 else

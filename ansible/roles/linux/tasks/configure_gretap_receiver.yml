@@ -1,0 +1,58 @@
+---
+# Receive a switch's gretap SPAN tunnel on a generic sensor (Suricata, tcpdump, ...).
+# The switch side is ovs/configure_gretap_span; Malcolm uses linux/configure_gretap_span instead.
+# Capture tools listen on the gretap interface — it carries copies only, never addressed.
+#
+# Variables:
+#   gretap_iface:     gretap interface name, same as the switch side. No hyphens (default: grespan)
+#   gretap_local_ip:  this VM's management IP — "{{ management_ip }}"
+#   gretap_remote_ip: the switch's management IP — e.g. "{{ sw_1_ip }}"
+
+- name: Create gretap tunnel interface (ignore if already exists)
+  command: >
+    ip link add {{ gretap_iface | default('grespan') }} type gretap
+    local {{ gretap_local_ip }} remote {{ gretap_remote_ip }}
+  changed_when: false
+  failed_when: false
+
+# Auto-calculated MTU (~1412) silently drops real frames — see linux/configure_gretap_span.
+- name: Set gretap interface MTU
+  command: ip link set {{ gretap_iface | default('grespan') }} mtu 1500
+  changed_when: false
+
+- name: Bring gretap interface up in promiscuous mode
+  command: ip link set {{ gretap_iface | default('grespan') }} up promisc on
+  changed_when: false
+
+- name: Install span-tunnel systemd service (recreates the interface at boot)
+  copy:
+    dest: /etc/systemd/system/span-tunnel.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=gretap SPAN tunnel receiver from {{ gretap_remote_ip }}
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash -c '\
+        ip link add {{ gretap_iface | default("grespan") }} type gretap \
+          local {{ gretap_local_ip }} remote {{ gretap_remote_ip }} 2>/dev/null || true; \
+        ip link set {{ gretap_iface | default("grespan") }} mtu 1500; \
+        ip link set {{ gretap_iface | default("grespan") }} up promisc on'
+      ExecStop=/bin/bash -c '\
+        ip link del {{ gretap_iface | default("grespan") }} 2>/dev/null || true'
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start span-tunnel service
+  systemd:
+    name: span-tunnel.service
+    enabled: yes
+    state: started
+    daemon_reload: yes

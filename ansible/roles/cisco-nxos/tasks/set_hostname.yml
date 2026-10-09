@@ -1,0 +1,10 @@
+---
+# Task: Set hostname on a Cisco NX-OS switch
+# Variables:
+#   hostname: Hostname for the switch (required)
+
+- name: Configure hostname
+  cisco.nxos.nxos_config:
+    lines:
+      - hostname {{ hostname }}
+  when: hostname is defined and hostname | length > 0

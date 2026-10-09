@@ -756,7 +756,7 @@ def template_build(
     skip_update: bool = typer.Option(False, "--skip-update", help="Windows only: skip Windows Update during the build (default: updates run)."),
     skip_optimize: bool = typer.Option(False, "--skip-optimize", help="Windows only: skip the SDelete free-space zero-fill (default: it runs)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Windows only: print the detected node/storage/bridge/VLAN + patched config and exit, building nothing."),
-    source: str = typer.Option("", "--source", help="cisco-iosvl2 / cisco-8kv / cisco-ftd / cisco-fmc / fortigate: path to the source qcow2 disk image to build from."),
+    source: str = typer.Option("", "--source", help="cisco-iosvl2 / cisco-8kv / cisco-nxos9kv / cisco-ftd / cisco-fmc / fortigate: path to the source qcow2 disk image to build from."),
     count: int = typer.Option(1, "--count", help="cisco-ftd / cisco-fmc only: build N auto-numbered single-use templates (cisco-ftd-1, -2, …), continuing past any that already exist."),
     gui: bool = typer.Option(False, "--gui", help="cisco-ftd / cisco-fmc / cisco-8kv / cisco-iosvl2 / fortigate: open the QEMU window during the build (headless by default). On the headless mgmt VM the window is a display reached over remote desktop."),
 ):
@@ -764,7 +764,7 @@ def template_build(
 
     nethsecurity is built via libvirt and imported; windows is built directly on a
     Proxmox node (--skip-update / --skip-optimize / --dry-run apply to windows only);
-    cisco-iosvl2 / cisco-8kv / cisco-ftd / cisco-fmc / fortigate boot the disk image given by
+    cisco-iosvl2 / cisco-8kv / cisco-nxos9kv / cisco-ftd / cisco-fmc / fortigate boot the disk image given by
     --source and import the result. fortigate takes a free-form name as its second arg and is
     imported as fortigate-<name> (e.g. `fortigate fgt-1` -> fortigate-fgt-1), so an HA pair is
     just two builds. cisco-ftd/cisco-fmc are single-use appliances: each import is tagged so it

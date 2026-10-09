@@ -1,12 +1,13 @@
 version: 1
-name: wazuh-lab1 (Wazuh lab — FortiGate HQ, Cumulus LAN, S2S-ready for an FTD branch)
+name: wazuh-lab1 (Wazuh lab — FortiGate HQ, OVS LAN with SPAN, S2S-ready for an FTD branch)
 description: >-
   One VyOS acts as the ISP with four uplinks (three RFC 5737 TEST-NETs and one RFC 6598
-  CGNAT range). HQ is a single FortiGate (fgt-1) on the first uplink, with a Cumulus switch
-  behind it carrying the LAN in VLAN 10: a Wazuh host, Ubuntu and Windows endpoints, a
-  Suricata host and one reserved port. fgt-1 already carries a route-based IPsec tunnel to
-  BR1 — a future FTD on the second uplink — which stays down until that firewall exists.
-  The third and fourth uplinks are for BR2 and BR3, future Cisco routers.
+  CGNAT range). HQ is a single FortiGate (fgt-1) on the first uplink, with an OVS switch
+  behind it carrying the LAN in VLAN 10: a Wazuh host, Ubuntu and Windows endpoints, and a
+  Suricata sensor that receives a mirror of every other switch port over a gretap tunnel.
+  fgt-1 already carries a route-based IPsec tunnel to BR1 — a future FTD on the second
+  uplink — which stays down until that firewall exists. The third and fourth uplinks are
+  for BR2 and BR3, future Cisco routers.
 vm_prefix: ""
 
 # Every VM gets the host CPU model (Proxmox defaults to kvm64, which hides AES-NI, AVX and
@@ -27,7 +28,13 @@ defaults:
 #   .10         wazuh-1
 #   .20         suricata-1
 #   .50         ubuntu-1
-#   .100-.199   fgt-1 DHCP pool (win-1, and whatever lands on the reserved port)
+#   .100-.199   fgt-1 DHCP pool (win-1)
+#
+# SPAN: sw-1 copies every frame entering eth1-eth4 (fgt-1 trunk + all hosts except the
+# sensor) into a gretap tunnel over the management network to suricata-1, which captures
+# on `grespan`. A mirror VNet NIC does not work here — Proxmox VXLAN SDN drops the copies
+# (see ovs/configure_gretap_span). The mirror is ingress-only, so every port a flow can
+# enter on must be listed, or Suricata sees only one direction of it.
 #
 # S2S HQ <-> BR1: route-based IKEv2, fgt-1 192.0.2.6 <-> BR1 198.51.100.14, transit
 # 169.254.1.1 (fgt-1) / 169.254.1.2 (BR1) /30.
@@ -43,12 +50,11 @@ networks:
   - {name: isp-br2, type: vnet}       # 203.0.113.0/29   vyos .1 <-> BR2 Cisco .6 (future)
   - {name: isp-br3, type: vnet}       # 100.64.0.0/29    vyos .1 <-> BR3 Cisco .6 (future)
   # HQ LAN — the firewall trunk, then one vnet per switch port
-  - {name: fgt-sw, type: vnet}        # fgt-1 port3 <-> sw-1 swp1 (trunk, vlan 10 tagged)
-  - {name: sw-wazuh, type: vnet}      # sw-1 swp2 (access 10) -> wazuh-1
-  - {name: sw-ubuntu, type: vnet}     # sw-1 swp3 (access 10) -> ubuntu-1
-  - {name: sw-win, type: vnet}        # sw-1 swp4 (access 10) -> win-1
-  - {name: sw-reserved, type: vnet}   # sw-1 swp5 (access 10) -> reserved for a future VM
-  - {name: sw-suricata, type: vnet}   # sw-1 swp6 (access 10) -> suricata-1
+  - {name: fgt-sw, type: vnet}        # fgt-1 port3 <-> sw-1 eth1 (trunk, vlan 10 tagged)
+  - {name: sw-wazuh, type: vnet}      # sw-1 eth2 (access 10) -> wazuh-1
+  - {name: sw-ubuntu, type: vnet}     # sw-1 eth3 (access 10) -> ubuntu-1
+  - {name: sw-win, type: vnet}        # sw-1 eth4 (access 10) -> win-1
+  - {name: sw-suricata, type: vnet}   # sw-1 eth5 (access 10) -> suricata-1 (LAN side, not the mirror)
 
 vms:
   # ═══════════════ ISP — one VyOS carrying all four uplinks ═══════════════
@@ -139,8 +145,8 @@ vms:
               - {name: port2, ip: "192.0.2.6 255.255.255.248", description: "WAN to ISP1 (vyos .1)", alias: WAN, role: wan}
               # LAN as a trunk: port3 is the tagged parent (left unaddressed), vlan10 subif is the gateway.
               - {name: vlan10, interface: port3, vlanid: 10, ip: "192.168.10.1 255.255.255.0", description: "LAN vlan10", alias: LAN10, role: lan}
-        # LAN DHCP: gives win-1 its LAN address (there is no generic Windows static-IP task)
-        # and serves whatever lands on the reserved port. The Linux hosts are static, below the pool.
+        # LAN DHCP: gives win-1 its LAN address (there is no generic Windows static-IP task).
+        # The Linux hosts are static, below the pool.
         - task: fortigate/configure_dhcp
           vars:
             dhcp_servers:
@@ -216,44 +222,50 @@ vms:
         # Pin port1 (mgmt) to its static platform IP, out of the build's vrf 1 into vrf 0.
         - task: fortigate/configure_mgmt_interface
 
-  # ═══════════════ HQ LAN switch — Cumulus, everything in VLAN 10 ═══════════════
-  # Scenario NICs map one-per-port from swp1 (net0 is eth0, management).
+  # ═══════════════ HQ LAN switch — OVS, everything in VLAN 10, SPAN to suricata-1 ═══════════════
+  # Debian + Open vSwitch (bridge br-lan). net0/eth0 is management and carries the gretap tunnel.
   - name: sw-1
     depends_on: [fgt-1]
-    template: CumulusCommunity/cumulus-vx
+    template: generic-x64/debian12
     clone_mode: linked
-    cpus: 4
-    memory: 5120
-    qemu_agent: false
+    cpus: 2
+    memory: 1024
+    qemu_agent: true
     interfaces:
-      - {name: eth1, type: vnet, network: fgt-sw}        # swp1 trunk 10 -> fgt-1 port3
-      - {name: eth2, type: vnet, network: sw-wazuh}      # swp2 access 10 -> wazuh-1
-      - {name: eth3, type: vnet, network: sw-ubuntu}     # swp3 access 10 -> ubuntu-1
-      - {name: eth4, type: vnet, network: sw-win}        # swp4 access 10 -> win-1
-      - {name: eth5, type: vnet, network: sw-reserved}   # swp5 access 10 -> reserved
-      - {name: eth6, type: vnet, network: sw-suricata}   # swp6 access 10 -> suricata-1
+      - {name: eth1, type: vnet, network: fgt-sw}        # trunk 10 -> fgt-1 port3
+      - {name: eth2, type: vnet, network: sw-wazuh}      # access 10 -> wazuh-1
+      - {name: eth3, type: vnet, network: sw-ubuntu}     # access 10 -> ubuntu-1
+      - {name: eth4, type: vnet, network: sw-win}        # access 10 -> win-1
+      - {name: eth5, type: vnet, network: sw-suricata}   # access 10 -> suricata-1
     ansible:
-      connection: {type: ssh, user: vagrant, password: vagrant, password_reset: true}
-      gather_facts: false
+      connection: {type: ssh, user: vagrant, password: vagrant}
+      gather_facts: true
       become: true
       tasks:
-        - task: cumulus/set_hostname
-          vars: {hostname: sw-1}
-        # swp1 is a trunk: the FortiGate LAN rides a tagged vlan10 subinterface, so the
-        # switch port must accept tagged vlan10 (an access port would drop it).
-        - task: cumulus/configure_trunk_ports
+        - task: linux/set_hostname
+        # eth1 is a trunk: the FortiGate LAN rides a tagged vlan10 subinterface.
+        - task: ovs/configure_vlan_switch
           vars:
-            trunk_ports:
-              - {port: swp1, vlans: [10], description: "*** fgt-1 LAN trunk (vlan10) ***"}
-        - task: cumulus/configure_access_ports
-          vars:
+            bridge_name: br-lan
+            trunk_port: eth1
+            trunk_vlans: [10]
             access_ports:
-              - {port: swp2, vlan: 10, description: "*** wazuh-1 ***"}
-              - {port: swp3, vlan: 10, description: "*** ubuntu-1 ***"}
-              - {port: swp4, vlan: 10, description: "*** win-1 ***"}
-              - {port: swp5, vlan: 10, description: "*** reserved ***"}
-              - {port: swp6, vlan: 10, description: "*** suricata-1 ***"}
-        - task: cumulus/save_config
+              - {name: eth2, tag: 10}   # wazuh-1
+              - {name: eth3, tag: 10}   # ubuntu-1
+              - {name: eth4, tag: 10}   # win-1
+              - {name: eth5, tag: 10}   # suricata-1
+        # Ingress-only mirror: frames on the trunk arrive tagged (vlan 10), host-port frames untagged.
+        - task: ovs/configure_gretap_span
+          vars:
+            bridge_name: br-lan
+            gretap_local_ip: "{{ management_ip }}"
+            gretap_remote_ip: "{{ suricata_1_ip }}"   # suricata-1 mgmt IP, injected by the platform
+            mirror_ports:
+              - eth1    # fgt-1 trunk — internet + BR1 traffic coming back into the LAN
+              - eth2    # wazuh-1
+              - eth3    # ubuntu-1
+              - eth4    # win-1
+              # - eth5  # suricata-1 itself — not mirrored
 
   # ═══════════════ HQ LAN hosts — VLAN 10, gateway fgt-1 ═══════════════
   # Wazuh host. Addressed only — Wazuh itself is not installed by this scenario.
@@ -321,9 +333,9 @@ vms:
         - task: windows/set_hostname
           vars: {hostname: win-1}
 
-  # Suricata host on its own port. Addressed only — Suricata itself is not installed by this
-  # scenario. swp6 is a plain access port for now; for the sensor to see LAN traffic, sw-1
-  # needs a mirror session onto swp6.
+  # Suricata sensor. eth1 is its normal LAN port (agent -> wazuh-1, updates); the mirror
+  # arrives on `grespan`, the gretap tunnel from sw-1 over management. Suricata itself is not
+  # installed yet — when it is, af-packet listens on grespan.
   - name: suricata-1
     depends_on: [sw-1]
     template: generic-x64/debian12
@@ -341,8 +353,7 @@ vms:
         - task: linux/set_hostname
         - task: linux/configure_network_interfaces
           vars: {lab_interface: eth1, lab_ip: 192.168.10.20, lab_netmask: 255.255.255.0, lab_gateway: 192.168.10.1, lab_dns: 8.8.8.8}
-
-  # Reserved: sw-1 swp5 (network sw-reserved) is wired into VLAN 10 with nothing on it. To use
-  # it, add a VM here with `interfaces: [{name: eth1, type: vnet, network: sw-reserved}]` and
-  # `depends_on: [sw-1]`, then add it to the running lab:
-  #   lab deploy start wazuh-lab1 --user <user> --target <vm-name>
+        - task: linux/configure_gretap_receiver
+          vars:
+            gretap_local_ip: "{{ management_ip }}"
+            gretap_remote_ip: "{{ sw_1_ip }}"   # sw-1 mgmt IP, injected by the platform
